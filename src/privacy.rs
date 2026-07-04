@@ -93,6 +93,9 @@ fn on_device_content(app: &str) -> &'static str {
 }
 
 fn render(app: &str) -> String {
+    if app == "flaccy" {
+        return render_flaccy();
+    }
     let c = config(app);
     let location = if c.uses_location {
         "<h2>Location</h2><p>If you grant location access, your approximate location is used on your device to improve the experience (such as suggesting a nearby language) and is not sent to our servers.</p>"
@@ -151,6 +154,25 @@ fn render(app: &str) -> String {
         deletion = deletion,
         contact = contact,
     )
+}
+
+fn render_flaccy() -> String {
+    let body = r#"<h1>Flaccy Privacy Policy</h1>
+<p><em>Last updated: July 2026</em></p>
+<p>Flaccy is designed to collect as little as possible. This policy explains what is processed and why.</p>
+<h2>On-device data</h2>
+<p>Flaccy works without an account — there is no sign-up, no analytics, no advertising, and no tracking. Your music library, playlists, and play history are stored on your device and are not uploaded to us.</p>
+<h2>Last.fm (optional)</h2>
+<p>If you connect a Last.fm account, you authenticate directly with Last.fm; we never see your Last.fm password. While connected, the app sends scrobbles (track, artist, album, and timestamp) and now-playing updates to Last.fm, and fetches your charts, loved tracks, and artist information from it. That data is handled under <a href="https://www.last.fm/legal/privacy">Last.fm's privacy policy</a>. You can disconnect at any time in Settings.</p>
+<h2>AI metadata cleanup</h2>
+<p>When an imported file lacks recognizable metadata, its file and folder names — never the audio content — are sent to the Groq API, where a language model identifies the artist, album, and track. No personal identifiers are attached, and per Groq's data policy this data is not used to train AI models.</p>
+<h2>Other service lookups</h2>
+<p>To enrich your library, the app fetches lyrics from LRCLIB, artwork and artist images from Apple Music/iTunes, MusicBrainz, and Last.fm, and share links from Songlink. These queries contain only track, artist, or album names.</p>
+<h2>What we don't do</h2>
+<p>We do not sell your data, show advertising, or use third-party tracking or advertising identifiers. No data leaves your device except the service calls described above.</p>
+<h2>Your choices</h2>
+<p>You can delete the app at any time to remove on-device data. For any questions, contact <a href="https://x.com/prblemslver">@prblemslver</a>.</p>"#;
+    page("Flaccy", "Privacy Policy", body)
 }
 
 pub fn payday_landing(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
