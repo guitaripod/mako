@@ -20,6 +20,9 @@ fn model_prices(model: &str) -> (f64, f64) {
         "gemini-3.1-flash-lite" => (0.25, 1.50),
         "gemini-3.5-flash" => (1.50, 9.00),
         "gemini-2.5-flash" => (0.30, 2.50),
+        "claude-haiku-4-5" => (1.00, 5.00),
+        "claude-sonnet-4-6" => (3.00, 15.00),
+        "claude-opus-4-8" => (5.00, 25.00),
         "gpt-5-mini" => (0.25, 2.00),
         "gpt-5-nano" => (0.05, 0.40),
         "gpt-5" => (1.25, 10.00),
@@ -34,12 +37,15 @@ fn model_prices(model: &str) -> (f64, f64) {
 enum Provider {
     Gemini,
     OpenAI,
+    Anthropic,
 }
 
 impl Provider {
     fn for_model(model: &str) -> Provider {
         let m = model.to_ascii_lowercase();
-        if m.starts_with("gpt") || m.starts_with("o1") || m.starts_with("o3")
+        if m.starts_with("claude") || m.starts_with("anthropic") {
+            Provider::Anthropic
+        } else if m.starts_with("gpt") || m.starts_with("o1") || m.starts_with("o3")
             || m.starts_with("o4") || m.starts_with("chatgpt")
         {
             Provider::OpenAI
@@ -52,6 +58,7 @@ impl Provider {
         match self {
             Provider::Gemini => "GEMINI_API_KEY",
             Provider::OpenAI => "OPENAI_API_KEY",
+            Provider::Anthropic => "ANTHROPIC_API_KEY",
         }
     }
 }
@@ -167,6 +174,7 @@ async fn chat_completion_inner(
     let result = match provider {
         Provider::Gemini => gemini_generate(&api_key, &model, &body).await,
         Provider::OpenAI => openai_generate(&api_key, &model, &body).await,
+        Provider::Anthropic => anthropic_generate(&api_key, &model, &body).await,
     };
     let (content, prompt_tokens, output_tokens) = match result {
         Ok(v) => v,
@@ -378,6 +386,101 @@ async fn openai_generate(
         .unwrap_or(0);
     let output_tokens = usage
         .and_then(|u| u.get("completion_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+
+    Ok((text, prompt_tokens, output_tokens))
+}
+
+const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_MAX_TOKENS: u32 = 4096;
+
+/// Calls the Anthropic Messages API with the messages (joined into one user
+/// turn) plus any images as base64 image content blocks. `max_tokens` is
+/// required by the API; JSON output is coaxed via a system instruction since
+/// Anthropic has no native json-mode flag. Mirrors the other generators'
+/// return shape: (text, prompt_tokens, output_tokens).
+async fn anthropic_generate(
+    api_key: &str,
+    model: &str,
+    body: &ChatRequest,
+) -> std::result::Result<(String, u64, u64), AppError> {
+    let joined = body
+        .messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut parts: Vec<Value> = vec![json!({ "type": "text", "text": joined })];
+    for image in &body.images {
+        parts.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": strip_data_url(image),
+            }
+        }));
+    }
+
+    let mut request_body = json!({
+        "model": model,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "messages": [ { "role": "user", "content": parts } ],
+    });
+    if body.response_json {
+        request_body["system"] =
+            json!("Respond with only valid JSON. Do not include markdown fences or any prose.");
+    }
+
+    let headers = Headers::new();
+    headers.set("x-api-key", api_key)?;
+    headers.set("anthropic-version", ANTHROPIC_VERSION)?;
+    headers.set("Content-Type", "application/json")?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&request_body.to_string())));
+    let request = Request::new_with_init(ANTHROPIC_MESSAGES_URL, &init)?;
+    let mut resp = Fetch::Request(request).send().await?;
+
+    if resp.status_code() >= 400 {
+        let detail = resp.text().await.unwrap_or_default();
+        console_log!("Anthropic chat error {}: {}", resp.status_code(), detail);
+        return Err(AppError::InternalError("AI provider error".to_string()));
+    }
+
+    let value: Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::InternalError(format!("Failed to parse AI response: {}", e)))?;
+
+    let text = value
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+
+    if text.is_empty() {
+        return Err(AppError::InternalError("Empty AI response".to_string()));
+    }
+
+    let usage = value.get("usage");
+    let prompt_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
         .and_then(|t| t.as_u64())
         .unwrap_or(0);
 

@@ -160,7 +160,7 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     let user_headers = worker::Headers::new();
     user_headers.set("Authorization", &format!("Bearer {}", token_data.access_token))?;
     user_headers.set("Accept", "application/vnd.github.v3+json")?;
-    user_headers.set("User-Agent", "openai-image-proxy/1.0")?;
+    user_headers.set("User-Agent", "mako/1.0")?;
     
     let user_req = worker::Request::new_with_init(
         user_url,
@@ -183,7 +183,7 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
         let emails_headers = worker::Headers::new();
         emails_headers.set("Authorization", &format!("Bearer {}", token_data.access_token))?;
         emails_headers.set("Accept", "application/vnd.github.v3+json")?;
-        emails_headers.set("User-Agent", "openai-image-proxy/1.0")?;
+        emails_headers.set("User-Agent", "mako/1.0")?;
         
         let emails_req = worker::Request::new_with_init(
             emails_url,

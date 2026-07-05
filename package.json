@@ -1,7 +1,7 @@
 {
-  "name": "openai-image-proxy",
+  "name": "mako",
   "version": "1.0.0",
-  "description": "OpenAI Image Proxy Cloudflare Worker",
+  "description": "mako — shared AI-credits backend Cloudflare Worker (deployed as openai-image-proxy)",
   "main": "index.js",
   "scripts": {
     "dev": "wrangler dev",
