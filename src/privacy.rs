@@ -53,6 +53,12 @@ fn config(app: &str) -> AppPrivacy {
             uses_location: false,
             voice_consent: false,
         },
+        "livingdex" => AppPrivacy {
+            name: "Living Dex",
+            ai: "when the app can't identify a subject on your device, the photo you capture is sent to our AI providers (Anthropic and Google) to identify the organism and write its entry; on-device identification and narration happen locally and send nothing. We also query public biodiversity sources (GBIF, Wikipedia) by species name, not by your photo",
+            uses_location: true,
+            voice_consent: false,
+        },
         _ => AppPrivacy {
             name: "This app",
             ai: "the content you submit is sent to our AI providers (OpenAI and Google) only to produce the result you requested",
@@ -85,10 +91,10 @@ fn contact_link(app: &str) -> &'static str {
 }
 
 fn on_device_content(app: &str) -> &'static str {
-    if app == "payday" {
-        "your invoices, estimates, clients, logo, and settings"
-    } else {
-        "results, history, and transcripts"
+    match app {
+        "payday" => "your invoices, estimates, clients, logo, and settings",
+        "livingdex" => "your captured photos, your species collection (your Dex), and your progress",
+        _ => "results, history, and transcripts",
     }
 }
 
@@ -97,7 +103,9 @@ fn render(app: &str) -> String {
         return render_flaccy();
     }
     let c = config(app);
-    let location = if c.uses_location {
+    let location = if app == "livingdex" {
+        "<h2>Location</h2><p>If you grant location access (While Using the App only), your approximate location tags each sighting on your device and is used to gauge how rare a species is where you are. For species of conservation concern, locations are coarsened so they cannot be used to find a vulnerable organism, and your precise location is never shared with other players.</p>"
+    } else if c.uses_location {
         "<h2>Location</h2><p>If you grant location access, your approximate location is used on your device to improve the experience (such as suggesting a nearby language) and is not sent to our servers.</p>"
     } else {
         ""
@@ -112,11 +120,15 @@ fn render(app: &str) -> String {
     let on_device = on_device_content(app);
     let purchases = if app == "payday" {
         "Subscriptions and credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock features or credit your balance. We never receive your payment-card details."
+    } else if app == "livingdex" {
+        "Living Dex Pro (an auto-renewing subscription) is sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock Pro features. We never receive your payment-card details."
     } else {
         "Credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which pack and a transaction identifier) to credit your balance. We never receive your payment-card details."
     };
     let deletion = if app == "payday" || app == "psybeam" {
         "You can delete your account from within the app at any time (in Settings), which removes your server-side identity and credit ledger; deleting the app removes any remaining on-device data."
+    } else if app == "livingdex" {
+        "Deleting the app removes your on-device collection and photos. Your anonymous credit identity holds no personal data; contact us to erase it."
     } else {
         "You can delete the app at any time to remove on-device data."
     };
@@ -225,20 +237,40 @@ fn page(name: &str, title: &str, body: &str) -> String {
 
 fn render_terms(app: &str) -> String {
     let c = config(app);
+    let subscriptions = if app == "livingdex" {
+        "Living Dex Pro is an auto-renewing subscription sold through Apple In-App Purchase. Payment is charged to your Apple Account at confirmation. It renews automatically unless cancelled at least 24 hours before the end of the current period; manage or cancel it in your Apple Account settings. Any free-trial portion is forfeited when you purchase a subscription. Basic identification is free. Prices are shown in the App before purchase."
+    } else {
+        "Pay Day Pro is an auto-renewing subscription sold through Apple In-App Purchase. Payment is charged to your Apple Account at confirmation. It renews automatically unless cancelled at least 24 hours before the end of the current period; manage or cancel it in your Apple Account settings. Any free-trial portion is forfeited when you purchase a subscription. Credit packs are one-time consumable purchases used to send invoices over the Peppol network and for optional AI features; consumed credits are non-refundable. Prices are shown in the App before purchase."
+    };
+    let responsibilities = if app == "livingdex" {
+        "Identifications are AI-generated best guesses and may be wrong. <strong>Never eat, touch, or handle any wild plant, fungus, or animal based on the App's identification</strong> — many species are toxic, venomous, protected, or dangerous, and misidentification can cause serious harm. The App is for general education and enjoyment and is not safety, medical, foraging, or professional advice. Respect wildlife and habitats and follow all local laws and protected-area rules."
+    } else {
+        "You are responsible for the accuracy and legality of the invoices, client data, and tax information you enter, and for having a lawful basis to invoice your clients. The App helps you produce documents in standard formats (including EN 16931 / Peppol); it is not tax, accounting, or legal advice, and you remain responsible for your compliance obligations."
+    };
+    let acceptable = if app == "livingdex" {
+        "Do not use the App unlawfully, to harass, bait, or endanger wildlife, to disturb protected species, nests, or habitats, to infringe others' rights, or to interfere with or reverse-engineer the service."
+    } else {
+        "Do not use the App unlawfully, to send fraudulent or unsolicited documents, to infringe others' rights, or to interfere with or reverse-engineer the service."
+    };
+    let availability = if app == "livingdex" {
+        "Cloud identification and AI features depend on third-party services and a network connection and may be unavailable or delayed; on-device features work offline."
+    } else {
+        "Network features (VAT validation, currency rates, and Peppol delivery) depend on third-party services and may be unavailable or delayed; issuing and sharing invoices as PDFs does not require them."
+    };
     let body = format!(
         r#"<h1>{name} Terms of Use</h1>
-<p><em>Last updated: June 2026</em></p>
+<p><em>Last updated: July 2026</em></p>
 <p>These Terms govern your use of {name} (the "App"), operated by Midgar Oy. By downloading or using the App you agree to them.</p>
 <h2>Licence</h2>
 <p>We grant you a personal, non-transferable, revocable licence to use the App on Apple devices you own or control, in accordance with the Apple Media Services Terms and these Terms.</p>
 <h2>Subscriptions and purchases</h2>
-<p>{name} Pro is an auto-renewing subscription sold through Apple In-App Purchase. Payment is charged to your Apple Account at confirmation. It renews automatically unless cancelled at least 24 hours before the end of the current period; manage or cancel it in your Apple Account settings. Any free-trial portion is forfeited when you purchase a subscription. Credit packs are one-time consumable purchases used to send invoices over the Peppol network and for optional AI features; consumed credits are non-refundable. Prices are shown in the App before purchase.</p>
+<p>{subscriptions}</p>
 <h2>Your responsibilities</h2>
-<p>You are responsible for the accuracy and legality of the invoices, client data, and tax information you enter, and for having a lawful basis to invoice your clients. The App helps you produce documents in standard formats (including EN 16931 / Peppol); it is not tax, accounting, or legal advice, and you remain responsible for your compliance obligations.</p>
+<p>{responsibilities}</p>
 <h2>Acceptable use</h2>
-<p>Do not use the App unlawfully, to send fraudulent or unsolicited documents, to infringe others' rights, or to interfere with or reverse-engineer the service.</p>
+<p>{acceptable}</p>
 <h2>Availability and third parties</h2>
-<p>Network features (VAT validation, currency rates, and Peppol delivery) depend on third-party services and may be unavailable or delayed; issuing and sharing invoices as PDFs does not require them.</p>
+<p>{availability}</p>
 <h2>Disclaimer and liability</h2>
 <p>The App is provided "as is" without warranties of any kind. To the maximum extent permitted by law, Midgar Oy is not liable for indirect or consequential damages, and our total liability is limited to the amount you paid for the App in the 12 months before the claim. Nothing limits liability that cannot be excluded by law.</p>
 <h2>Changes and termination</h2>
@@ -255,6 +287,15 @@ fn render_terms(app: &str) -> String {
 
 fn render_support(app: &str) -> String {
     let c = config(app);
+    let topics = if app == "livingdex" {
+        r#"<li>Subscriptions are managed in your Apple Account settings; restore purchases from the paywall.</li>
+<li>Your collection and photos are stored on your device; deleting the app removes them.</li>
+<li>Identifications are AI best guesses — never eat, touch, or handle a wild organism based only on the App.</li>"#
+    } else {
+        r#"<li>Subscriptions and credit packs are managed in your Apple Account settings; restore purchases from the paywall.</li>
+<li>You can delete your account from within the app (Settings).</li>
+<li>Invoices and client data are stored on your device; the App works offline for creating and sharing PDFs.</li>"#
+    };
     let body = format!(
         r#"<h1>{name} Support</h1>
 <p>Need help with {name}? We're happy to assist.</p>
@@ -262,9 +303,7 @@ fn render_support(app: &str) -> String {
 <p>Email us at {contact} and we'll get back to you, usually within two business days.</p>
 <h2>Common topics</h2>
 <ul>
-<li>Subscriptions and credit packs are managed in your Apple Account settings; restore purchases from the paywall.</li>
-<li>You can delete your account from within the app (Settings).</li>
-<li>Invoices and client data are stored on your device; the App works offline for creating and sharing PDFs.</li>
+{topics}
 </ul>
 <h2>Legal</h2>
 <p>See our <a href="/privacy/{app}">Privacy Policy</a> and <a href="/terms/{app}">Terms of Use</a>.</p>"#,
