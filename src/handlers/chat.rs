@@ -28,6 +28,10 @@ fn model_prices(model: &str) -> (f64, f64) {
         "gpt-5" => (1.25, 10.00),
         "gpt-4.1-mini" => (0.40, 1.60),
         "gpt-4.1" => (2.00, 8.00),
+        // Any other Claude id (a new/pinned model without an explicit entry)
+        // prices at Sonnet rates rather than the cheap default, so an Opus/Sonnet
+        // request can't leak ~10x revenue via the fallback.
+        other if other.starts_with("claude") || other.starts_with("anthropic") => (3.00, 15.00),
         _ => (0.50, 3.00),
     }
 }
@@ -220,6 +224,21 @@ fn strip_data_url(image: &str) -> &str {
     }
 }
 
+/// The media type declared in a `data:<type>;base64,...` URL, defaulting to
+/// jpeg for a bare base64 string. Anthropic validates this against the decoded
+/// bytes and 400s on a mismatch, so a PNG must be declared as such.
+fn media_type_of(image: &str) -> &str {
+    if let Some(rest) = image.strip_prefix("data:") {
+        if let Some(semi) = rest.find(';') {
+            let ty = &rest[..semi];
+            if ty.starts_with("image/") {
+                return ty;
+            }
+        }
+    }
+    "image/jpeg"
+}
+
 /// Calls Gemini generateContent with the messages (joined into one user turn)
 /// plus any images as inlineData parts. Returns (text, prompt_tokens, output_tokens).
 async fn gemini_generate(
@@ -237,7 +256,7 @@ async fn gemini_generate(
     parts.push(json!({ "text": joined }));
     for image in &body.images {
         parts.push(json!({
-            "inlineData": { "mimeType": "image/jpeg", "data": strip_data_url(image) }
+            "inlineData": { "mimeType": media_type_of(image), "data": strip_data_url(image) }
         }));
     }
 
@@ -329,7 +348,7 @@ async fn openai_generate(
     for image in &body.images {
         parts.push(json!({
             "type": "image_url",
-            "image_url": { "url": format!("data:image/jpeg;base64,{}", strip_data_url(image)) }
+            "image_url": { "url": format!("data:{};base64,{}", media_type_of(image), strip_data_url(image)) }
         }));
     }
 
@@ -394,7 +413,7 @@ async fn openai_generate(
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_MAX_TOKENS: u32 = 4096;
+const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
 /// Calls the Anthropic Messages API with the messages (joined into one user
 /// turn) plus any images as base64 image content blocks. `max_tokens` is
@@ -419,7 +438,7 @@ async fn anthropic_generate(
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": "image/jpeg",
+                "media_type": media_type_of(image),
                 "data": strip_data_url(image),
             }
         }));
@@ -448,8 +467,14 @@ async fn anthropic_generate(
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {
+        let status = resp.status_code();
         let detail = resp.text().await.unwrap_or_default();
-        console_log!("Anthropic chat error {}: {}", resp.status_code(), detail);
+        console_log!("Anthropic chat error {}: {}", status, detail);
+        // 429 (rate_limit) / 529 (overloaded) are transient — surface as a rate
+        // limit so clients back off rather than treating it as a hard failure.
+        if status == 429 || status == 529 {
+            return Err(AppError::RateLimitExceeded);
+        }
         return Err(AppError::InternalError("AI provider error".to_string()));
     }
 
@@ -457,6 +482,14 @@ async fn anthropic_generate(
         .json()
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to parse AI response: {}", e)))?;
+
+    // A `max_tokens` stop returns HTTP 200 with partial content — surfacing it as
+    // an error avoids charging for a truncated (and, for response_json, unparseable)
+    // reply. The 8192 cap is well above narration/Q&A needs.
+    if value.get("stop_reason").and_then(|s| s.as_str()) == Some("max_tokens") {
+        console_log!("Anthropic response truncated at max_tokens for model {}", model);
+        return Err(AppError::InternalError("AI response truncated".to_string()));
+    }
 
     let text = value
         .get("content")
