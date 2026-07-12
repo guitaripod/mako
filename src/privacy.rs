@@ -49,7 +49,7 @@ fn config(app: &str) -> AppPrivacy {
         },
         "payday" => AppPrivacy {
             name: "Pay Day",
-            ai: "when you ask the app to draft line items from a photo or a description, or to write a payment reminder, that photo or text is sent to our AI provider only to produce the draft you requested",
+            ai: "only when you tap an AI action to draft line items from a photo or a description, the content you provide (that photo or text, plus the invoice currency) is sent over an encrypted connection to our backend, operated by Midgar Oy, which forwards it to OpenAI (OpenAI, L.L.C.) solely to generate the draft you requested. Nothing is sent until you grant permission in the app's AI consent screen, which you can withdraw at any time in Settings. Your saved invoices and client list are not sent",
             uses_location: false,
             voice_consent: false,
         },
@@ -142,7 +142,7 @@ fn render(app: &str) -> String {
 <p><em>Last updated: June 2026</em></p>
 <p>{name} is designed to collect as little as possible. This policy explains what is processed and why.</p>
 <h2>AI processing</h2>
-<p>To provide the app's core feature, {ai}. This data is processed only to produce your result and is not used to train AI models.</p>
+<p>To provide the app's core feature, {ai}. This data is processed only to produce your result and is not used to train AI models. Our AI providers handle it under their own privacy and security commitments that protect it to a standard comparable to this policy, and are permitted to use it only to return your result.</p>
 <h2>Identity</h2>
 <p>{name} works without an account. On first launch we create an anonymous, device-based identity used only to track your credit balance. You may optionally Sign in with Apple to sync your balance across devices, in which case we receive only the identifier Apple provides.</p>
 <h2>Purchases</h2>
