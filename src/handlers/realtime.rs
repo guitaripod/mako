@@ -16,6 +16,12 @@ const RESERVE_GUARD_MINUTES: i32 = 1;
 const OPENAI_MINT_URL: &str = "https://api.openai.com/v1/realtime/translations/client_secrets";
 const OPENAI_SDP_URL: &str = "https://api.openai.com/v1/realtime/translations/calls";
 const DEFAULT_MODEL: &str = "gpt-realtime-translate";
+/// A translations session emits `input_transcript` deltas ONLY when an input
+/// transcription model is configured; with none, the client's "what was heard"
+/// confirmation line has no data source at all. `gpt-4o-mini-transcribe` adds
+/// $0.003/min on top of the $0.034/min translate rate and returns the source in
+/// one burst at end of turn — the streaming `gpt-live-transcribe` costs $0.017.
+const INPUT_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 
 #[derive(Deserialize)]
 struct StartRequest {
@@ -374,7 +380,13 @@ async fn mint_ephemeral(
         .to_string();
 
     let body = json!({
-        "session": { "model": model, "audio": { "output": { "language": language } } }
+        "session": {
+            "model": model,
+            "audio": {
+                "input": { "transcription": { "model": INPUT_TRANSCRIPTION_MODEL } },
+                "output": { "language": language }
+            }
+        }
     });
     let headers = Headers::new();
     headers.set("Authorization", &format!("Bearer {}", api_key))?;
