@@ -177,6 +177,74 @@ pub struct OAuthTokenResponse {
     pub refresh_token: String,
 }
 
+/// What Apple's AdServices attribution endpoint says produced an install.
+/// `attributed == false` is Apple's organic answer and carries no campaign data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdServicesAttribution {
+    pub attributed: bool,
+    pub org_id: Option<i64>,
+    pub campaign_id: Option<i64>,
+    pub ad_group_id: Option<i64>,
+    pub keyword_id: Option<i64>,
+    pub ad_id: Option<i64>,
+    pub country_or_region: Option<String>,
+    pub click_date: Option<String>,
+    pub conversion_type: Option<String>,
+}
+
+/// A persisted install attribution, as stored against an existing mako identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallAttribution {
+    pub app_id: String,
+    pub user_id: String,
+    pub attributed: bool,
+    pub campaign_id: Option<i64>,
+    pub ad_group_id: Option<i64>,
+    pub keyword_id: Option<i64>,
+    pub country_or_region: Option<String>,
+    pub created_at: String,
+}
+
+/// Spend-relevant counts for one keyword (or for a campaign's non-keyword
+/// placement, where `keyword_id` is null).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeywordPerformance {
+    pub campaign_id: Option<i64>,
+    pub ad_group_id: Option<i64>,
+    pub keyword_id: Option<i64>,
+    pub country_or_region: Option<String>,
+    pub installs: i64,
+    pub payers: i64,
+    pub purchases: i64,
+    pub revenue_usd_cents: i64,
+    pub reported_net_usd_cents: i64,
+    pub purchases_missing_net: i64,
+    pub revenue_missing_net_usd_cents: i64,
+    pub net_revenue_usd_cents: Option<i64>,
+    pub net_per_payer_usd_cents: Option<i64>,
+    pub revenue_per_payer_usd_cents: Option<i64>,
+    pub first_install_at: Option<String>,
+    pub last_install_at: Option<String>,
+}
+
+/// Window-wide totals accompanying a keyword report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttributionTotals {
+    pub total_installs: i64,
+    pub attributed_installs: i64,
+    pub organic_installs: i64,
+    pub payers: i64,
+    pub purchases: i64,
+    pub revenue_usd_cents: i64,
+    pub reported_net_usd_cents: i64,
+    pub purchases_missing_net: i64,
+    pub revenue_missing_net_usd_cents: i64,
+    pub net_revenue_usd_cents: Option<i64>,
+    pub net_per_payer_usd_cents: Option<i64>,
+    pub revenue_per_payer_usd_cents: Option<i64>,
+    pub store_net_share: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub id: String,

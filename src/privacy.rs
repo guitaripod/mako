@@ -82,6 +82,28 @@ fn einvoicing_section(app: &str) -> &'static str {
     }
 }
 
+/// Apple Ads (AdServices) install measurement, disclosed only for the apps that
+/// actually submit an attribution token to us. Apple's attribution carries the
+/// campaign, ad group, keyword and country — no advertising identifier, no device
+/// identifier, nothing that identifies a person — which is why it needs no
+/// tracking permission and does not make the "no third-party tracking" statement
+/// below untrue.
+///
+/// Solar Beam is deliberately absent even though it runs a campaign: it has no
+/// backend identity and never sends a token, so claiming its campaign data
+/// reaches a server would be a false disclosure. Add it here only if it ever
+/// gains the integration.
+fn ad_measurement_section(app: &str, name: &str) -> String {
+    if !matches!(app, "dreameater" | "payday") {
+        return String::new();
+    }
+    format!(
+        r#"<h2>Advertising measurement</h2>
+<p>We promote {name} with ads on the App Store. If you installed the app after tapping one of those ads, Apple tells our server which campaign, ad group, and search keyword produced the install, and the country the App Store served it in — never who you are. Apple's App Store attribution includes no advertising identifier and no device identifier, which is why it requires no tracking permission. We keep those campaign details alongside your anonymous identity purely to see which ads pay for themselves, we receive nothing that could recognise you in any other app or website, and we never share it.</p>"#,
+        name = name
+    )
+}
+
 fn contact_link(app: &str) -> &'static str {
     if app == "payday" {
         r#"<a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>"#
@@ -116,6 +138,7 @@ fn render(app: &str) -> String {
         ""
     };
     let einvoicing = einvoicing_section(app);
+    let ad_measurement = ad_measurement_section(app, c.name);
     let contact = contact_link(app);
     let on_device = on_device_content(app);
     let purchases = if app == "payday" {
@@ -151,8 +174,9 @@ fn render(app: &str) -> String {
 <h2>On-device data</h2>
 <p>Content you create in the app — such as {on_device} — is stored on your device and is not uploaded to us.</p>
 {location}
+{ad_measurement}
 <h2>What we don't do</h2>
-<p>We do not sell your data, show advertising, or use third-party tracking or advertising identifiers.</p>
+<p>We do not sell your data, show advertising inside the app, or use third-party tracking or advertising identifiers.</p>
 <h2>Your choices</h2>
 <p>{deletion}{consent} For any questions, contact {contact}.</p>
 </body></html>"#,
@@ -162,6 +186,7 @@ fn render(app: &str) -> String {
         einvoicing = einvoicing,
         on_device = on_device,
         location = location,
+        ad_measurement = ad_measurement,
         consent = consent,
         deletion = deletion,
         contact = contact,
@@ -890,4 +915,49 @@ fn render_support(app: &str) -> String {
         app = app,
     );
     page(c.name, "Support", &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn campaign_apps_disclose_apple_ads_measurement() {
+        for app in ["dreameater", "payday"] {
+            let html = render(app);
+            assert!(html.contains("Advertising measurement"), "{} lacks the section", app);
+            assert!(html.contains("no advertising identifier"), "{} omits the no-IDFA promise", app);
+        }
+    }
+
+    #[test]
+    fn apps_without_campaigns_say_nothing_about_ads() {
+        for app in ["pixie", "psybeam", "livingdex", "doublekick", "psywave"] {
+            assert!(!render(app).contains("Advertising measurement"), "{} gained an ads section", app);
+        }
+    }
+
+    /// Solar Beam runs an App Store campaign but sends us nothing, so its page
+    /// must not claim we receive campaign data for it.
+    #[test]
+    fn an_app_that_submits_no_token_claims_no_ad_measurement() {
+        let html = render("solarbeam");
+        assert!(!html.contains("Advertising measurement"));
+        assert!(!html.contains("which campaign, ad group, and search keyword"));
+    }
+
+    #[test]
+    fn no_app_claims_in_app_advertising_or_third_party_tracking() {
+        for app in ["dreameater", "payday", "pixie", "psybeam", "livingdex"] {
+            let html = render(app);
+            assert!(html.contains("show advertising inside the app"));
+            assert!(html.contains("third-party tracking or advertising identifiers"));
+        }
+    }
+
+    #[test]
+    fn on_device_promises_are_unchanged() {
+        assert!(render("payday").contains("stored on your device and is not uploaded to us"));
+        assert!(render("livingdex").contains("stored on your device and is not uploaded to us"));
+    }
 }

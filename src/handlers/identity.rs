@@ -436,6 +436,8 @@ async fn link_inner(
             zero_wallet(&db, &app_id, &anon.user_id).await?;
         }
 
+        crate::attribution::carry_attribution_across_merge(&db, &app_id, &anon.user_id, &existing_id).await?;
+
         console_log!("Merged anonymous {} into apple user {}", anon.user_id, existing_id);
         return Response::from_json(&IdentityResponse {
             api_key: existing_api_key,
@@ -500,10 +502,10 @@ async fn relink_anonymous_to_apple(
 }
 
 /// Delete the authenticated user's account (App Store 5.1.1(v)): removes the
-/// user row, every per-user credit record, and all of the user's generated
-/// images (R2 objects + rows + reports) so nothing of theirs lingers in the
-/// public gallery feed. Scoped to the api-key's own user_id, so a caller can
-/// only ever delete their own account.
+/// user row, every per-user credit record, the user's ad-attribution rows, and
+/// all of the user's generated images (R2 objects + rows + reports) so nothing of
+/// theirs lingers in the public gallery feed. Scoped to the api-key's own
+/// user_id, so a caller can only ever delete their own account.
 pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
     let auth = match authenticate(&req, &db).await {
@@ -514,7 +516,14 @@ pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Resp
 
     purge_user_images(&ctx.env, &db, &uid).await?;
 
-    for table in ["credit_transactions", "credit_purchases", "user_credits", "user_locks"] {
+    for table in [
+        "credit_transactions",
+        "credit_purchases",
+        "user_credits",
+        "user_locks",
+        "install_attributions",
+        "purchase_attributions",
+    ] {
         db.prepare(&format!("DELETE FROM {} WHERE user_id = ?", table))
             .bind(&[uid.clone().into()])?
             .run()

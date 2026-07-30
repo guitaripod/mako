@@ -66,6 +66,8 @@ tags:
     description: Image gallery and management
   - name: Credits
     description: Credit system and billing
+  - name: Attribution
+    description: Apple Ads (AdServices) install attribution and per-keyword payer reporting
   - name: Usage
     description: Usage tracking and statistics
   - name: Admin
@@ -552,6 +554,237 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalServerError'
+
+  # Apple Ads attribution
+  /v1/attribution:
+    post:
+      operationId: submitAdServicesAttribution
+      summary: Exchange an Apple AdServices token for install attribution
+      description: |
+        Takes the opaque token from `AAAttribution.attributionToken()` on first
+        launch, exchanges it server-side with Apple
+        (`https://api-adservices.apple.com/api/v1/`), and stores the resulting
+        campaign, ad group, keyword and country against the caller's identity —
+        the same identity the credits ledger uses. Apple answers
+        `attribution: false` for organic installs, which is recorded as such.
+
+        The raw token is never stored or logged; only its SHA-256 fingerprint is,
+        which is what makes a resubmitted token a no-op rather than a second
+        install. First-touch wins: an identity that already has an attribution
+        row keeps it.
+
+        No advertising identifier, ATT prompt, IDFA or device identifier is
+        involved — AdServices attribution describes the ad, not the person.
+
+        Every exchange outcome answers `200` with an actionable `status`, so ad
+        measurement can never stall or fail app launch:
+
+        | status | meaning | client action |
+        |---|---|---|
+        | `attributed` | Apple returned campaign data | done |
+        | `organic` | Apple returned `attribution: false` | done |
+        | `duplicate` | this token, or this identity, was already recorded | done |
+        | `pending` | Apple replied 404/429/5xx — the record has not propagated | retry after `retry_after_seconds` |
+        | `invalid` | Apple replied 400, or the token is malformed | never retry |
+        | `unavailable` | the exchange could not be attempted right now | retry after `retry_after_seconds` |
+      tags: [Attribution]
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [attribution_token]
+              properties:
+                app_id:
+                  type: string
+                  description: |
+                    Optional tenant id. When present it must equal the
+                    authenticated app (`X-App-ID`), otherwise the request is
+                    rejected with 400.
+                  example: dreameater
+                attribution_token:
+                  type: string
+                  description: The opaque token returned by AAAttribution.attributionToken().
+                token:
+                  type: string
+                  description: Accepted alias for `attribution_token`.
+      responses:
+        '200':
+          description: The exchange outcome. Never an error the client must handle at launch.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, attributed]
+                properties:
+                  status:
+                    type: string
+                    enum: [attributed, organic, duplicate, pending, invalid, unavailable]
+                  attributed:
+                    type: boolean
+                    description: True only when this install came from an Apple Ads campaign.
+                  retry_after_seconds:
+                    type: integer
+                    description: Present for `pending` and `unavailable` only.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/attribution/keywords:
+    get:
+      operationId: getKeywordAttributionReport
+      summary: Per-keyword installs, payers and revenue
+      description: |
+        Spend-relevant counts per (campaign, ad group, keyword) for the
+        authenticated app — the input to the per-keyword pause rule (pause a term
+        at 30 taps with zero installs; taps come from Apple Ads reporting) and to
+        the per-campaign kill rule (cost per payer above 60% of net per payer).
+
+        Installs are filtered by the window; each keyword's purchases cover the
+        whole lifetime of that install cohort, so a keyword's payers include
+        buyers who converted after the window closed. `payers` counts distinct
+        buying identities, never purchases, so a repeat buyer is one payer.
+
+        Net revenue is never guessed. `reported_net_usd_cents` sums only purchases
+        where RevenueCat sent a `takehome_percentage`; the gross of the rest is in
+        `revenue_missing_net_usd_cents` and is netted out with the tenant's
+        `apps.store_net_share` (0.85 under Apple's Small Business Program, 0.70
+        otherwise). When that share is not configured and some purchase has no
+        reported commission, `net_revenue_usd_cents` and `net_per_payer_usd_cents`
+        come back `null` — an unknown net must never read as zero, or a
+        profitable keyword looks like a dead one — and the gross
+        `revenue_per_payer_usd_cents` is there to evaluate the rule by hand.
+      tags: [Attribution, Admin]
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - name: since
+          in: query
+          required: false
+          description: Inclusive lower bound on install time (ISO-8601 date or timestamp).
+          schema:
+            type: string
+          example: '2026-07-01'
+        - name: until
+          in: query
+          required: false
+          description: Exclusive upper bound on install time (ISO-8601 date or timestamp).
+          schema:
+            type: string
+          example: '2026-08-01'
+      responses:
+        '200':
+          description: Keyword rollup plus window totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  app_id:
+                    type: string
+                  since:
+                    type: string
+                  until:
+                    type: string
+                  keywords:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        campaign_id:
+                          type: integer
+                          nullable: true
+                        ad_group_id:
+                          type: integer
+                          nullable: true
+                        keyword_id:
+                          type: integer
+                          nullable: true
+                          description: Null for a campaign placement with no keyword.
+                        country_or_region:
+                          type: string
+                          nullable: true
+                        installs:
+                          type: integer
+                        payers:
+                          type: integer
+                          description: Distinct identities from this keyword that made at least one purchase.
+                        purchases:
+                          type: integer
+                        revenue_usd_cents:
+                          type: integer
+                          description: Gross store revenue from this keyword's install cohort.
+                        reported_net_usd_cents:
+                          type: integer
+                          description: Net revenue RevenueCat actually reported a commission for.
+                        purchases_missing_net:
+                          type: integer
+                          description: Purchases with no store commission reported by RevenueCat.
+                        revenue_missing_net_usd_cents:
+                          type: integer
+                          description: Gross revenue of those purchases, netted out via apps.store_net_share.
+                        net_revenue_usd_cents:
+                          type: integer
+                          nullable: true
+                          description: Null when a commission is unknown and no store_net_share is configured.
+                        net_per_payer_usd_cents:
+                          type: integer
+                          nullable: true
+                          description: Null when the keyword has no payers yet, or net revenue is unknown.
+                        revenue_per_payer_usd_cents:
+                          type: integer
+                          nullable: true
+                          description: Gross revenue per payer. Null only when the keyword has no payers.
+                        first_install_at:
+                          type: string
+                          nullable: true
+                        last_install_at:
+                          type: string
+                          nullable: true
+                  totals:
+                    type: object
+                    description: Install mix for the window, plus the attributed cohort's payers and revenue.
+                    properties:
+                      total_installs:
+                        type: integer
+                      attributed_installs:
+                        type: integer
+                      organic_installs:
+                        type: integer
+                      payers:
+                        type: integer
+                      purchases:
+                        type: integer
+                      revenue_usd_cents:
+                        type: integer
+                      reported_net_usd_cents:
+                        type: integer
+                      purchases_missing_net:
+                        type: integer
+                      revenue_missing_net_usd_cents:
+                        type: integer
+                      net_revenue_usd_cents:
+                        type: integer
+                        nullable: true
+                      net_per_payer_usd_cents:
+                        type: integer
+                        nullable: true
+                      revenue_per_payer_usd_cents:
+                        type: integer
+                        nullable: true
+                      store_net_share:
+                        type: number
+                        nullable: true
+                        description: The apps.store_net_share used for this report, if configured.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   # Capability Endpoints
   /v1/run/chat.completion:

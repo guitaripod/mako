@@ -9,6 +9,7 @@ pub mod oauth_apple_callback;
 pub mod oauth_native;
 pub mod device_auth;
 pub mod identity;
+pub mod attribution;
 pub mod credits;
 pub mod chat;
 pub mod realtime;

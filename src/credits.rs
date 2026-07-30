@@ -411,7 +411,7 @@ pub async fn complete_purchase(
     
     // Get purchase details
     let purchase = db
-        .prepare("SELECT app_id, user_id, pack_id, credits, payment_provider FROM credit_purchases WHERE id = ? AND status = 'pending'")
+        .prepare("SELECT app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider FROM credit_purchases WHERE id = ? AND status = 'pending'")
         .bind(&[purchase_id.into()])?
         .first::<serde_json::Value>(None)
         .await?
@@ -440,7 +440,39 @@ pub async fn complete_purchase(
     };
     add_credits(app_id, user_id, credits, "purchase", &description, Some(purchase_id), db).await?;
 
+    let amount_usd_cents = purchase.get("amount_usd_cents").and_then(|v| v.as_i64()).unwrap_or(0);
+    tag_purchase_attribution(db, app_id, user_id, purchase_id, pack_id, amount_usd_cents).await;
+
     Ok(())
+}
+
+/// Copies the buyer's Apple Ads campaign/keyword onto a completed credit-pack
+/// purchase. Best-effort by design: ad measurement must never be able to fail a
+/// purchase that has already been credited.
+async fn tag_purchase_attribution(
+    db: &D1Database,
+    app_id: &str,
+    user_id: &str,
+    purchase_id: &str,
+    pack_id: &str,
+    amount_usd_cents: i64,
+) {
+    match crate::attribution::tag_purchase(
+        db,
+        app_id,
+        user_id,
+        purchase_id,
+        crate::attribution::PurchaseKind::CreditPack,
+        pack_id,
+        amount_usd_cents,
+        None,
+    )
+    .await
+    {
+        Ok(true) => worker::console_log!("tagged purchase {} with ad attribution", purchase_id),
+        Ok(false) => {}
+        Err(e) => worker::console_log!("could not tag purchase {} with ad attribution: {:?}", purchase_id, e),
+    }
 }
 
 pub async fn get_user_transactions(
@@ -538,11 +570,11 @@ mod tests {
         };
         
         let cost = calculate_openai_cost_usd(&usage);
-        // 100 text tokens: 100/1M * $5 = $0.0005
-        // 100 image tokens: 100/1M * $10 = $0.001
-        // 800 output tokens: 800/1M * $40 = $0.032
-        // Total: $0.0335
-        assert!((cost - 0.0335).abs() < 0.0001);
+        let expected = (100.0 / 1_000_000.0) * 5.0
+            + (100.0 / 1_000_000.0) * 8.0
+            + (800.0 / 1_000_000.0) * 30.0;
+        assert!((cost - expected).abs() < 1e-9);
+        assert!((cost - 0.0253).abs() < 0.0001);
     }
     
     #[test]
@@ -589,14 +621,13 @@ mod tests {
         
         let starter = &packs[0];
         assert_eq!(starter.id, "starter");
-        assert_eq!(starter.credits, 100);
-        assert_eq!(starter.price_usd_cents, 199);
-        
+        assert_eq!(starter.credits, 150);
+        assert_eq!(starter.price_usd_cents, 299);
+
         let enterprise = &packs[4];
         assert_eq!(enterprise.id, "enterprise");
-        assert_eq!(enterprise.credits + enterprise.bonus_credits, 11000);
-        
-        // Verify pricing is sustainable (no free credits)
+        assert_eq!(enterprise.credits + enterprise.bonus_credits, 7000);
+
         for pack in &packs {
             assert!(pack.price_usd_cents > 0, "All packs must have a price");
         }

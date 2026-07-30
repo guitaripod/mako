@@ -2,6 +2,7 @@ use worker::*;
 
 mod models;
 mod error;
+mod attribution;
 mod auth;
 mod handlers;
 mod storage;
@@ -95,6 +96,8 @@ Privacy Policy: /privacy-policy"#)
         .post_async("/v1/auth/device/code", device_auth::start_device_flow)
         .post_async("/v1/auth/device/token", device_auth::poll_device_token)
         .get_async("/v1/auth/device/:device_code/status", device_auth::device_auth_status)
+        .post_async("/v1/attribution", handlers::attribution::submit)
+        .get_async("/v1/attribution/keywords", handlers::attribution::keywords)
         .post_async("/v1/identity/anonymous", identity::anonymous_register)
         .post_async("/v1/identity/link", identity::link)
         .delete_async("/v1/identity", identity::delete_identity)

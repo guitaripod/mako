@@ -1340,6 +1340,68 @@ async fn resolve_tenant_by_product(db: &worker::D1Database, product_id: &str) ->
     Some((app_id, prefix))
 }
 
+/// Tags a paid RevenueCat event that the credits ledger does not itself record —
+/// a subscription, or a product that resolves to no credit pack — with the
+/// buyer's Apple Ads campaign and keyword.
+///
+/// Keyed on the store transaction id, and skipped entirely when a
+/// `credit_purchases` row already exists for that transaction, so a keyword's
+/// revenue is counted exactly once no matter which path credited the purchase.
+/// Best-effort: a webhook must still return 200 to RevenueCat.
+async fn tag_revenuecat_revenue(db: &worker::D1Database, event: &RevenueCatEvent) {
+    let app_id = match db
+        .prepare("SELECT app_id FROM users WHERE id = ?1")
+        .bind(&[event.app_user_id.clone().into()])
+    {
+        Ok(stmt) => match stmt.first::<serde_json::Value>(None).await {
+            Ok(Some(row)) => row.get("app_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+    if app_id.is_empty() {
+        worker::console_log!("No mako identity for RevenueCat user {}; not tagging", event.app_user_id);
+        return;
+    }
+
+    let already_in_ledger = match db
+        .prepare("SELECT id FROM credit_purchases WHERE app_id = ?1 AND payment_id = ?2 AND payment_provider = 'revenuecat'")
+        .bind(&[app_id.clone().into(), event.transaction_id.clone().into()])
+    {
+        Ok(stmt) => matches!(stmt.first::<serde_json::Value>(None).await, Ok(Some(_))),
+        Err(_) => false,
+    };
+    if already_in_ledger {
+        return;
+    }
+
+    let kind = if event.entitlement_id.is_some() {
+        crate::attribution::PurchaseKind::Subscription
+    } else {
+        crate::attribution::PurchaseKind::Unknown
+    };
+    let gross = crate::attribution::usd_to_cents(event.price);
+    let net = crate::attribution::net_cents(gross, event.takehome_percentage);
+    let purchase_id = format!("rc:{}", event.transaction_id);
+
+    match crate::attribution::tag_purchase(
+        db,
+        &app_id,
+        &event.app_user_id,
+        &purchase_id,
+        kind,
+        &event.product_id,
+        gross,
+        net,
+    )
+    .await
+    {
+        Ok(true) => worker::console_log!("tagged {} {} with ad attribution", kind.as_str(), purchase_id),
+        Ok(false) => {}
+        Err(e) => worker::console_log!("could not tag {} with ad attribution: {:?}", purchase_id, e),
+    }
+}
+
 pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
     
@@ -1374,6 +1436,7 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
                 Some(t) => t,
                 None => {
                     worker::console_log!("No tenant matched product {}", event.product_id);
+                    tag_revenuecat_revenue(&db, event).await;
                     return Response::ok("OK");
                 }
             };
@@ -1389,6 +1452,7 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
                 Some(p) => p,
                 None => {
                     worker::console_log!("Unknown pack {} for app {} (product {})", pack_id, app_id, event.product_id);
+                    tag_revenuecat_revenue(&db, event).await;
                     return Response::ok("OK");
                 }
             };
@@ -1421,6 +1485,10 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
             complete_purchase(&purchase_id, &db).await?;
 
             worker::console_log!("Processed RevenueCat purchase {} for app {} user {}", purchase_id, app_id, event.app_user_id);
+        },
+        "NON_RENEWING_PURCHASE" => {
+            let db = env.d1("DB")?;
+            tag_revenuecat_revenue(&db, event).await;
         },
         "CANCELLATION" | "UNCANCELLATION" | "EXPIRATION" => {
             // Handle subscription events (we don't have subscriptions yet)

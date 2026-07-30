@@ -13,6 +13,7 @@
   - `chat.completion` — text + vision, routed by model id to Gemini / OpenAI / **Anthropic Claude**.
   - `image` generation/editing (OpenAI, Gemini).
   - `realtime.translate` — reserved-minute realtime sessions.
+- **Apple Ads attribution** — `POST /v1/attribution` exchanges an AdServices token with Apple server-side and records the campaign/ad group/keyword behind an install; purchases are tagged with it, and `GET /v1/attribution/keywords` reports installs, payers and revenue per keyword. No advertising identifier, no ATT prompt, and the token itself is never stored (only a SHA-256 fingerprint, for idempotency).
 
 ## Providers
 
@@ -38,7 +39,8 @@ Set the tenant's RevenueCat secret if it has a premium tier: `wrangler secret pu
 ## Develop / deploy
 
 ```sh
-cargo check --target wasm32-unknown-unknown   # type-check
+cargo check --target wasm32-unknown-unknown --all-targets   # type-check as CI does
+cargo test --lib                              # unit tests (host target)
 npx wrangler dev                              # local
 npx wrangler deploy                           # production (openai-image-proxy)
 ```
