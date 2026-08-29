@@ -130,7 +130,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
 
                 let per_image_credits = cost_estimate.credits / generation_req.n as u32;
                 let cost_cents = (cost_estimate.credits as f32 / 3.0) as i32;
-                let is_public: i32 = if generation_req.is_public.unwrap_or(true) { 1 } else { 0 };
+                let is_public: i32 = if generation_req.is_public.unwrap_or(false) { 1 } else { 0 };
 
                 let stmt = db.prepare(
                     "INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, provider, model, size, quality, created_at, expires_at, cost_cents, credits_charged, is_public)
@@ -398,7 +398,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
 
                 let per_image_credits = cost_estimate.credits / edit_req.n as u32;
                 let cost_cents = (cost_estimate.credits as f32 / 3.0) as i32;
-                let is_public: i32 = if edit_req.is_public.unwrap_or(true) { 1 } else { 0 };
+                let is_public: i32 = if edit_req.is_public.unwrap_or(false) { 1 } else { 0 };
 
                 let stmt = db.prepare(
                     "INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, provider, model, size, quality, created_at, expires_at, cost_cents, credits_charged, is_public)

@@ -28,7 +28,7 @@ fn build_image_metadata(value: &serde_json::Value) -> ImageMetadata {
         size: value.get("size").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         model: value.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         quality: value.get("quality").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        is_public: value.get("is_public").and_then(|v| v.as_i64()).map(|v| v != 0).unwrap_or(true),
+        is_public: value.get("is_public").and_then(|v| v.as_i64()).map(|v| v != 0).unwrap_or(false),
     }
 }
 
@@ -206,7 +206,7 @@ pub async fn get_image(req: Request, ctx: RouteContext<()>) -> Result<Response> 
 
     match result {
         Some(value) => {
-            let is_public = value.get("is_public").and_then(|v| v.as_i64()).map(|v| v != 0).unwrap_or(true);
+            let is_public = value.get("is_public").and_then(|v| v.as_i64()).map(|v| v != 0).unwrap_or(false);
             if !is_public {
                 let owner_id = value.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
                 let is_owner = crate::auth::authenticate(&req, &db)
