@@ -94,12 +94,12 @@ fn einvoicing_section(app: &str) -> &'static str {
 /// reaches a server would be a false disclosure. Add it here only if it ever
 /// gains the integration.
 fn ad_measurement_section(app: &str, name: &str) -> String {
-    if !matches!(app, "dreameater" | "payday") {
+    if !matches!(app, "dreameater" | "payday" | "psybeam") {
         return String::new();
     }
     format!(
         r#"<h2>Advertising measurement</h2>
-<p>We promote {name} with ads on the App Store. If you installed the app after tapping one of those ads, Apple tells our server which campaign, ad group, and search keyword produced the install, and the country the App Store served it in — never who you are. Apple's App Store attribution includes no advertising identifier and no device identifier, which is why it requires no tracking permission. We keep those campaign details alongside your anonymous identity purely to see which ads pay for themselves, we receive nothing that could recognise you in any other app or website, and we never share it.</p>"#,
+<p>We may promote {name} with ads on the App Store. If you installed the app after tapping one of those ads, Apple tells our server which campaign, ad group, and search keyword produced the install, and the country the App Store served it in — never who you are. Apple's App Store attribution includes no advertising identifier and no device identifier, which is why it requires no tracking permission. We keep those campaign details alongside your anonymous identity purely to see which ads pay for themselves, we receive nothing that could recognise you in any other app or website, and we never share it.</p>"#,
         name = name
     )
 }
@@ -923,7 +923,7 @@ mod tests {
 
     #[test]
     fn campaign_apps_disclose_apple_ads_measurement() {
-        for app in ["dreameater", "payday"] {
+        for app in ["dreameater", "payday", "psybeam"] {
             let html = render(app);
             assert!(html.contains("Advertising measurement"), "{} lacks the section", app);
             assert!(html.contains("no advertising identifier"), "{} omits the no-IDFA promise", app);
@@ -932,7 +932,7 @@ mod tests {
 
     #[test]
     fn apps_without_campaigns_say_nothing_about_ads() {
-        for app in ["pixie", "psybeam", "livingdex", "doublekick", "psywave"] {
+        for app in ["pixie", "livingdex", "doublekick", "psywave"] {
             assert!(!render(app).contains("Advertising measurement"), "{} gained an ads section", app);
         }
     }
