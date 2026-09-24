@@ -7,8 +7,6 @@ use crate::credits::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use uuid::Uuid;
-use chrono::Utc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreditBalanceResponse {
@@ -338,7 +336,6 @@ pub async fn admin_adjust_credits(mut req: Request, ctx: RouteContext<()>) -> Re
     let description = format!("Admin adjustment by {}: {}", admin_user_id, adjust_req.reason);
     
     let new_balance = if adjust_req.amount > 0 {
-        // Positive adjustment - add credits
         add_credits(
             &app_id,
             &adjust_req.user_id,
@@ -349,54 +346,14 @@ pub async fn admin_adjust_credits(mut req: Request, ctx: RouteContext<()>) -> Re
             &db,
         ).await?
     } else {
-        // Negative adjustment - deduct credits but ensure balance doesn't go below 0
-        let current_balance = get_user_balance(&app_id, &adjust_req.user_id, &db).await?;
-        let amount_to_deduct = adjust_req.amount.abs() as u32;
-        
-        // Calculate new balance, but don't go below 0
-        let new_balance = if current_balance >= amount_to_deduct as i32 {
-            current_balance - amount_to_deduct as i32
-        } else {
-            0
-        };
-        
-        // Calculate actual amount deducted
-        let actual_deduction = current_balance - new_balance;
-        
-        // Update balance
-        db.prepare(
-            "UPDATE user_credits
-             SET balance = ?, updated_at = ?
-             WHERE app_id = ? AND user_id = ?"
-        )
-        .bind(&[
-            new_balance.into(),
-            Utc::now().to_rfc3339().into(),
-            app_id.clone().into(),
-            adjust_req.user_id.clone().into(),
-        ])?
-        .run()
-        .await?;
-
-        // Record transaction with actual amount deducted
-        let transaction_id = Uuid::new_v4().to_string();
-        db.prepare(
-            "INSERT INTO credit_transactions (id, app_id, user_id, type, amount, balance_after, description, reference_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)"
-        )
-        .bind(&[
-            transaction_id.into(),
-            app_id.clone().into(),
-            adjust_req.user_id.clone().into(),
-            "admin_adjustment".into(),
-            (-actual_deduction).into(), // Negative amount for deduction
-            new_balance.into(),
-            description.into(),
-            Utc::now().to_rfc3339().into(),
-        ])?
-        .run()
-        .await?;
-        
+        let (new_balance, _actual_deduction) = crate::credits::deduct_credits_clamped(
+            &app_id,
+            &adjust_req.user_id,
+            adjust_req.amount.unsigned_abs(),
+            "admin_adjustment",
+            &description,
+            &db,
+        ).await?;
         new_balance
     };
     

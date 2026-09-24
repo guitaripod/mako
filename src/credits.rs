@@ -228,6 +228,46 @@ pub async fn check_and_reserve_credits(
     Ok(())
 }
 
+/// Records a paywall hit: a metered capability answered 402 because the
+/// wallet's balance was below the rate. Best-effort — a logging failure must
+/// never turn an already-decided 402 into a 500.
+pub async fn record_paywall_event(
+    db: &D1Database,
+    app_id: &str,
+    user_id: &str,
+    capability: &str,
+    balance: i32,
+) {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let stmt = db
+        .prepare(
+            "INSERT INTO paywall_events (id, app_id, user_id, capability, balance, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&[
+            id.into(),
+            app_id.into(),
+            user_id.into(),
+            capability.into(),
+            balance.into(),
+            now.into(),
+        ]);
+    match stmt {
+        Ok(s) => {
+            if let Err(e) = s.run().await {
+                worker::console_log!("record_paywall_event: insert failed: {:?}", e);
+            }
+        }
+        Err(e) => worker::console_log!("record_paywall_event: prepare failed: {:?}", e),
+    }
+}
+
+/// Deducts `amount` credits atomically: the balance check, the write, and the
+/// balance the ledger records as `balance_after` all come from the same
+/// guarded `UPDATE ... RETURNING`, so two concurrent deductions for the same
+/// wallet can never both read the same starting balance and clobber each
+/// other's write (the lost-update race that over-credited live wallets).
 pub async fn deduct_credits(
     app_id: &str,
     user_id: &str,
@@ -239,35 +279,35 @@ pub async fn deduct_credits(
     let transaction_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
-    // Get current balance with lock
-    let current_balance = get_user_balance(app_id, user_id, db).await?;
+    let row = db
+        .prepare(
+            "UPDATE user_credits
+             SET balance = balance - ?, lifetime_spent = lifetime_spent + ?, updated_at = ?
+             WHERE app_id = ? AND user_id = ? AND balance >= ?
+             RETURNING balance",
+        )
+        .bind(&[
+            amount.into(),
+            amount.into(),
+            now.clone().into(),
+            app_id.into(),
+            user_id.into(),
+            amount.into(),
+        ])?
+        .first::<serde_json::Value>(None)
+        .await?;
 
-    if current_balance < amount as i32 {
-        return Err(AppError::PaymentRequired(format!(
-            "Insufficient credits. Need {} credits, have {}",
-            amount, current_balance
-        )).into());
-    }
+    let new_balance = match row {
+        Some(v) => v.get("balance").and_then(|b| b.as_i64()).unwrap_or(0) as i32,
+        None => {
+            let current_balance = get_user_balance(app_id, user_id, db).await?;
+            return Err(AppError::PaymentRequired(format!(
+                "Insufficient credits. Need {} credits, have {}",
+                amount, current_balance
+            )).into());
+        }
+    };
 
-    let new_balance = current_balance - amount as i32;
-
-    // Update balance
-    db.prepare(
-        "UPDATE user_credits
-         SET balance = ?, lifetime_spent = lifetime_spent + ?, updated_at = ?
-         WHERE app_id = ? AND user_id = ?"
-    )
-    .bind(&[
-        new_balance.into(),
-        amount.into(),
-        now.clone().into(),
-        app_id.into(),
-        user_id.into(),
-    ])?
-    .run()
-    .await?;
-
-    // Record transaction
     db.prepare(
         "INSERT INTO credit_transactions (id, app_id, user_id, type, amount, balance_after, description, reference_id, created_at)
          VALUES (?, ?, ?, 'spend', ?, ?, ?, ?, ?)"
@@ -288,6 +328,12 @@ pub async fn deduct_credits(
     Ok(new_balance)
 }
 
+/// Adds `amount` credits atomically, mirroring `deduct_credits`: the write and
+/// the ledger's `balance_after` both come from the same `UPDATE ... RETURNING`,
+/// so a concurrent deduction on the same wallet can never be lost underneath a
+/// stale-balance write. A missing `user_credits` row is a bug (one is always
+/// created at registration, before any add/deduct is possible) surfaced as an
+/// error rather than silently dropped.
 pub async fn add_credits(
     app_id: &str,
     user_id: &str,
@@ -300,23 +346,20 @@ pub async fn add_credits(
     let transaction_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
-    // Get current balance
-    let current_balance = get_user_balance(app_id, user_id, db).await?;
-    let new_balance = current_balance + amount as i32;
-
-    // Update balance and lifetime_purchased if it's a purchase
     let update_query = if transaction_type == "purchase" {
         "UPDATE user_credits
-         SET balance = ?, lifetime_purchased = lifetime_purchased + ?, updated_at = ?
-         WHERE app_id = ? AND user_id = ?"
+         SET balance = balance + ?, lifetime_purchased = lifetime_purchased + ?, updated_at = ?
+         WHERE app_id = ? AND user_id = ?
+         RETURNING balance"
     } else {
         "UPDATE user_credits
-         SET balance = ?, updated_at = ?
-         WHERE app_id = ? AND user_id = ?"
+         SET balance = balance + ?, updated_at = ?
+         WHERE app_id = ? AND user_id = ?
+         RETURNING balance"
     };
 
     let mut params = vec![
-        new_balance.into(),
+        amount.into(),
     ];
 
     if transaction_type == "purchase" {
@@ -327,12 +370,18 @@ pub async fn add_credits(
     params.push(app_id.into());
     params.push(user_id.into());
 
-    db.prepare(update_query)
+    let new_balance = db
+        .prepare(update_query)
         .bind(&params)?
-        .run()
-        .await?;
+        .first::<serde_json::Value>(None)
+        .await?
+        .ok_or_else(|| AppError::InternalError(format!(
+            "add_credits: no user_credits row for {}/{}", app_id, user_id
+        )))?
+        .get("balance")
+        .and_then(|b| b.as_i64())
+        .unwrap_or(0) as i32;
 
-    // Record transaction
     db.prepare(
         "INSERT INTO credit_transactions (id, app_id, user_id, type, amount, balance_after, description, reference_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -352,6 +401,73 @@ pub async fn add_credits(
     .await?;
 
     Ok(new_balance)
+}
+
+/// Deducts up to `amount` credits, clamping to whatever remains rather than
+/// failing when the balance is short — for admin corrections that must be able
+/// to zero out a wallet in one call. Atomic via compare-and-swap: each attempt
+/// reads the balance, then writes guarded on that exact value still holding,
+/// so a concurrent mutation (a refund, a purchase) on the same wallet is never
+/// clobbered, only retried against. Returns the resulting balance and the
+/// amount actually deducted.
+pub async fn deduct_credits_clamped(
+    app_id: &str,
+    user_id: &str,
+    amount: u32,
+    transaction_type: &str,
+    description: &str,
+    db: &D1Database,
+) -> Result<(i32, u32)> {
+    for _ in 0..8 {
+        let current = get_user_balance(app_id, user_id, db).await?;
+        if current <= 0 {
+            return Ok((current.max(0), 0));
+        }
+        let to_deduct = amount.min(current as u32);
+        let now = Utc::now().to_rfc3339();
+
+        let row = db
+            .prepare(
+                "UPDATE user_credits
+                 SET balance = balance - ?, lifetime_spent = lifetime_spent + ?, updated_at = ?
+                 WHERE app_id = ? AND user_id = ? AND balance = ?
+                 RETURNING balance",
+            )
+            .bind(&[
+                to_deduct.into(),
+                to_deduct.into(),
+                now.clone().into(),
+                app_id.into(),
+                user_id.into(),
+                current.into(),
+            ])?
+            .first::<serde_json::Value>(None)
+            .await?;
+
+        let Some(row) = row else { continue };
+        let new_balance = row.get("balance").and_then(|b| b.as_i64()).unwrap_or(0) as i32;
+
+        let transaction_id = Uuid::new_v4().to_string();
+        db.prepare(
+            "INSERT INTO credit_transactions (id, app_id, user_id, type, amount, balance_after, description, reference_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)"
+        )
+        .bind(&[
+            transaction_id.into(),
+            app_id.into(),
+            user_id.into(),
+            transaction_type.into(),
+            (-(to_deduct as i32)).into(),
+            new_balance.into(),
+            description.into(),
+            now.into(),
+        ])?
+        .run()
+        .await?;
+
+        return Ok((new_balance, to_deduct));
+    }
+    Err(AppError::InternalError("deduct_credits_clamped: too much contention".to_string()).into())
 }
 
 pub async fn record_purchase(
@@ -388,50 +504,38 @@ pub async fn record_purchase(
     Ok(purchase_id)
 }
 
+/// Completes a pending purchase atomically: the pending -> completed status
+/// flip is a single guarded `UPDATE ... RETURNING`, so two concurrent callers
+/// (the payment webhook, the client's status poll, and the RevenueCat
+/// fast-track path can all reach this for the same purchase) can never both
+/// see 'pending' and both grant credits for it.
 pub async fn complete_purchase(
     purchase_id: &str,
     db: &D1Database,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    
-    // First check if purchase is already completed
-    let existing = db
-        .prepare("SELECT status FROM credit_purchases WHERE id = ?")
-        .bind(&[purchase_id.into()])?
+
+    let claimed = db
+        .prepare(
+            "UPDATE credit_purchases SET status = 'completed', completed_at = ?
+             WHERE id = ? AND status = 'pending'
+             RETURNING app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider",
+        )
+        .bind(&[now.into(), purchase_id.into()])?
         .first::<serde_json::Value>(None)
         .await?;
-    
-    if let Some(purchase) = existing {
-        if purchase.get("status").and_then(|s| s.as_str()) == Some("completed") {
-            // Already completed, return success (idempotent)
-            worker::console_log!("Purchase {} already completed, skipping", purchase_id);
-            return Ok(());
-        }
-    }
-    
-    // Get purchase details
-    let purchase = db
-        .prepare("SELECT app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider FROM credit_purchases WHERE id = ? AND status = 'pending'")
-        .bind(&[purchase_id.into()])?
-        .first::<serde_json::Value>(None)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Purchase not found".to_string()))?;
+
+    let purchase = match claimed {
+        Some(p) => p,
+        None => return complete_purchase_already_claimed(purchase_id, db).await,
+    };
 
     let app_id = purchase.get("app_id").and_then(|v| v.as_str()).unwrap_or("pixie");
     let user_id = purchase.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
     let pack_id = purchase.get("pack_id").and_then(|v| v.as_str()).unwrap_or("");
     let credits = purchase.get("credits").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
     let payment_provider = purchase.get("payment_provider").and_then(|v| v.as_str()).unwrap_or("");
-    
-    // Update purchase status
-    db.prepare(
-        "UPDATE credit_purchases SET status = 'completed', completed_at = ? WHERE id = ?"
-    )
-    .bind(&[now.into(), purchase_id.into()])?
-    .run()
-    .await?;
-    
-    // Add credits to user with proper description
+
     let description = match payment_provider {
         "revenuecat" => format!("App Store purchase: {} pack", pack_id),
         "stripe" => format!("Card purchase: {} pack", pack_id),
@@ -444,6 +548,26 @@ pub async fn complete_purchase(
     tag_purchase_attribution(db, app_id, user_id, purchase_id, pack_id, amount_usd_cents).await;
 
     Ok(())
+}
+
+/// The status flip in `complete_purchase` matched no row: either the purchase
+/// was already completed by a concurrent caller (idempotent no-op) or it
+/// never existed / is in a terminal non-pending state (a real error).
+async fn complete_purchase_already_claimed(purchase_id: &str, db: &D1Database) -> Result<()> {
+    let status = db
+        .prepare("SELECT status FROM credit_purchases WHERE id = ?")
+        .bind(&[purchase_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string()));
+
+    match status.as_deref() {
+        Some("completed") => {
+            worker::console_log!("Purchase {} already completed, skipping", purchase_id);
+            Ok(())
+        }
+        _ => Err(AppError::NotFound("Purchase not found".to_string()).into()),
+    }
 }
 
 /// Copies the buyer's Apple Ads campaign/keyword onto a completed credit-pack

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use chrono::{Utc, Duration};
 use crate::error::AppError;
 use crate::auth::authenticate;
-use crate::credits::{get_user_balance, get_flat_capability_cost, deduct_credits, add_credits};
+use crate::credits::{get_user_balance, get_flat_capability_cost, deduct_credits, add_credits, record_paywall_event};
 
 const CAPABILITY: &str = "realtime.translate";
 const DEFAULT_RATE_CREDITS: u32 = 1; // 1 credit per minute
@@ -93,6 +93,7 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
     let balance = get_user_balance(&auth.app_id, &auth.user_id, &db).await?;
     let affordable_minutes = balance / rate as i32;
     if affordable_minutes < 1 {
+        record_paywall_event(&db, &auth.app_id, &auth.user_id, CAPABILITY, balance).await;
         return Err(AppError::PaymentRequired(format!(
             "Insufficient credits. Need {} per minute, have {}.",
             rate, balance

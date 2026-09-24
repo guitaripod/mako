@@ -420,7 +420,7 @@ async fn link_inner(
             .map_err(AppError::from);
         }
 
-        let anon_balance = get_user_balance(&app_id, &anon.user_id, &db).await? as u32;
+        let anon_balance = drain_wallet(&db, &app_id, &anon.user_id).await?;
         if anon_balance > 0 {
             add_credits(
                 &app_id,
@@ -432,8 +432,6 @@ async fn link_inner(
                 &db,
             )
             .await?;
-
-            zero_wallet(&db, &app_id, &anon.user_id).await?;
         }
 
         crate::attribution::carry_attribution_across_merge(&db, &app_id, &anon.user_id, &existing_id).await?;
@@ -614,11 +612,29 @@ pub async fn charge_capability(mut req: Request, ctx: RouteContext<()>) -> Resul
     }
 }
 
-async fn zero_wallet(db: &D1Database, app_id: &str, user_id: &str) -> std::result::Result<(), AppError> {
-    let now = Utc::now().to_rfc3339();
-    db.prepare("UPDATE user_credits SET balance = 0, updated_at = ? WHERE app_id = ? AND user_id = ?")
-        .bind(&[now.into(), app_id.into(), user_id.into()])?
-        .run()
-        .await?;
-    Ok(())
+/// Atomically zeroes `user_id`'s wallet and returns exactly what was drained.
+/// Retries on contention (a refund or a settle landing on the anonymous
+/// wallet mid-merge) so the amount later credited to the linked account is
+/// always exactly what left this one — never a stale snapshot that a
+/// concurrent mutation is silently overwritten by.
+async fn drain_wallet(db: &D1Database, app_id: &str, user_id: &str) -> std::result::Result<u32, AppError> {
+    loop {
+        let current = get_user_balance(app_id, user_id, db).await?;
+        if current <= 0 {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let claimed = db
+            .prepare(
+                "UPDATE user_credits SET balance = 0, updated_at = ?
+                 WHERE app_id = ? AND user_id = ? AND balance = ?
+                 RETURNING balance",
+            )
+            .bind(&[now.into(), app_id.into(), user_id.into(), current.into()])?
+            .first::<Value>(None)
+            .await?;
+        if claimed.is_some() {
+            return Ok(current as u32);
+        }
+    }
 }
