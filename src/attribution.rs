@@ -102,7 +102,7 @@ pub fn parse_attribution(body: &str) -> std::result::Result<AdServicesAttributio
         .and_then(|v| v.as_bool())
         .ok_or("apple response had no attribution flag")?;
 
-    if !attributed {
+    if !attributed || is_sample_payload(&value) {
         return Ok(AdServicesAttribution::default());
     }
 
@@ -123,6 +123,17 @@ pub fn parse_attribution(body: &str) -> std::result::Result<AdServicesAttributio
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
     })
+}
+
+/// Campaign id in the fixed sample payload AdServices returns for development
+/// and TestFlight builds, where no real ad tap can exist.
+const SAMPLE_CAMPAIGN_ID: i64 = 1_234_567_890;
+
+/// Whether Apple answered with its development-build sample payload rather
+/// than a real ad tap. Recording it as paid would credit a campaign that never
+/// ran with an install that only a developer's own build produced.
+fn is_sample_payload(value: &serde_json::Value) -> bool {
+    value.get("campaignId").and_then(|v| v.as_i64()) == Some(SAMPLE_CAMPAIGN_ID)
 }
 
 /// Exchanges the token with Apple. The token travels in the request body as
@@ -648,6 +659,16 @@ mod tests {
         assert_eq!(parsed.keyword_id, Some(87675432));
         assert_eq!(parsed.country_or_region.as_deref(), Some("US"));
         assert_eq!(parsed.conversion_type.as_deref(), Some("Download"));
+    }
+
+    #[test]
+    fn development_sample_payload_is_not_a_paid_install() {
+        let body = r#"{"attribution": true, "orgId": 1234567890, "campaignId": 1234567890,
+            "conversionType": "Download", "clickDate": "2026-09-24T21:29Z",
+            "adGroupId": 1234567890, "countryOrRegion": "US", "keywordId": 12323222, "adId": 1234567890}"#;
+        let parsed = parse_attribution(body).unwrap();
+        assert!(!parsed.attributed);
+        assert_eq!(parsed.campaign_id, None);
     }
 
     #[test]
