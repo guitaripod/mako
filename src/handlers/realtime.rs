@@ -120,7 +120,7 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
         Ok(m) => m,
         Err(e) => {
             // No session was opened — give the reservation back.
-            let _ = add_credits(
+            if let Err(refund_err) = add_credits(
                 &auth.app_id,
                 &auth.user_id,
                 reserved_credits,
@@ -129,7 +129,13 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
                 Some(&session_id),
                 &db,
             )
-            .await;
+            .await
+            {
+                console_log!(
+                    "realtime start: mint failed AND refund of {} credits failed for {}/{}: {:?}",
+                    reserved_credits, auth.app_id, auth.user_id, refund_err
+                );
+            }
             return Err(e);
         }
     };

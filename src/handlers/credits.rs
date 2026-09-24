@@ -3,7 +3,7 @@ use crate::error::AppError;
 use crate::auth;
 use crate::credits::{
     get_user_balance, get_user_transactions, get_credit_packs, get_credit_packs_for_app,
-    record_purchase, complete_purchase, add_credits, estimate_image_cost
+    record_purchase, complete_purchase, record_and_complete_purchase, add_credits, estimate_image_cost
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -981,8 +981,7 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
         }
     }
 
-    // Verified. Record + complete (idempotent; the dedup check above prevents double-grant).
-    let purchase_id = record_purchase(
+    let purchase_id = record_and_complete_purchase(
         &app_id,
         &user_id,
         &validate_req.pack_id,
@@ -992,8 +991,6 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
         &validate_req.purchase_token,
         &db,
     ).await?;
-
-    complete_purchase(&purchase_id, &db).await?;
 
     let new_balance = get_user_balance(&app_id, &user_id, &db).await?;
 
@@ -1428,7 +1425,7 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
                 return Response::ok("OK");
             }
 
-            let purchase_id = record_purchase(
+            let purchase_id = record_and_complete_purchase(
                 &app_id,
                 &event.app_user_id,
                 &pack_id,
@@ -1438,8 +1435,6 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
                 &event.transaction_id,
                 &db,
             ).await?;
-
-            complete_purchase(&purchase_id, &db).await?;
 
             worker::console_log!("Processed RevenueCat purchase {} for app {} user {}", purchase_id, app_id, event.app_user_id);
         },

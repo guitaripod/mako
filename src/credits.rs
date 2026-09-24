@@ -504,6 +504,71 @@ pub async fn record_purchase(
     Ok(purchase_id)
 }
 
+/// Records a RevenueCat purchase and completes it, guarding against a second
+/// `credit_purchases` row ever being created for the same
+/// `(app_id, payment_provider, payment_id)` — the webhook and the client
+/// fast-track both reach this for the same external transaction and can race
+/// each other, unlike Stripe/crypto where the caller already holds a single
+/// `purchase_id` minted up front. The insert-or-noop is one guarded statement
+/// (mirrors the `UPDATE ... RETURNING` guard above: D1 serializes writes, so a
+/// second identical attempt always sees the first one's committed row), so at
+/// most one row — and one `complete_purchase` grant — can ever exist per
+/// transaction, however many callers race.
+pub async fn record_and_complete_purchase(
+    app_id: &str,
+    user_id: &str,
+    pack_id: &str,
+    credits: u32,
+    amount_usd_cents: u32,
+    payment_provider: &str,
+    payment_id: &str,
+    db: &D1Database,
+) -> Result<String> {
+    let candidate_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+
+    db.prepare(
+        "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?
+         WHERE NOT EXISTS (
+             SELECT 1 FROM credit_purchases WHERE app_id = ? AND payment_provider = ? AND payment_id = ?
+         )",
+    )
+    .bind(&[
+        candidate_id.into(),
+        app_id.into(),
+        user_id.into(),
+        pack_id.into(),
+        credits.into(),
+        amount_usd_cents.into(),
+        payment_provider.into(),
+        payment_id.into(),
+        now.into(),
+        app_id.into(),
+        payment_provider.into(),
+        payment_id.into(),
+    ])?
+    .run()
+    .await?;
+
+    let purchase_id = db
+        .prepare(
+            "SELECT id FROM credit_purchases
+             WHERE app_id = ? AND payment_provider = ? AND payment_id = ?
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(&[app_id.into(), payment_provider.into(), payment_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(|s| s.to_string()))
+        .ok_or_else(|| AppError::InternalError(format!(
+            "record_and_complete_purchase: row vanished for {}/{}/{}", app_id, payment_provider, payment_id
+        )))?;
+
+    complete_purchase(&purchase_id, db).await?;
+    Ok(purchase_id)
+}
+
 /// Completes a pending purchase atomically: the pending -> completed status
 /// flip is a single guarded `UPDATE ... RETURNING`, so two concurrent callers
 /// (the payment webhook, the client's status poll, and the RevenueCat

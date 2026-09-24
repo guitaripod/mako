@@ -616,9 +616,11 @@ pub async fn charge_capability(mut req: Request, ctx: RouteContext<()>) -> Resul
 /// Retries on contention (a refund or a settle landing on the anonymous
 /// wallet mid-merge) so the amount later credited to the linked account is
 /// always exactly what left this one — never a stale snapshot that a
-/// concurrent mutation is silently overwritten by.
+/// concurrent mutation is silently overwritten by. Bounded like
+/// `deduct_credits_clamped`'s CAS loop, so pathological contention fails loud
+/// instead of retrying forever.
 async fn drain_wallet(db: &D1Database, app_id: &str, user_id: &str) -> std::result::Result<u32, AppError> {
-    loop {
+    for _ in 0..8 {
         let current = get_user_balance(app_id, user_id, db).await?;
         if current <= 0 {
             return Ok(0);
@@ -637,4 +639,5 @@ async fn drain_wallet(db: &D1Database, app_id: &str, user_id: &str) -> std::resu
             return Ok(current as u32);
         }
     }
+    Err(AppError::InternalError("drain_wallet: too much contention".to_string()))
 }
