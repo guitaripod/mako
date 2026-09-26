@@ -37,7 +37,7 @@ fn config(app: &str) -> AppPrivacy {
         },
         "psywave" => AppPrivacy {
             name: "Psywave",
-            ai: "the description or photo you provide is sent to OpenAI to generate a playlist",
+            ai: "the description or photo you provide is sent to Google Gemini to generate a playlist",
             uses_location: false,
             voice_consent: false,
         },
