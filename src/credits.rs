@@ -700,6 +700,9 @@ pub fn estimate_image_cost(
     size: &str,
     is_edit: bool,
 ) -> u32 {
+    if let Some(gemini_model) = crate::providers::gemini::GeminiImageModel::from_model_id(model) {
+        return gemini_model.credits_per_image();
+    }
     if model.starts_with("gemini") {
         return 21;
     }
@@ -782,6 +785,9 @@ mod tests {
         assert_eq!(estimate_image_cost("gemini-2.5-flash", "low", "1024x1024", false), 21);
         assert_eq!(estimate_image_cost("gemini-2.5-flash", "low", "1536x1024", true), 21);
         assert_eq!(estimate_image_cost("gemini-2.5-flash", "high", "auto", false), 21);
+        assert_eq!(estimate_image_cost("gemini-3.1-flash-image", "low", "auto", true), 21);
+        assert_eq!(estimate_image_cost("gemini-3-pro-image", "low", "auto", false), 41);
+        assert_eq!(estimate_image_cost("gemini-3-pro-image", "high", "auto", true), 41);
 
         // Test OpenAI generation costs
         assert_eq!(estimate_image_cost("gpt-image-1", "low", "1024x1024", false), 4);

@@ -7,9 +7,57 @@ use crate::deployment::{DeploymentConfig, DeploymentMode};
 use super::{ImageProvider, UnifiedImageRequest, UnifiedEditRequest, ProviderResponse, ImageBytes, CostEstimate, ProviderFeatures};
 use crate::models::ImageUsage;
 
-const GEMINI_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent";
-const GEMINI_CREDITS_PER_IMAGE: u32 = 21;
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_IMAGE_ATTEMPTS: usize = 3;
+
+/// The Gemini image tiers mako sells. Every legacy Nano Banana id a shipped client
+/// still sends rides the current flash model, so old app versions keep working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiImageModel {
+    NanoBanana2,
+    NanoBananaPro,
+}
+
+impl GeminiImageModel {
+    pub fn from_model_id(model: &str) -> Option<Self> {
+        match model {
+            "gemini-2.5-flash" | "gemini-2.5-flash-image-preview" | "gemini-2.5-flash-image"
+            | "gemini-3.1-flash" | "gemini-3.1-flash-image" => Some(Self::NanoBanana2),
+            "gemini-3-pro-image" | "gemini-3-pro-image-preview" | "nano-banana-pro" => Some(Self::NanoBananaPro),
+            _ => None,
+        }
+    }
+
+    fn api_model(self) -> &'static str {
+        match self {
+            Self::NanoBanana2 => "gemini-3.1-flash-image",
+            Self::NanoBananaPro => "gemini-3-pro-image",
+        }
+    }
+
+    /// Google's 1K list price × 3 × 100, rounded up: Nano Banana 2 $0.067 → 21,
+    /// Nano Banana Pro $0.134 → 41.
+    pub fn credits_per_image(self) -> u32 {
+        match self {
+            Self::NanoBanana2 => 21,
+            Self::NanoBananaPro => 41,
+        }
+    }
+}
+
+/// Splits a `data:<mime>;base64,<payload>` input into its MIME type and payload. A bare
+/// base64 string is treated as JPEG, which is what clients sent before data URLs.
+fn split_image_input(input: &str) -> std::result::Result<(String, String), AppError> {
+    let Some(rest) = input.strip_prefix("data:") else {
+        return Ok(("image/jpeg".to_string(), input.to_string()));
+    };
+    let Some((header, payload)) = rest.split_once(',') else {
+        return Err(AppError::BadRequest("Invalid image data URL".to_string()));
+    };
+    let mime = header.split(';').next().unwrap_or("").trim();
+    let mime = if mime.starts_with("image/") { mime } else { "image/jpeg" };
+    Ok((mime.to_string(), payload.to_string()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GeminiRequest {
@@ -70,10 +118,11 @@ struct PromptFeedback {
 
 pub struct GeminiProvider {
     api_key: String,
+    model: GeminiImageModel,
 }
 
 impl GeminiProvider {
-    pub fn new(env: &Env) -> Result<Self> {
+    pub fn new(env: &Env, model: GeminiImageModel) -> Result<Self> {
         let deployment_config = DeploymentConfig::from_env(env)
             .map_err(|e| worker::Error::from(AppError::InternalError(format!("Deployment config error: {:?}", e))))?;
 
@@ -88,11 +137,11 @@ impl GeminiProvider {
             }
         };
 
-        Ok(Self { api_key })
+        Ok(Self { api_key, model })
     }
 
     pub fn with_api_key(api_key: String) -> Self {
-        Self { api_key }
+        Self { api_key, model: GeminiImageModel::NanoBanana2 }
     }
 
     fn image_generation_config() -> Option<GenerationConfig> {
@@ -111,7 +160,8 @@ impl GeminiProvider {
             .with_headers(headers)
             .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&serde_json::to_string(request_body)?)));
 
-        let request = WorkerRequest::new_with_init(GEMINI_API_URL, &init)?;
+        let url = format!("{}/{}:generateContent", GEMINI_API_BASE, self.model.api_model());
+        let request = WorkerRequest::new_with_init(&url, &init)?;
         let mut response = Fetch::Request(request).send().await?;
 
         if response.status_code() >= 400 {
@@ -232,22 +282,14 @@ impl ImageProvider for GeminiProvider {
         let mut all_images = Vec::new();
         let mut all_prompts = Vec::new();
 
-        let input_image_data = if request.image[0].starts_with("data:") {
-            let parts: Vec<&str> = request.image[0].split(',').collect();
-            if parts.len() != 2 {
-                return Err(AppError::BadRequest("Invalid image data URL".to_string()).into());
-            }
-            parts[1].to_string()
-        } else {
-            request.image[0].clone()
-        };
+        let (input_mime_type, input_image_data) = split_image_input(&request.image[0])?;
 
         for _ in 0..n {
             let parts = vec![
                 GeminiPart::Text { text: request.prompt.clone() },
                 GeminiPart::Image {
                     inline_data: InlineData {
-                        mime_type: "image/jpeg".to_string(),
+                        mime_type: input_mime_type.clone(),
                         data: input_image_data.clone(),
                     },
                 },
@@ -279,15 +321,15 @@ impl ImageProvider for GeminiProvider {
     fn estimate_cost(&self, request: &UnifiedImageRequest) -> CostEstimate {
         let n = request.n.unwrap_or(1) as u32;
         CostEstimate {
-            credits: GEMINI_CREDITS_PER_IMAGE * n,
+            credits: self.model.credits_per_image() * n,
             provider: "gemini".to_string(),
         }
     }
 
-    fn estimate_edit_cost(&self, _request: &UnifiedEditRequest) -> CostEstimate {
-        let n = _request.n.unwrap_or(1) as u32;
+    fn estimate_edit_cost(&self, request: &UnifiedEditRequest) -> CostEstimate {
+        let n = request.n.unwrap_or(1) as u32;
         CostEstimate {
-            credits: GEMINI_CREDITS_PER_IMAGE * n,
+            credits: self.model.credits_per_image() * n,
             provider: "gemini".to_string(),
         }
     }
@@ -306,5 +348,45 @@ impl ImageProvider for GeminiProvider {
 
     fn get_name(&self) -> &str {
         "gemini"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_and_current_flash_ids_resolve_to_nano_banana_2() {
+        for id in ["gemini-2.5-flash", "gemini-2.5-flash-image", "gemini-3.1-flash-image"] {
+            assert_eq!(GeminiImageModel::from_model_id(id), Some(GeminiImageModel::NanoBanana2));
+        }
+        assert_eq!(GeminiImageModel::NanoBanana2.api_model(), "gemini-3.1-flash-image");
+        assert_eq!(GeminiImageModel::NanoBanana2.credits_per_image(), 21);
+    }
+
+    #[test]
+    fn pro_ids_resolve_to_nano_banana_pro() {
+        for id in ["gemini-3-pro-image", "gemini-3-pro-image-preview", "nano-banana-pro"] {
+            assert_eq!(GeminiImageModel::from_model_id(id), Some(GeminiImageModel::NanoBananaPro));
+        }
+        assert_eq!(GeminiImageModel::NanoBananaPro.api_model(), "gemini-3-pro-image");
+        assert_eq!(GeminiImageModel::NanoBananaPro.credits_per_image(), 41);
+        assert_eq!(GeminiImageModel::from_model_id("gpt-image-2"), None);
+    }
+
+    #[test]
+    fn data_url_keeps_its_mime_type() {
+        let (mime, data) = split_image_input("data:image/png;base64,AAAA").unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, "AAAA");
+        let (mime, _) = split_image_input("data:image/webp;base64,BBBB").unwrap();
+        assert_eq!(mime, "image/webp");
+    }
+
+    #[test]
+    fn bare_base64_and_odd_headers_fall_back_to_jpeg() {
+        assert_eq!(split_image_input("CCCC").unwrap(), ("image/jpeg".to_string(), "CCCC".to_string()));
+        assert_eq!(split_image_input("data:;base64,DDDD").unwrap().0, "image/jpeg");
+        assert!(split_image_input("data:image/png;base64").is_err());
     }
 }
