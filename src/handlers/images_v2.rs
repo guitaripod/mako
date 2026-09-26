@@ -1,9 +1,9 @@
-use worker::{Request, Response, RouteContext, Result};
+use worker::{D1Database, Request, Response, RouteContext, Result};
 use crate::models::{ImageGenerationRequest, ImageEditRequest, ImageResponse, ImageData, UsageRecord, ErrorResponse, ErrorDetail};
 use crate::error::AppError;
 use crate::auth;
 use crate::storage::store_image_from_bytes;
-use crate::credits::{check_and_reserve_credits, deduct_credits, get_flat_capability_cost};
+use crate::credits::{check_and_reserve_credits, deduct_credits, get_flat_capability_cost, get_user_balance, record_paywall_event};
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 use crate::providers::{self, UnifiedImageRequest, UnifiedEditRequest};
 use crate::{log_debug, log_error};
@@ -75,7 +75,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
 
     if let Err(e) = check_and_reserve_credits(&app_id, &user_id, cost_estimate.credits, &db).await {
         let _ = release_lock(&app_id, &user_id, &db).await;
-        return AppError::from(e).to_response();
+        return credit_check_failure_response(e, &db, &app_id, &user_id, "image.generate").await;
     }
 
     log_debug!("Sending request to provider", json!({
@@ -91,20 +91,21 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
             let _ = release_lock(&app_id, &user_id, &db).await;
 
             let error_msg = e.to_string();
-            if error_msg.contains("content_policy_violation") || error_msg.contains("moderation") {
-                let custom_error = ErrorResponse {
-                    error: ErrorDetail {
-                        message: "Our AI backend is being a bit too cautious with this image. Nothing wrong on your end - just the underlying service being overly protective. Try a different prompt and you should be good to go!".to_string(),
-                        error_type: "moderation_error".to_string(),
-                        param: None,
-                        code: Some("moderation_blocked".to_string()),
-                    }
-                };
-                return Response::from_json(&custom_error)
-                    .map(|r| r.with_status(400));
-            }
-            
-            return Err(e);
+            record_failed_request(&db, FailedRequest {
+                app_id: &app_id,
+                user_id: &user_id,
+                request_type: "generation",
+                provider: provider.get_name(),
+                model: &generation_req.model,
+                prompt: &generation_req.prompt,
+                size: &generation_req.size,
+                quality: &generation_req.quality,
+                image_count: generation_req.n,
+                input_images_count: None,
+                response_time_ms: (worker::Date::now().as_millis() - start_time) as u32,
+                error: &error_msg,
+            }).await;
+            return provider_failure_response(&error_msg, "prompt");
         }
     };
 
@@ -345,7 +346,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
 
     if let Err(e) = check_and_reserve_credits(&app_id, &user_id, cost_estimate.credits, &db).await {
         let _ = release_lock(&app_id, &user_id, &db).await;
-        return AppError::from(e).to_response();
+        return credit_check_failure_response(e, &db, &app_id, &user_id, "image.edit").await;
     }
 
     log_debug!("Sending edit request to provider", json!({
@@ -361,20 +362,21 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
             let _ = release_lock(&app_id, &user_id, &db).await;
 
             let error_msg = e.to_string();
-            if error_msg.contains("content_policy_violation") || error_msg.contains("moderation") {
-                let custom_error = ErrorResponse {
-                    error: ErrorDetail {
-                        message: "Our AI backend is being a bit too cautious with this image. Nothing wrong on your end - just the underlying service being overly protective. Try a different image and you should be good to go!".to_string(),
-                        error_type: "moderation_error".to_string(),
-                        param: None,
-                        code: Some("moderation_blocked".to_string()),
-                    }
-                };
-                return Response::from_json(&custom_error)
-                    .map(|r| r.with_status(400));
-            }
-            
-            return Err(e);
+            record_failed_request(&db, FailedRequest {
+                app_id: &app_id,
+                user_id: &user_id,
+                request_type: "edit",
+                provider: provider.get_name(),
+                model: &edit_req.model,
+                prompt: &edit_req.prompt,
+                size: &edit_req.size,
+                quality: &edit_req.quality,
+                image_count: edit_req.n,
+                input_images_count: Some(edit_req.image.len() as u8),
+                response_time_ms: (worker::Date::now().as_millis() - start_time) as u32,
+                error: &error_msg,
+            }).await;
+            return provider_failure_response(&error_msg, "image");
         }
     };
 
@@ -544,4 +546,110 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     };
     
     Response::from_json(&response)
+}
+
+/// A 402 from the credit check is a paywall hit; it is logged before answering so the
+/// funnel shows who ran out, not just who paid. Any other failure answers as before.
+async fn credit_check_failure_response(
+    error: worker::Error,
+    db: &D1Database,
+    app_id: &str,
+    user_id: &str,
+    capability: &str,
+) -> Result<Response> {
+    let app_error = AppError::from(error);
+    if matches!(app_error, AppError::PaymentRequired(_)) {
+        let balance = get_user_balance(app_id, user_id, db).await.unwrap_or(0);
+        record_paywall_event(db, app_id, user_id, capability, balance).await;
+    }
+    app_error.to_response()
+}
+
+/// An image request that produced no image, logged so the funnel can tell a user who
+/// never tried from one who tried and was refused.
+struct FailedRequest<'a> {
+    app_id: &'a str,
+    user_id: &'a str,
+    request_type: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    prompt: &'a str,
+    size: &'a str,
+    quality: &'a str,
+    image_count: u8,
+    input_images_count: Option<u8>,
+    response_time_ms: u32,
+    error: &'a str,
+}
+
+/// Best-effort: a logging failure never changes the response the caller already gets.
+async fn record_failed_request(db: &D1Database, failed: FailedRequest<'_>) {
+    let error: String = failed.error.chars().take(500).collect();
+    let stmt = db
+        .prepare(
+            "INSERT INTO usage_records (id, app_id, user_id, request_type, provider, model, prompt, image_size, image_quality,
+             image_count, input_images_count, total_tokens, input_tokens, output_tokens, text_tokens,
+             image_tokens, r2_keys, response_time_ms, simplified_cost, error, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, '[]', ?, ?, ?, ?)",
+        )
+        .bind(&[
+            Uuid::new_v4().to_string().into(),
+            failed.app_id.into(),
+            failed.user_id.into(),
+            failed.request_type.into(),
+            failed.provider.into(),
+            failed.model.into(),
+            failed.prompt.into(),
+            failed.size.into(),
+            failed.quality.into(),
+            failed.image_count.into(),
+            failed.input_images_count.map(|n| n.into()).unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+            failed.response_time_ms.into(),
+            (failed.provider == "gemini").into(),
+            error.into(),
+            Utc::now().to_rfc3339().into(),
+        ]);
+    match stmt {
+        Ok(s) => {
+            if let Err(e) = s.run().await {
+                worker::console_log!("record_failed_request: insert failed: {:?}", e);
+            }
+        }
+        Err(e) => worker::console_log!("record_failed_request: prepare failed: {:?}", e),
+    }
+}
+
+/// The response for a provider call that produced nothing. A refusal is the request
+/// being declined, not a server fault: moderation answers 400, and a Gemini reply
+/// without an image (usually its safety filter on a photo of a person) answers 422
+/// `no_image`, so clients can explain it instead of reporting a server error.
+fn provider_failure_response(error_msg: &str, retry_subject: &str) -> Result<Response> {
+    let (status, error_type, code, message) =
+        if error_msg.contains("content_policy_violation") || error_msg.contains("moderation") {
+            (
+                400,
+                "moderation_error",
+                "moderation_blocked",
+                format!("Our AI backend is being a bit too cautious with this image. Nothing wrong on your end - just the underlying service being overly protective. Try a different {} and you should be good to go!", retry_subject),
+            )
+        } else if error_msg.contains("No images returned by Gemini") {
+            (
+                422,
+                "generation_error",
+                "no_image",
+                "The model declined to make this image. Try rewording the request - photos of people sometimes trip its safety filter.".to_string(),
+            )
+        } else {
+            return AppError::InternalError(error_msg.to_string()).to_response();
+        };
+
+    Response::from_json(&ErrorResponse {
+        error: ErrorDetail {
+            message,
+            error_type: error_type.to_string(),
+            param: None,
+            code: Some(code.to_string()),
+        },
+    })
+    .map(|r| r.with_status(status))
 }
