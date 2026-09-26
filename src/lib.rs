@@ -34,7 +34,11 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let router = Router::new();
     
     router
-        .get("/", |_, _| {
+        .get("/", |req, _| {
+            if handlers::shared_playlists::is_public_host(&req) {
+                let target = handlers::shared_playlists::app_store_url("share-root");
+                return Response::redirect(Url::parse(&target)?);
+            }
             Response::ok(r#"mako — the reactor that powers Midgar Corp's apps
 
 API Documentation: /docs
@@ -58,6 +62,10 @@ Privacy Policy: /privacy-policy"#)
         .get("/privacy/:app", privacy::privacy_handler)
         .get("/terms/:app", privacy::terms_handler)
         .get("/support/:app", privacy::support_handler)
+        .get_async("/p/:id", handlers::shared_playlists::page)
+        .post_async("/v1/playlists/share", handlers::shared_playlists::share)
+        .get_async("/v1/playlists/:id", handlers::shared_playlists::fetch)
+        .post_async("/v1/credits/refund", handlers::refunds::refund_charge)
         .get("/payday", privacy::payday_landing)
         .get("/docs/", |req, _| {
             let url = req.url().unwrap();

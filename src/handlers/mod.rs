@@ -13,3 +13,5 @@ pub mod attribution;
 pub mod credits;
 pub mod chat;
 pub mod realtime;
+pub mod refunds;
+pub mod shared_playlists;

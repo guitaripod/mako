@@ -4,7 +4,8 @@ compatibility_date = "2024-01-01"
 
 workers_dev = true
 routes = [
-  { pattern = "mako.midgarcorp.cc", custom_domain = true }
+  { pattern = "mako.midgarcorp.cc", custom_domain = true },
+  { pattern = "psywave.midgarcorp.cc", custom_domain = true }
 ]
 
 # Note: This file has multiple environments defined (production and development)

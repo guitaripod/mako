@@ -119,6 +119,8 @@ struct ChatResponse {
     content: String,
     model: String,
     credits_charged: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    charge_reference: Option<String>,
     usage: ChatUsage,
 }
 
@@ -193,12 +195,14 @@ async fn chat_completion_inner(
     } else {
         flat_cost.unwrap_or_else(|| credits_from_tokens(&model, prompt_tokens, output_tokens))
     };
+    let mut charge_reference = None;
     if credits > 0 {
         let reference = format!("chat:{}", Uuid::new_v4());
         if let Err(e) = deduct_credits(&auth.app_id, &auth.user_id, credits, "chat.completion", &reference, &db).await {
             let _ = release_lock(&auth.app_id, &auth.user_id, &db).await;
             return Err(AppError::from(e));
         }
+        charge_reference = Some(reference);
     }
 
     let _ = release_lock(&auth.app_id, &auth.user_id, &db).await;
@@ -207,6 +211,7 @@ async fn chat_completion_inner(
         content,
         model,
         credits_charged: credits,
+        charge_reference,
         usage: ChatUsage {
             prompt_tokens,
             output_tokens,

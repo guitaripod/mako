@@ -37,7 +37,7 @@ fn config(app: &str) -> AppPrivacy {
         },
         "psywave" => AppPrivacy {
             name: "Psywave",
-            ai: "the description or photo you provide is sent to Google Gemini to generate a playlist",
+            ai: "the description or photo you provide is sent to OpenAI to generate a playlist",
             uses_location: false,
             voice_consent: false,
         },
@@ -105,7 +105,7 @@ fn ad_measurement_section(app: &str, name: &str) -> String {
 }
 
 fn contact_link(app: &str) -> &'static str {
-    if app == "payday" {
+    if app == "payday" || app == "psywave" {
         r#"<a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>"#
     } else {
         r#"<a href="https://x.com/prblemslver">@prblemslver</a>"#
@@ -116,8 +116,28 @@ fn on_device_content(app: &str) -> &'static str {
     match app {
         "payday" => "your invoices, estimates, clients, logo, and settings",
         "livingdex" => "your captured photos, your species collection (your Dex), and your progress",
+        "psywave" => "your playlist history and a small copy of any photo you made a playlist from",
         _ => "results, history, and transcripts",
     }
+}
+
+fn last_updated(app: &str) -> &'static str {
+    match app {
+        "psywave" => "September 2026",
+        _ => "June 2026",
+    }
+}
+
+/// Psywave's two data flows beyond generation: playlist pages the listener
+/// chooses to publish, and on-device reads of their Apple Music library.
+fn psywave_sections(app: &str) -> &'static str {
+    if app != "psywave" {
+        return "";
+    }
+    r#"<h2>Shared playlists</h2>
+<p>When you tap Share Link, the playlist's name, description, mood, and song list (titles, artists, albums, Apple Music song identifiers, and album-art addresses) are stored on our server so the link can show them. Anyone with the link can view that page. It never includes your photo, your identity, or anything else from your device. To have a shared page removed, contact us with its link.</p>
+<h2>Apple Music</h2>
+<p>With your permission, Psywave adds the playlists you make to your Apple Music library. If you turn on Psywave Pro's “Only songs new to me” or “Grow One of My Playlists”, the app reads your library on your device to skip songs you already have or to see which songs a chosen playlist contains; only the song titles and artists of that chosen playlist are sent to our AI provider to suggest additions, and nothing from your library is stored on our servers.</p>"#
 }
 
 fn render(app: &str) -> String {
@@ -141,7 +161,11 @@ fn render(app: &str) -> String {
     let ad_measurement = ad_measurement_section(app, c.name);
     let contact = contact_link(app);
     let on_device = on_device_content(app);
-    let purchases = if app == "payday" {
+    let psywave = psywave_sections(app);
+    let updated = last_updated(app);
+    let purchases = if app == "psywave" {
+        "Psywave Pro (an auto-renewing subscription) and credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock Pro or credit your balance. We never receive your payment-card details."
+    } else if app == "payday" {
         "Subscriptions and credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock features or credit your balance. We never receive your payment-card details."
     } else if app == "livingdex" {
         "Living Dex Pro (an auto-renewing subscription) is sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock Pro features. We never receive your payment-card details."
@@ -162,7 +186,7 @@ fn render(app: &str) -> String {
 <style>body{{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1c1c1e}}h1{{font-size:28px}}h2{{font-size:18px;margin-top:28px}}a{{color:#06c}}@media(prefers-color-scheme:dark){{body{{background:#000;color:#e5e5ea}}a{{color:#4da3ff}}}}</style>
 </head><body>
 <h1>{name} Privacy Policy</h1>
-<p><em>Last updated: June 2026</em></p>
+<p><em>Last updated: {updated}</em></p>
 <p>{name} is designed to collect as little as possible. This policy explains what is processed and why.</p>
 <h2>AI processing</h2>
 <p>To provide the app's core feature, {ai}. This data is processed only to produce your result and is not used to train AI models. Our AI providers handle it under their own privacy and security commitments that protect it to a standard comparable to this policy, and are permitted to use it only to return your result.</p>
@@ -173,6 +197,7 @@ fn render(app: &str) -> String {
 {einvoicing}
 <h2>On-device data</h2>
 <p>Content you create in the app — such as {on_device} — is stored on your device and is not uploaded to us.</p>
+{psywave}
 {location}
 {ad_measurement}
 <h2>What we don't do</h2>
@@ -185,6 +210,8 @@ fn render(app: &str) -> String {
         purchases = purchases,
         einvoicing = einvoicing,
         on_device = on_device,
+        psywave = psywave,
+        updated = updated,
         location = location,
         ad_measurement = ad_measurement,
         consent = consent,
@@ -890,14 +917,20 @@ fn render_terms(app: &str) -> String {
 
 fn render_support(app: &str) -> String {
     let c = config(app);
-    let topics = if app == "livingdex" {
-        r#"<li>Subscriptions are managed in your Apple Account settings; restore purchases from the paywall.</li>
+    let topics = match app {
+        "livingdex" => r#"<li>Subscriptions are managed in your Apple Account settings; restore purchases from the paywall.</li>
 <li>Your collection and photos are stored on your device; deleting the app removes them.</li>
-<li>Identifications are AI best guesses — never eat, touch, or handle a wild organism based only on the App.</li>"#
-    } else {
-        r#"<li>Subscriptions and credit packs are managed in your Apple Account settings; restore purchases from the paywall.</li>
+<li>Identifications are AI best guesses — never eat, touch, or handle a wild organism based only on the App.</li>"#,
+        "payday" => r#"<li>Subscriptions and credit packs are managed in your Apple Account settings; restore purchases from the paywall.</li>
 <li>You can delete your account from within the app (Settings).</li>
-<li>Invoices and client data are stored on your device; the App works offline for creating and sharing PDFs.</li>"#
+<li>Invoices and client data are stored on your device; the App works offline for creating and sharing PDFs.</li>"#,
+        "psywave" => r#"<li><strong>Importing needs Apple Music.</strong> Psywave adds playlists to your library through Apple Music, so importing requires an active Apple Music subscription and permission for Psywave to access Apple Music (Settings ▸ Psywave).</li>
+<li><strong>Using another service?</strong> Tap Export ▸ Send to Spotify, YouTube Music &amp; more to save a track list that Soundiiz or TuneMyMusic import, or share the playlist link — its page has search links for each song.</li>
+<li><strong>A song is missing.</strong> Psywave only keeps songs it can find on Apple Music in your country, and asks for extras so a playlist still reaches the length you chose. If almost nothing could be found, the credit is refunded automatically.</li>
+<li><strong>Psywave Pro and credits.</strong> Subscriptions are managed in your Apple Account settings; restore purchases in Psywave ▸ Settings. Credits never expire.</li>
+<li><strong>Siri and Shortcuts.</strong> Say “Make a playlist in Psywave”, or share a photo to Psywave from the Photos app.</li>"#,
+        _ => r#"<li>Subscriptions and credit packs are managed in your Apple Account settings; restore purchases in the app.</li>
+<li>Deleting the app removes the content it stored on your device.</li>"#,
     };
     let body = format!(
         r#"<h1>{name} Support</h1>
@@ -953,6 +986,25 @@ mod tests {
             assert!(html.contains("show advertising inside the app"));
             assert!(html.contains("third-party tracking or advertising identifiers"));
         }
+    }
+
+    #[test]
+    fn psywave_pages_describe_psywave() {
+        let privacy = render("psywave");
+        assert!(privacy.contains("Shared playlists"));
+        assert!(privacy.contains("It never includes your photo"));
+        assert!(privacy.contains("Psywave Pro (an auto-renewing subscription)"));
+        let support = render_support("psywave");
+        assert!(support.contains("Importing needs Apple Music"));
+        assert!(!support.contains("Invoices"));
+    }
+
+    #[test]
+    fn support_defaults_no_longer_describe_pay_day() {
+        for app in ["dreameater", "doublekick", "psybeam"] {
+            assert!(!render_support(app).contains("Invoices"), "{} shows Pay Day topics", app);
+        }
+        assert!(render_support("payday").contains("Invoices"));
     }
 
     #[test]
