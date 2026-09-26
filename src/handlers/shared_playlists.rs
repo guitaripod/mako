@@ -317,21 +317,22 @@ struct PageText {
     made_with: &'static str,
     pitch: &'static str,
     missing: &'static str,
+    report: &'static str,
 }
 
 fn text(language: PageLanguage) -> PageText {
     match language {
-        PageLanguage::En => PageText { songs: "songs", open_in_app: "Open in Psywave", get_app: "Get Psywave — free", made_with: "Made with Psywave", pitch: "Turn any vibe or photo into a playlist of real songs.", missing: "This playlist is no longer available." },
-        PageLanguage::De => PageText { songs: "Songs", open_in_app: "In Psywave öffnen", get_app: "Psywave laden – gratis", made_with: "Erstellt mit Psywave", pitch: "Mach aus jeder Stimmung und jedem Foto eine Playlist mit echten Songs.", missing: "Diese Playlist ist nicht mehr verfügbar." },
-        PageLanguage::Es => PageText { songs: "canciones", open_in_app: "Abrir en Psywave", get_app: "Consigue Psywave gratis", made_with: "Hecho con Psywave", pitch: "Convierte cualquier ambiente o foto en una playlist de canciones reales.", missing: "Esta playlist ya no está disponible." },
-        PageLanguage::Fr => PageText { songs: "titres", open_in_app: "Ouvrir dans Psywave", get_app: "Obtenir Psywave gratuitement", made_with: "Créé avec Psywave", pitch: "Transformez une ambiance ou une photo en playlist de vrais titres.", missing: "Cette playlist n'est plus disponible." },
-        PageLanguage::It => PageText { songs: "brani", open_in_app: "Apri in Psywave", get_app: "Scarica Psywave gratis", made_with: "Creata con Psywave", pitch: "Trasforma qualsiasi atmosfera o foto in una playlist di brani veri.", missing: "Questa playlist non è più disponibile." },
-        PageLanguage::Ja => PageText { songs: "曲", open_in_app: "Psywaveで開く", get_app: "Psywaveを無料で入手", made_with: "Psywaveで作成", pitch: "気分や写真から、本物の曲でプレイリストを作成。", missing: "このプレイリストは公開が終了しました。" },
-        PageLanguage::Ko => PageText { songs: "곡", open_in_app: "Psywave에서 열기", get_app: "Psywave 무료로 받기", made_with: "Psywave로 만든 플레이리스트", pitch: "어떤 기분이나 사진도 실제 노래로 채운 플레이리스트로.", missing: "더 이상 볼 수 없는 플레이리스트입니다." },
-        PageLanguage::Pl => PageText { songs: "utworów", open_in_app: "Otwórz w Psywave", get_app: "Pobierz Psywave za darmo", made_with: "Stworzone w Psywave", pitch: "Zamień dowolny nastrój lub zdjęcie w playlistę prawdziwych utworów.", missing: "Ta playlista nie jest już dostępna." },
-        PageLanguage::PtBr => PageText { songs: "músicas", open_in_app: "Abrir no Psywave", get_app: "Baixe o Psywave grátis", made_with: "Feita com o Psywave", pitch: "Transforme qualquer vibe ou foto em uma playlist de músicas de verdade.", missing: "Esta playlist não está mais disponível." },
-        PageLanguage::ZhHans => PageText { songs: "首", open_in_app: "在 Psywave 中打开", get_app: "免费获取 Psywave", made_with: "由 Psywave 生成", pitch: "把任何心情或照片变成真实歌曲组成的歌单。", missing: "此歌单已不再可用。" },
-        PageLanguage::ZhHant => PageText { songs: "首", open_in_app: "在 Psywave 中開啟", get_app: "免費取得 Psywave", made_with: "由 Psywave 產生", pitch: "把任何心情或照片變成真實歌曲組成的歌單。", missing: "此歌單已無法使用。" },
+        PageLanguage::En => PageText { songs: "songs", open_in_app: "Open in Psywave", get_app: "Get Psywave — free", made_with: "Made with Psywave", pitch: "Turn any vibe or photo into a playlist of real songs.", missing: "This playlist is no longer available.", report: "Report this playlist" },
+        PageLanguage::De => PageText { songs: "Songs", open_in_app: "In Psywave öffnen", get_app: "Psywave laden – gratis", made_with: "Erstellt mit Psywave", pitch: "Mach aus jeder Stimmung und jedem Foto eine Playlist mit echten Songs.", missing: "Diese Playlist ist nicht mehr verfügbar.", report: "Playlist melden" },
+        PageLanguage::Es => PageText { songs: "canciones", open_in_app: "Abrir en Psywave", get_app: "Consigue Psywave gratis", made_with: "Hecho con Psywave", pitch: "Convierte cualquier ambiente o foto en una playlist de canciones reales.", missing: "Esta playlist ya no está disponible.", report: "Denunciar esta playlist" },
+        PageLanguage::Fr => PageText { songs: "titres", open_in_app: "Ouvrir dans Psywave", get_app: "Obtenir Psywave gratuitement", made_with: "Créé avec Psywave", pitch: "Transformez une ambiance ou une photo en playlist de vrais titres.", missing: "Cette playlist n'est plus disponible.", report: "Signaler cette playlist" },
+        PageLanguage::It => PageText { songs: "brani", open_in_app: "Apri in Psywave", get_app: "Scarica Psywave gratis", made_with: "Creata con Psywave", pitch: "Trasforma qualsiasi atmosfera o foto in una playlist di brani veri.", missing: "Questa playlist non è più disponibile.", report: "Segnala questa playlist" },
+        PageLanguage::Ja => PageText { songs: "曲", open_in_app: "Psywaveで開く", get_app: "Psywaveを無料で入手", made_with: "Psywaveで作成", pitch: "気分や写真から、本物の曲でプレイリストを作成。", missing: "このプレイリストは公開が終了しました。", report: "このプレイリストを報告" },
+        PageLanguage::Ko => PageText { songs: "곡", open_in_app: "Psywave에서 열기", get_app: "Psywave 무료로 받기", made_with: "Psywave로 만든 플레이리스트", pitch: "어떤 기분이나 사진도 실제 노래로 채운 플레이리스트로.", missing: "더 이상 볼 수 없는 플레이리스트입니다.", report: "이 플레이리스트 신고" },
+        PageLanguage::Pl => PageText { songs: "utworów", open_in_app: "Otwórz w Psywave", get_app: "Pobierz Psywave za darmo", made_with: "Stworzone w Psywave", pitch: "Zamień dowolny nastrój lub zdjęcie w playlistę prawdziwych utworów.", missing: "Ta playlista nie jest już dostępna.", report: "Zgłoś tę playlistę" },
+        PageLanguage::PtBr => PageText { songs: "músicas", open_in_app: "Abrir no Psywave", get_app: "Baixe o Psywave grátis", made_with: "Feita com o Psywave", pitch: "Transforme qualquer vibe ou foto em uma playlist de músicas de verdade.", missing: "Esta playlist não está mais disponível.", report: "Denunciar esta playlist" },
+        PageLanguage::ZhHans => PageText { songs: "首", open_in_app: "在 Psywave 中打开", get_app: "免费获取 Psywave", made_with: "由 Psywave 生成", pitch: "把任何心情或照片变成真实歌曲组成的歌单。", missing: "此歌单已不再可用。", report: "举报此歌单" },
+        PageLanguage::ZhHant => PageText { songs: "首", open_in_app: "在 Psywave 中開啟", get_app: "免費取得 Psywave", made_with: "由 Psywave 產生", pitch: "把任何心情或照片變成真實歌曲組成的歌單。", missing: "此歌單已無法使用。", report: "檢舉此歌單" },
     }
 }
 
@@ -385,7 +386,7 @@ fn html_lang(language: PageLanguage) -> &'static str {
     }
 }
 
-const STYLE: &str = "*{box-sizing:border-box}body{margin:0;background:#0A0612;color:#F5F2FF;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased}.glow{background:radial-gradient(120% 60% at 20% 0%,rgba(143,89,247,.45),rgba(240,86,142,.14) 45%,transparent 75%)}.wrap{max-width:680px;margin:0 auto;padding:28px 20px 48px}.brand{font-size:13px;letter-spacing:.3em;font-weight:700;color:#C9B3FF;text-decoration:none}h1{font-size:34px;line-height:1.1;margin:18px 0 10px;font-weight:800}.desc{color:rgba(255,255,255,.66);font-size:16px;line-height:1.5;margin:0 0 14px}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}.chip{background:rgba(143,89,247,.28);border-radius:999px;padding:6px 12px;font-size:13px;font-weight:600}.cta{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:26px}.btn{flex:1 1 200px;text-align:center;border-radius:16px;padding:14px 16px;font-weight:700;font-size:16px;text-decoration:none;color:#fff}.primary{background:linear-gradient(90deg,#8F59F7,#F0568E)}.secondary{background:#1E1633;border:1px solid rgba(255,255,255,.12)}ol{list-style:none;margin:0;padding:0}li{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}.art{width:52px;height:52px;border-radius:10px;background:#1E1633;flex:0 0 52px;object-fit:cover}.meta{flex:1;min-width:0}.t{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.a{color:rgba(255,255,255,.6);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.links{display:flex;gap:6px}.links a{font-size:12px;font-weight:700;color:#fff;text-decoration:none;border-radius:8px;padding:6px 8px;background:#1E1633}.links .am{background:#FA2D48}.foot{margin-top:30px;text-align:center;color:rgba(255,255,255,.55);font-size:14px}.foot a{color:#C9B3FF}@media(max-width:520px){h1{font-size:28px}li{flex-wrap:wrap}.meta{flex:1 1 calc(100% - 64px)}.links{width:100%;padding-left:64px;margin-top:-4px}}";
+const STYLE: &str = "*{box-sizing:border-box}body{margin:0;background:#0A0612;color:#F5F2FF;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased}.glow{background:radial-gradient(120% 60% at 20% 0%,rgba(143,89,247,.45),rgba(240,86,142,.14) 45%,transparent 75%)}.wrap{max-width:680px;margin:0 auto;padding:28px 20px 48px}.brand{font-size:13px;letter-spacing:.3em;font-weight:700;color:#C9B3FF;text-decoration:none}h1{font-size:34px;line-height:1.1;margin:18px 0 10px;font-weight:800}.desc{color:rgba(255,255,255,.66);font-size:16px;line-height:1.5;margin:0 0 14px}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}.chip{background:rgba(143,89,247,.28);border-radius:999px;padding:6px 12px;font-size:13px;font-weight:600}.cta{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:26px}.btn{flex:1 1 200px;text-align:center;border-radius:16px;padding:14px 16px;font-weight:700;font-size:16px;text-decoration:none;color:#fff}.primary{background:linear-gradient(90deg,#8F59F7,#F0568E)}.secondary{background:#1E1633;border:1px solid rgba(255,255,255,.12)}ol{list-style:none;margin:0;padding:0}li{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}.art{width:52px;height:52px;border-radius:10px;background:#1E1633;flex:0 0 52px;object-fit:cover}.meta{flex:1;min-width:0}.t{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.a{color:rgba(255,255,255,.6);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.links{display:flex;gap:6px}.links a{font-size:12px;font-weight:700;color:#fff;text-decoration:none;border-radius:8px;padding:6px 8px;background:#1E1633}.links .am{background:#FA2D48}.foot{margin-top:30px;text-align:center;color:rgba(255,255,255,.55);font-size:14px}.foot a{color:#C9B3FF}.foot .report{display:inline-block;margin-top:14px;font-size:12px;color:rgba(255,255,255,.4)}@media(max-width:520px){h1{font-size:28px}li{flex-wrap:wrap}.meta{flex:1 1 calc(100% - 64px)}.links{width:100%;padding-left:64px;margin-top:-4px}}";
 
 pub fn render_page(id: &str, playlist: &SharedPlaylist, language: PageLanguage) -> String {
     let t = text(language);
@@ -441,7 +442,7 @@ pub fn render_page(id: &str, playlist: &SharedPlaylist, language: PageLanguage) 
     };
 
     format!(
-        r#"<!DOCTYPE html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} · Psywave</title><meta name="robots" content="noindex"><meta name="description" content="{summary}"><meta name="apple-itunes-app" content="app-id={app_id}, app-argument=psywave://p/{id}"><meta property="og:type" content="music.playlist"><meta property="og:title" content="{title}"><meta property="og:description" content="{summary}"><meta property="og:image" content="{image}"><meta property="og:url" content="{url}"><meta name="twitter:card" content="summary"><style>{style}</style></head><body><div class="glow"><div class="wrap"><a class="brand" href="{store}">PSYWAVE</a><h1>{title}</h1>{description}<div class="chips">{chips}</div><div class="cta"><a class="btn primary" href="psywave://p/{id}">{open}</a><a class="btn secondary" href="{store}">{get}</a></div><ol>{rows}</ol><p class="foot">{pitch}<br><a href="{store}">{made_with}</a></p></div></div></body></html>"#,
+        r#"<!DOCTYPE html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} · Psywave</title><meta name="robots" content="noindex"><meta name="description" content="{summary}"><meta name="apple-itunes-app" content="app-id={app_id}, app-argument=psywave://p/{id}"><meta property="og:type" content="music.playlist"><meta property="og:title" content="{title}"><meta property="og:description" content="{summary}"><meta property="og:image" content="{image}"><meta property="og:url" content="{url}"><meta name="twitter:card" content="summary"><style>{style}</style></head><body><div class="glow"><div class="wrap"><a class="brand" href="{store}">PSYWAVE</a><h1>{title}</h1>{description}<div class="chips">{chips}</div><div class="cta"><a class="btn primary" href="psywave://p/{id}">{open}</a><a class="btn secondary" href="{store}">{get}</a></div><ol>{rows}</ol><p class="foot">{pitch}<br><a href="{store}">{made_with}</a><br><a class="report" href="mailto:support@midgarcorp.cc?subject=Report%20playlist%20{id}">{report}</a></p></div></div></body></html>"#,
         lang = html_lang(language),
         title = escape(&playlist.name),
         summary = escape(&summary),
@@ -458,6 +459,7 @@ pub fn render_page(id: &str, playlist: &SharedPlaylist, language: PageLanguage) 
         rows = rows,
         pitch = escape(t.pitch),
         made_with = escape(t.made_with),
+        report = escape(t.report),
     )
 }
 
@@ -539,6 +541,7 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("https://music.apple.com/jp/song/828259377"));
         assert!(html.contains("app-argument=psywave://p/AbCdEf2345"));
+        assert!(html.contains("mailto:support@midgarcorp.cc?subject=Report%20playlist%20AbCdEf2345"));
     }
 
     #[test]
