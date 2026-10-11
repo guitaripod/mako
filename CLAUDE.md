@@ -49,6 +49,17 @@ Traces an App Store ad install to the keyword that produced it, then to whether 
 - `apps.store_net_share` (0.85 Small Business Program / 0.70 otherwise) nets out purchases RevenueCat reports no `takehome_percentage` for. Unset ⇒ the report returns `net_*: null` rather than 0.
 - **Privacy invariants**: never store or log the raw token (only its SHA-256 fingerprint); no IDFA, no `ASIdentifierManager`, no ATT prompt. Apps running campaigns disclose this in `src/privacy.rs` (`ad_measurement_section`).
 
+## Tenant switches and v2 request shapes (migrations 020-024)
+
+Every one of these is data on the `apps` row or a new request shape, so a tenant that has not opted in behaves exactly as before.
+
+- **Privacy flags** (`apps.store_prompts`, `apps.store_images`, default 1; `dreameater` 0): 0 keeps prompt text out of `usage_records`/`stored_images` and returns images as base64 without R2. `scripts/scrub-tenant.sh <app_id> --yes [--local]` removes what a tenant already stored. No provider error body, prompt or request body is ever logged (`src/redact.rs`).
+- **Chat aliases** (`chat_aliases`, `weekly_usage`, `chat_requests`): a `chat.completion` body with `alias` is resolved server-side (system prompt, JSON schema, max tokens, temperature, flat price, weekly free bucket, premium bypass). Pure logic in `src/chat_alias.rs`, handler in `src/handlers/chat_alias.rs`. Rows are inserted by the operator, never by a migration. A cut-off reply is 422 `truncated` and uncharged.
+- **Art** (`image_styles`, `apps.art_credits`): a `/v1/images/generations` body with `style` for a tenant that has styles is composed on the server, charged `art_credits` per image after success, returned as base64 and never stored (`src/art.rs`, `src/handlers/art.rs`).
+- **Strict purchases** (`apps.strict_purchases`, default 0): the RevenueCat webhook credits `NON_RENEWING_PURCHASE` (deduplicated with the client validate call on the transaction id), reverses `CANCELLATION` refunds of credit packs once down to a zero balance, skips `SANDBOX` events in production, and `is_premium_user` requires the tenant's own entitlement and falls back to a 24 hour cached answer on a RevenueCat error. Pure logic in `src/purchases.rs`.
+- **Account deletion** removes every table in `USER_DATA_TABLES` (`src/handlers/identity.rs`); a test derives the tables with a `user_id` column from the migrations and fails when one is missing, so add new per-user tables to that list.
+- **Local end-to-end run**: `scripts/test-local.sh` builds, applies every migration to a fresh local D1, seeds users and aliases, and exercises the flows against `wrangler dev --local` with mock providers (`MOCK_PROVIDERS=1` and a non-production `ENVIRONMENT`, both set in a temporary `.dev.vars`, never in `wrangler.toml`). `scripts/smoke-dreameater.sh` is the same check against a real deployment.
+
 ## Important Notes
 
 - **Tests**: `cargo test --lib` runs the pure-logic unit tests on the host target (D1/fetch paths are validated with `npx wrangler dev` + `wrangler d1 execute --local`, and against the CLI in `guitaripod/pixie`). CI type-checks tests for wasm but does not run them.

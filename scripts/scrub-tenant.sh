@@ -8,6 +8,7 @@ usage() {
   echo "usage: $0 <app_id> --yes [--local]" >&2
   echo "  Deletes the tenant's R2 objects and stored_images rows and blanks its stored prompts and provider errors." >&2
   echo "  Targets the remote D1 and R2 unless --local is given. Safe to run again." >&2
+  echo "  MAKO_WRANGLER_ARGS adds wrangler flags, e.g. --config x.toml --persist-to dir for a local run." >&2
   exit 2
 }
 
@@ -27,14 +28,15 @@ done
 [[ "$APP_ID" =~ ^[a-z0-9_-]+$ ]] || { echo "app_id must match [a-z0-9_-]+" >&2; exit 2; }
 [ "$CONFIRMED" -eq 1 ] || { echo "refusing to run without --yes" >&2; usage; }
 
+read -r -a EXTRA_ARGS <<< "${MAKO_WRANGLER_ARGS:-}"
 WRANGLER=(npx wrangler)
 
 d1_json() {
-  "${WRANGLER[@]}" d1 execute "$DB_NAME" "$TARGET" --json --command "$1"
+  "${WRANGLER[@]}" d1 execute "$DB_NAME" "$TARGET" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} --json --command "$1"
 }
 
 d1_run() {
-  "${WRANGLER[@]}" d1 execute "$DB_NAME" "$TARGET" --command "$1" >/dev/null
+  "${WRANGLER[@]}" d1 execute "$DB_NAME" "$TARGET" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} --command "$1" >/dev/null
 }
 
 first_value() {
@@ -75,7 +77,7 @@ FAILED=0
 DELETED=0
 while IFS= read -r key; do
   [ -n "$key" ] || continue
-  if "${WRANGLER[@]}" r2 object delete "$BUCKET/$key" "$TARGET" >/dev/null 2>&1; then
+  if "${WRANGLER[@]}" r2 object delete "$BUCKET/$key" "$TARGET" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} >/dev/null 2>&1; then
     DELETED=$((DELETED + 1))
   else
     FAILED=$((FAILED + 1))

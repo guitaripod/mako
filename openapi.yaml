@@ -796,6 +796,18 @@ paths:
         charges the tenant wallet. Cost is a flat per-app capability price when
         configured, otherwise derived from actual token usage. Images may be
         passed as base64 strings or data URLs.
+
+        **Alias requests.** A body with an `alias` (instead of `messages`) is resolved
+        server-side from `chat_aliases`: `{alias, input, messages?, language?,
+        idempotency_key, retry_of?}`. The row decides the model, a real system prompt
+        (`{language}` is filled from `language`, default "the language of the dream"),
+        an optional JSON response schema, `max_tokens` and `temperature`. Charging
+        order: premium bypass, then the weekly free bucket, then the row's flat price,
+        always after the provider answered. A repeated `idempotency_key` and a
+        `retry_of` of a settled request are not charged again. A reply cut off by the
+        token limit answers 422 with code `truncated` and is not charged. The response
+        adds `free_remaining` (the weekly bucket left, or null), `alias` and `version`.
+        An unknown alias is 400. Requests without `alias` behave exactly as before.
       tags: [Capabilities]
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -900,6 +912,16 @@ paths:
       description: |
         Generate images from text prompts using the gpt-image-1 model. This endpoint is compatible with OpenAI's API format.
         In self-hosted mode, users can provide their own OpenAI API key.
+
+        **Art requests.** For a tenant with rows in `image_styles`, a body with a `style`
+        is an art request: `{style, scene, mood?, n?, idempotency_key}` with `scene` at
+        most 400 characters and `n` 1 or 2. The server composes the prompt from the
+        style fragment, scene and mood, makes a 1024 x 1024 medium-quality image,
+        returns it as `b64_json` and stores neither the prompt nor the image. It costs
+        the tenant's `art_credits` per image (not charged to premium users, and only
+        charged after an image was made); a balance below the cost is 402 before the
+        provider is called. An unknown style is 400. Requests without `style` take the
+        unchanged path.
       tags: [Images]
       requestBody:
         required: true
@@ -2270,6 +2292,19 @@ components:
         balance:
           type: integer
           example: 1250
+        weekly:
+          type: object
+          description: Weekly free buckets by alias, present only for tenants that have any. Resets Monday 00:00 UTC.
+          additionalProperties:
+            type: object
+            properties:
+              limit:
+                type: integer
+              remaining:
+                type: integer
+              resets_at:
+                type: string
+                format: date-time
         last_updated:
           type: string
           format: date-time
