@@ -184,7 +184,7 @@ async fn load_settlement(
     Ok(settlement)
 }
 
-async fn replays_of_key(db: &D1Database, app_id: &str, user_id: &str, reference: &str) -> Result<Option<u32>, AppError> {
+pub(crate) async fn replays_of_key(db: &D1Database, app_id: &str, user_id: &str, reference: &str) -> Result<Option<u32>, AppError> {
     let row = db
         .prepare("SELECT replays FROM chat_requests WHERE app_id = ?1 AND user_id = ?2 AND reference = ?3")
         .bind(&[app_id.into(), user_id.into(), reference.into()])?
@@ -217,8 +217,7 @@ async fn retry_was_used(db: &D1Database, app_id: &str, user_id: &str, original: 
     Ok(row.is_some())
 }
 
-/// Remembers the request so the same key or a retry of it is recognised, and
-/// counts a free repeat. Best-effort: the reply is already paid for.
+/// Remembers an alias request so the same key or a retry of it is recognised.
 async fn record_settlement(
     db: &D1Database,
     auth: &AuthedUser,
@@ -228,27 +227,59 @@ async fn record_settlement(
     reference: &str,
     settlement: Settlement,
 ) {
-    let result = if settlement.key_already_settled {
-        db.prepare("UPDATE chat_requests SET replays = replays + 1 WHERE app_id = ?1 AND user_id = ?2 AND reference = ?3")
-            .bind(&[auth.app_id.clone().into(), auth.user_id.clone().into(), reference.into()])
+    let granted_retry = if settlement.is_settled() && !settlement.key_already_settled {
+        request.retry_of.as_deref()
     } else {
-        let granted_retry = if settlement.is_settled() { request.retry_of.clone() } else { None };
+        None
+    };
+    remember_request(
+        db,
+        &RememberedRequest {
+            app_id: &auth.app_id,
+            user_id: &auth.user_id,
+            reference,
+            alias: &cfg.alias,
+            kind: kind_label(plan.kind),
+            retry_of: granted_retry,
+            is_free_repeat: settlement.key_already_settled,
+        },
+    )
+    .await;
+}
+
+pub(crate) struct RememberedRequest<'a> {
+    pub app_id: &'a str,
+    pub user_id: &'a str,
+    pub reference: &'a str,
+    pub alias: &'a str,
+    pub kind: &'a str,
+    pub retry_of: Option<&'a str>,
+    pub is_free_repeat: bool,
+}
+
+/// Writes the `chat_requests` row for a settled request, or counts a free repeat
+/// of one. Best-effort: the reply is already paid for.
+pub(crate) async fn remember_request(db: &D1Database, request: &RememberedRequest<'_>) {
+    let statement = if request.is_free_repeat {
+        db.prepare("UPDATE chat_requests SET replays = replays + 1 WHERE app_id = ?1 AND user_id = ?2 AND reference = ?3")
+            .bind(&[request.app_id.into(), request.user_id.into(), request.reference.into()])
+    } else {
         db.prepare(
             "INSERT INTO chat_requests (app_id, user_id, reference, alias, kind, retry_of, replays, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
              ON CONFLICT(app_id, user_id, reference) DO UPDATE SET replays = 0, kind = excluded.kind, created_at = excluded.created_at",
         )
         .bind(&[
-            auth.app_id.clone().into(),
-            auth.user_id.clone().into(),
-            reference.into(),
-            cfg.alias.clone().into(),
-            kind_label(plan.kind).into(),
-            granted_retry.map(|r| r.into()).unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+            request.app_id.into(),
+            request.user_id.into(),
+            request.reference.into(),
+            request.alias.into(),
+            request.kind.into(),
+            request.retry_of.map(|r| r.into()).unwrap_or(worker::wasm_bindgen::JsValue::NULL),
             Utc::now().to_rfc3339().into(),
         ])
     };
-    match result {
+    match statement {
         Ok(stmt) => {
             if let Err(e) = stmt.run().await {
                 worker::console_log!("chat_requests write failed: {:?}", e);

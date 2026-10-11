@@ -31,9 +31,16 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         return e.to_response();
     }
 
-    let generation_req: ImageGenerationRequest = match req.json().await {
-        Ok(req) => req,
+    let body_text = match req.text().await {
+        Ok(text) => text,
         Err(e) => return AppError::BadRequest(format!("Invalid request body: {}", e)).to_response(),
+    };
+    if let Some(response) = crate::handlers::art::try_handle(&env, &auth, &body_text, start_time).await {
+        return response;
+    }
+    let generation_req: ImageGenerationRequest = match serde_json::from_str(&body_text) {
+        Ok(req) => req,
+        Err(e) => return AppError::BadRequest(format!("Invalid request body: {}", worker::Error::from(e))).to_response(),
     };
 
     if generation_req.stream {
@@ -585,7 +592,7 @@ fn returned_image(bytes: &[u8], revised_prompts: &[Option<String>], index: usize
 
 /// A 402 from the credit check is a paywall hit; it is logged before answering so the
 /// funnel shows who ran out, not just who paid. Any other failure answers as before.
-async fn credit_check_failure_response(
+pub(crate) async fn credit_check_failure_response(
     error: worker::Error,
     db: &D1Database,
     app_id: &str,
@@ -602,23 +609,23 @@ async fn credit_check_failure_response(
 
 /// An image request that produced no image, logged so the funnel can tell a user who
 /// never tried from one who tried and was refused.
-struct FailedRequest<'a> {
-    app_id: &'a str,
-    user_id: &'a str,
-    request_type: &'a str,
-    provider: &'a str,
-    model: &'a str,
-    prompt: &'a str,
-    size: &'a str,
-    quality: &'a str,
-    image_count: u8,
-    input_images_count: Option<u8>,
-    response_time_ms: u32,
-    error: &'a str,
+pub(crate) struct FailedRequest<'a> {
+    pub app_id: &'a str,
+    pub user_id: &'a str,
+    pub request_type: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub prompt: &'a str,
+    pub size: &'a str,
+    pub quality: &'a str,
+    pub image_count: u8,
+    pub input_images_count: Option<u8>,
+    pub response_time_ms: u32,
+    pub error: &'a str,
 }
 
 /// Best-effort: a logging failure never changes the response the caller already gets.
-async fn record_failed_request(db: &D1Database, failed: FailedRequest<'_>) {
+pub(crate) async fn record_failed_request(db: &D1Database, failed: FailedRequest<'_>) {
     let error: String = failed.error.chars().take(500).collect();
     let stmt = db
         .prepare(
@@ -658,7 +665,7 @@ async fn record_failed_request(db: &D1Database, failed: FailedRequest<'_>) {
 /// being declined, not a server fault: moderation answers 400, and a Gemini reply
 /// without an image (usually its safety filter on a photo of a person) answers 422
 /// `no_image`, so clients can explain it instead of reporting a server error.
-fn provider_failure_response(error_msg: &str, retry_subject: &str) -> Result<Response> {
+pub(crate) fn provider_failure_response(error_msg: &str, retry_subject: &str) -> Result<Response> {
     let (status, error_type, code, message) =
         if error_msg.contains("content_policy_violation") || error_msg.contains("moderation") {
             (
@@ -687,4 +694,32 @@ fn provider_failure_response(error_msg: &str, retry_subject: &str) -> Result<Res
         },
     })
     .map(|r| r.with_status(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tenant_that_keeps_no_images_gets_base64_and_no_url() {
+        let policy = TenantPolicy { store_images: false, store_prompts: false, ..TenantPolicy::default() };
+        let image = returned_image(&[1, 2, 3], &[Some("echoed dream text".to_string())], 0, &policy);
+        assert_eq!(image.b64_json.as_deref(), Some("AQID"));
+        assert_eq!(image.url, None);
+        assert_eq!(image.revised_prompt, None);
+    }
+
+    #[test]
+    fn a_tenant_that_keeps_prompts_still_gets_the_revised_prompt_back() {
+        let policy = TenantPolicy { store_images: false, ..TenantPolicy::default() };
+        let image = returned_image(&[1], &[Some("revised".to_string())], 0, &policy);
+        assert_eq!(image.revised_prompt.as_deref(), Some("revised"));
+    }
+
+    #[test]
+    fn the_default_policy_keeps_the_stored_prompt_so_other_tenants_are_unchanged() {
+        let policy = TenantPolicy::default();
+        assert_eq!(policy.prompt_for_storage("a pier"), "a pier");
+        assert!(policy.store_images);
+    }
 }

@@ -12,6 +12,7 @@ pub mod identity;
 pub mod attribution;
 pub mod credits;
 pub mod chat;
+pub mod art;
 pub mod chat_alias;
 pub mod realtime;
 pub mod refunds;
