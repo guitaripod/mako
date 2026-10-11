@@ -55,7 +55,7 @@ fn config(app: &str) -> AppPrivacy {
         },
         "livingdex" => AppPrivacy {
             name: "Living Dex",
-            ai: "when the app can't identify a subject on your device, the photo you capture is sent to our AI providers (Anthropic and Google) to identify the organism and write its entry; on-device identification and narration happen locally and send nothing. We also query public biodiversity sources (GBIF, Wikipedia) by species name, not by your photo",
+            ai: "the photo you capture is sent to Google (Gemini) to identify the organism, and the species name alone is sent to Anthropic (Claude) when a field entry is written in the cloud",
             uses_location: true,
             voice_consent: false,
         },
@@ -107,6 +107,8 @@ fn ad_measurement_section(app: &str, name: &str) -> String {
 fn contact_link(app: &str) -> &'static str {
     if app == "payday" || app == "psywave" {
         r#"<a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>"#
+    } else if app == "livingdex" {
+        r#"<a href="mailto:guitaripod@gmail.com">guitaripod@gmail.com</a> (or <a href="https://x.com/prblemslver">@prblemslver</a> on X)"#
     } else {
         r#"<a href="https://x.com/prblemslver">@prblemslver</a>"#
     }
@@ -115,7 +117,6 @@ fn contact_link(app: &str) -> &'static str {
 fn on_device_content(app: &str) -> &'static str {
     match app {
         "payday" => "your invoices, estimates, clients, logo, and settings",
-        "livingdex" => "your captured photos, your species collection (your Dex), and your progress",
         "psywave" => "your playlist history and a small copy of any photo you made a playlist from",
         _ => "results, history, and transcripts",
     }
@@ -124,6 +125,7 @@ fn on_device_content(app: &str) -> &'static str {
 fn last_updated(app: &str) -> &'static str {
     match app {
         "psywave" => "September 2026",
+        "livingdex" => "October 2026",
         _ => "June 2026",
     }
 }
@@ -144,10 +146,11 @@ fn render(app: &str) -> String {
     if app == "flaccy" {
         return render_flaccy();
     }
+    if app == "livingdex" {
+        return render_livingdex();
+    }
     let c = config(app);
-    let location = if app == "livingdex" {
-        "<h2>Location</h2><p>If you grant location access (While Using the App only), your approximate location tags each sighting on your device and is used to gauge how rare a species is where you are. For species of conservation concern, locations are coarsened so they cannot be used to find a vulnerable organism, and your precise location is never shared with other players.</p>"
-    } else if c.uses_location {
+    let location = if c.uses_location {
         "<h2>Location</h2><p>If you grant location access, your approximate location is used on your device to improve the experience (such as suggesting a nearby language) and is not sent to our servers.</p>"
     } else {
         ""
@@ -167,15 +170,11 @@ fn render(app: &str) -> String {
         "Psywave Pro (an auto-renewing subscription) and credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock Pro or credit your balance. We never receive your payment-card details."
     } else if app == "payday" {
         "Subscriptions and credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock features or credit your balance. We never receive your payment-card details."
-    } else if app == "livingdex" {
-        "Living Dex Pro (an auto-renewing subscription) is sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock Pro features. We never receive your payment-card details."
     } else {
         "Credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which pack and a transaction identifier) to credit your balance. We never receive your payment-card details."
     };
     let deletion = if app == "payday" || app == "psybeam" {
         "You can delete your account from within the app at any time (in Settings), which removes your server-side identity and credit ledger; deleting the app removes any remaining on-device data."
-    } else if app == "livingdex" {
-        "Deleting the app removes your on-device collection and photos. Your anonymous credit identity holds no personal data; contact us to erase it."
     } else {
         "You can delete the app at any time to remove on-device data."
     };
@@ -218,6 +217,51 @@ fn render(app: &str) -> String {
         deletion = deletion,
         contact = contact,
     )
+}
+
+/// Living Dex's privacy policy. Every statement here is tied to what the app and
+/// the `livingdex` tenant actually do: all identification runs in the cloud,
+/// nothing the user photographs is stored by us, and account deletion erases the
+/// anonymous account, wallet and ledger.
+fn render_livingdex() -> String {
+    let body = format!(
+        r#"<h1>Living Dex Privacy Policy</h1>
+<p><em>Last updated: {updated}</em></p>
+<p>Living Dex is designed to collect as little as possible. This policy explains exactly what leaves your device, where it goes, and how long it is kept.</p>
+<h2>Identifying a photo</h2>
+<p>Every identification happens in the cloud: the app has no on-device species model. When you capture a photo, the app shrinks a copy (longest side 1,536 pixels, JPEG) and sends it over an encrypted connection to our backend, operated by Midgar Oy. The backend forwards it to Google (Gemini) solely to identify the organism and returns the result. We do not save the photo or add it to any gallery: our servers keep no copy once the answer is returned. Google processes it under its own terms and privacy policy, which may include a short retention period for safety and abuse monitoring. We do not use your photos to train AI models, and we ask our providers not to. The full-resolution original stays on your device.</p>
+<h2>Field entries</h2>
+<p>The written field entry for a species is generated on your device with Apple Foundation Models when your device supports it. Otherwise the species name, its classification, and a short factual summary (never your photo, location, or identity) are sent through our backend to Anthropic (Claude) to write the text.</p>
+<h2>Species information lookups</h2>
+<p>To rate rarity, build your Nearby list, and fill in each species' card, the app contacts the Living Dex service, a Cloudflare Worker run by us. It looks up public sources with the species' scientific name: GBIF (occurrence counts and taxonomy), Wikipedia and Wikimedia Commons (summaries and images), and Xeno-canto (recordings). The Worker stores nothing and has no database; it does not receive your account, your photos, or your purchases. Like any web service, Cloudflare may keep standard request logs (such as the request address and your IP address) for a limited time.</p>
+<h2>Location</h2>
+<p>Location is optional and used only while the app is open (While Using the App). If you allow it, each sighting is tagged with its place on your device. To rate how rare a species is where you are, the coordinates of the sighting, first rounded to about 11 km, are sent to the Living Dex service, which asks GBIF how often that species is recorded within about 150 km. A photo you pick from your library or a bundled sample carries no location, so its rarity is rated from worldwide data. To build the Nearby list, the app sends the centre of a roughly 55 km grid cell around you. We do not store these coordinates; they appear only in the standard request logs described above, and in a short-lived cache that is keyed to an area of roughly 11 km and not to you. Your location is never sent to the AI providers, never shown to other players, and never linked to your account. If you decline location access, identification still works; rarity is rated from worldwide data instead and the Nearby list cannot be built.</p>
+<h2>Identity</h2>
+<p>Living Dex works without an account. On first launch the app creates a random device identifier, kept in your Keychain, and uses Apple DeviceCheck so that Apple can confirm the request comes from a genuine Apple device; Apple tells us only yes or no. We use that to create an anonymous account holding an account ID, an access key, and your credit balance. Each new device receives 30 free identifications once; after that, identifications need Living Dex Pro or purchased credits.</p>
+<p>If you choose to link Sign in with Apple, we additionally store Apple's user identifier and the email address Apple provides, which may be Apple's private relay address. We never receive your Apple password.</p>
+<h2>Credits and purchases</h2>
+<p>We keep a ledger for your account: credits granted, credits used by each identification or field entry (with the time), and credit packs bought. Living Dex Pro (monthly or annual) and credit packs are sold through Apple In-App Purchase. RevenueCat processes the purchases: it receives your Apple transaction data and your anonymous account ID so that it can tell us whether you have Pro. We never receive your payment-card details.</p>
+<h2>Game Center</h2>
+<p>If you are signed in to Game Center, the app reports your number of unique species and achievement progress to Apple's Game Center, which handles them under Apple's privacy policy. Nothing else is shared with it.</p>
+<h2>On-device data</h2>
+<p>Content you create in the app, such as your species collection (your Dex), your sightings with their locations, your saved photos, and your progress, is stored on your device and is not uploaded to us for storage.</p>
+<h2>How long we keep data</h2>
+<ul>
+<li>Photos sent for identification: not kept by us. Google and Anthropic keep API data only under their own terms.</li>
+<li>Account, credit balance, and ledger: kept until you delete your account.</li>
+<li>Cloudflare request logs: kept for the limited period Cloudflare's logging settings allow.</li>
+<li>Purchase records at Apple and RevenueCat, and Game Center data at Apple: kept under their policies.</li>
+</ul>
+<h2>Deleting your account and data</h2>
+<p>In the app, open Profile, then Settings, then Delete Account. This permanently deletes your anonymous account, your credit wallet and ledger, and any images stored for it on our servers, and clears all data on your device (your collection, photos, and progress). It cannot be undone, and it does not cancel an App Store subscription: manage or cancel that in iOS Settings under your Apple Account, then Subscriptions. Records held by Apple (purchases, Game Center) and by RevenueCat are kept under their own policies; contact us if you want us to ask RevenueCat to erase yours. Deleting the app alone removes the on-device data but not the server-side account.</p>
+<h2>What we don't do</h2>
+<p>We do not sell your data, show advertising inside the app, or use third-party tracking or advertising identifiers. The app does not ask for tracking permission and does not measure ad campaigns.</p>
+<h2>Contact</h2>
+<p>For any questions, contact {contact}.</p>"#,
+        updated = last_updated("livingdex"),
+        contact = contact_link("livingdex"),
+    );
+    page("Living Dex", "Privacy Policy", &body)
 }
 
 fn render_flaccy() -> String {
@@ -868,12 +912,12 @@ fn page(name: &str, title: &str, body: &str) -> String {
 fn render_terms(app: &str) -> String {
     let c = config(app);
     let subscriptions = if app == "livingdex" {
-        "Living Dex Pro is an auto-renewing subscription sold through Apple In-App Purchase. Payment is charged to your Apple Account at confirmation. It renews automatically unless cancelled at least 24 hours before the end of the current period; manage or cancel it in your Apple Account settings. Any free-trial portion is forfeited when you purchase a subscription. Basic identification is free. Prices are shown in the App before purchase."
+        "Every new device receives 30 free identifications. Each identification uses one credit; when they are used up you can continue with Living Dex Pro or buy credit packs. Living Dex Pro is an auto-renewing subscription, offered monthly and annually, that includes unlimited cloud identifications (subject to reasonable rate limits that protect the service). Eligible new subscribers get a 3-day free trial on the annual plan. Payment is charged to your Apple Account at confirmation of purchase, or when the free trial ends. The subscription renews automatically at the same price unless you cancel at least 24 hours before the end of the current period, and your account is charged for renewal within 24 hours before the period ends. Manage or cancel it in iOS Settings under your Apple Account, then Subscriptions. Any unused portion of a free trial is forfeited when you purchase a subscription. Cancelling does not delete your account; deleting your Living Dex account does not cancel a subscription.</p><p>Credit packs are consumable one-time purchases: credits are not refundable, transferable, or redeemable for money, except where the law requires otherwise. A photo that reaches the identification service uses a credit even when nothing is recognised; a request that fails because of a network or service error does not. Prices are shown in the App before purchase, and purchases are processed by Apple under the Apple Media Services Terms."
     } else {
         "Pay Day Pro is an auto-renewing subscription sold through Apple In-App Purchase. Payment is charged to your Apple Account at confirmation. It renews automatically unless cancelled at least 24 hours before the end of the current period; manage or cancel it in your Apple Account settings. Any free-trial portion is forfeited when you purchase a subscription. Credit packs are one-time consumable purchases used to send invoices over the Peppol network and for optional AI features; consumed credits are non-refundable. Prices are shown in the App before purchase."
     };
     let responsibilities = if app == "livingdex" {
-        "Identifications are AI-generated best guesses and may be wrong. <strong>Never eat, touch, or handle any wild plant, fungus, or animal based on the App's identification</strong> — many species are toxic, venomous, protected, or dangerous, and misidentification can cause serious harm. The App is for general education and enjoyment and is not safety, medical, foraging, or professional advice. Respect wildlife and habitats and follow all local laws and protected-area rules."
+        "Identifications, field entries, and rarity ratings are produced by AI and public data, are best guesses, and may be wrong or incomplete. <strong>Never eat, taste, touch, or handle any wild plant, fungus, or animal based on the App's output. Never consume a wild mushroom or plant on the strength of this App.</strong> Many species are toxic, venomous, protected, or dangerous, and misidentification can cause serious harm or death. The App is for general education and enjoyment and is not safety, medical, foraging, or professional advice. Keep a safe distance from wildlife, do not disturb it, and follow all local laws and protected-area rules."
     } else {
         "You are responsible for the accuracy and legality of the invoices, client data, and tax information you enter, and for having a lawful basis to invoice your clients. The App helps you produce documents in standard formats (including EN 16931 / Peppol); it is not tax, accounting, or legal advice, and you remain responsible for your compliance obligations."
     };
@@ -883,13 +927,13 @@ fn render_terms(app: &str) -> String {
         "Do not use the App unlawfully, to send fraudulent or unsolicited documents, to infringe others' rights, or to interfere with or reverse-engineer the service."
     };
     let availability = if app == "livingdex" {
-        "Cloud identification and AI features depend on third-party services and a network connection and may be unavailable or delayed; on-device features work offline."
+        "Identification is performed in the cloud for every photo, so it needs an internet connection and depends on third-party AI and data services that may be unavailable, delayed, or inaccurate. Browsing your collection works offline. The App sends your photos to AI providers as described in the Privacy Policy."
     } else {
         "Network features (VAT validation, currency rates, and Peppol delivery) depend on third-party services and may be unavailable or delayed; issuing and sharing invoices as PDFs does not require them."
     };
     let body = format!(
         r#"<h1>{name} Terms of Use</h1>
-<p><em>Last updated: July 2026</em></p>
+<p><em>Last updated: {updated}</em></p>
 <p>These Terms govern your use of {name} (the "App"), operated by Midgar Oy. By downloading or using the App you agree to them.</p>
 <h2>Licence</h2>
 <p>We grant you a personal, non-transferable, revocable licence to use the App on Apple devices you own or control, in accordance with the Apple Media Services Terms and these Terms.</p>
@@ -910,6 +954,7 @@ fn render_terms(app: &str) -> String {
 <h2>Contact</h2>
 <p>{contact}</p>"#,
         name = c.name,
+        updated = if app == "livingdex" { last_updated(app) } else { "July 2026" },
         contact = contact_link(app),
     );
     page(c.name, "Terms of Use", &body)
@@ -918,9 +963,13 @@ fn render_terms(app: &str) -> String {
 fn render_support(app: &str) -> String {
     let c = config(app);
     let topics = match app {
-        "livingdex" => r#"<li>Subscriptions are managed in your Apple Account settings; restore purchases from the paywall.</li>
-<li>Your collection and photos are stored on your device; deleting the app removes them.</li>
-<li>Identifications are AI best guesses — never eat, touch, or handle a wild organism based only on the App.</li>"#,
+        "livingdex" => r#"<li><strong>It says "no clear living thing".</strong> The AI could not find one clearly visible wild animal, bird, insect, plant, or fungus it was confident about, so nothing was added to your Dex. Get closer, fill the frame with the subject, use good light, hold steady, and avoid people, pets, screens, food, and objects. A photo that reaches the AI uses a credit even when nothing is recognised; if the request fails because you are offline or the service is down, no credit is used.</li>
+<li><strong>The identification is wrong.</strong> Identification is done by AI and can be mistaken, especially for look-alike species, so treat it as a best guess. Never eat, taste, touch, or handle a wild animal, plant, or fungus, and never consume a wild mushroom or plant, based on this App.</li>
+<li><strong>Free identifications, credits, and Pro.</strong> Every new device gets 30 free identifications, one credit each. After that, Living Dex Pro (monthly or annual) gives unlimited cloud identifications, or you can buy credit packs. Credits are consumable and non-refundable except where the law requires. Check your balance in Profile.</li>
+<li><strong>Restore purchases.</strong> Open the Pro screen and tap Restore while signed in to the same Apple Account you bought with. Subscriptions are managed or cancelled in iOS Settings under your Apple Account, then Subscriptions; deleting the app or your Living Dex account does not cancel one.</li>
+<li><strong>Location and Nearby.</strong> Location is optional. Allow While Using the App in iOS Settings under Living Dex to get local rarity and the Nearby list.</li>
+<li><strong>Deleting your account.</strong> Open Profile, then Settings, then Delete Account. This permanently deletes your anonymous account, credit wallet, and stored images from our servers and clears all data on your device. It cannot be undone and does not cancel a subscription.</li>
+<li><strong>Your collection and photos.</strong> They are stored on your device only; deleting the app removes them.</li>"#,
         "payday" => r#"<li>Subscriptions and credit packs are managed in your Apple Account settings; restore purchases from the paywall.</li>
 <li>You can delete your account from within the app (Settings).</li>
 <li>Invoices and client data are stored on your device; the App works offline for creating and sharing PDFs.</li>"#,
@@ -1005,6 +1054,25 @@ mod tests {
             assert!(!render_support(app).contains("Invoices"), "{} shows Pay Day topics", app);
         }
         assert!(render_support("payday").contains("Invoices"));
+    }
+
+    #[test]
+    fn livingdex_pages_describe_cloud_identification_and_deletion() {
+        let privacy = render("livingdex");
+        assert!(privacy.contains("no on-device species model"));
+        assert!(privacy.contains("Delete Account"));
+        assert!(privacy.contains("does not cancel an App Store subscription"));
+        assert!(privacy.contains("October 2026"));
+        assert!(privacy.contains("guitaripod@gmail.com"));
+        assert!(!privacy.contains("on-device identification"));
+        let terms = render_terms("livingdex");
+        assert!(terms.contains("30 free identifications"));
+        assert!(terms.contains("3-day free trial"));
+        assert!(terms.contains("Never consume a wild mushroom or plant"));
+        assert!(!terms.contains("on-device features work offline"));
+        let support = render_support("livingdex");
+        assert!(support.contains("no clear living thing"));
+        assert!(support.contains("Restore"));
     }
 
     #[test]
