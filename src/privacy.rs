@@ -125,7 +125,7 @@ fn on_device_content(app: &str) -> &'static str {
 fn last_updated(app: &str) -> &'static str {
     match app {
         "psywave" => "September 2026",
-        "livingdex" => "October 2026",
+        "livingdex" | "inventory" => "October 2026",
         _ => "June 2026",
     }
 }
@@ -148,6 +148,9 @@ fn render(app: &str) -> String {
     }
     if app == "livingdex" {
         return render_livingdex();
+    }
+    if app == "inventory" {
+        return render_inventory();
     }
     let c = config(app);
     let location = if c.uses_location {
@@ -281,6 +284,71 @@ fn render_flaccy() -> String {
 <h2>Your choices</h2>
 <p>You can delete the app at any time to remove on-device data. For any questions, contact <a href="https://x.com/prblemslver">@prblemslver</a>.</p>"#;
     page("Flaccy", "Privacy Policy", body)
+}
+
+/// Master of Inventory's privacy policy. The app has no account and no AI: the
+/// inventory stays on the device and in the user's own iCloud, receipts are read
+/// on the device, and the only things that leave it are purchase records for
+/// RevenueCat and the anonymous "More apps" catalogue request.
+fn render_inventory() -> String {
+    let body = format!(
+        r#"<h1>Master of Inventory Privacy Policy</h1>
+<p><em>Last updated: {updated}</em></p>
+<p>Master of Inventory is a private record of what you own: what it cost, when you bought it, when the warranty ends and until when you can still return it. It has no account, no analytics, no advertising, and no server of ours that holds your inventory. This policy explains exactly what the app stores, what leaves your device, and who receives it.</p>
+<h2>In short</h2>
+<ul>
+<li>Your items, photos, receipts and notes stay on your device and, if you use iCloud, in your own iCloud. We cannot see them.</li>
+<li>Receipts and serial numbers are read on your device. Nothing is uploaded for text recognition.</li>
+<li>The only information that leaves the app is purchase records sent to RevenueCat and anonymous counts from the optional "More apps" screen.</li>
+<li>No advertising, no tracking, no analytics software, no sale of data.</li>
+</ul>
+<h2>Who we are</h2>
+<p>Master of Inventory is published by Midgar Oy, a company in Finland. For the small amount of information described under Purchases and More apps below, Midgar Oy is the controller. You can reach us at {contact}.</p>
+<h2>What the app stores on your device</h2>
+<p>Everything you enter or capture: item names, brands, models, serial numbers, stores, prices and currencies, purchase dates, warranty and return deadlines, notes, where an item is kept, categories, photos, receipts and other documents (images and PDFs) together with the text read from them, and your settings such as reminder times and default warranty. It is kept in the app's private storage on your device, protected by iOS data protection, and is not uploaded to us.</p>
+<h2>iCloud sync</h2>
+<p>If you are signed in to iCloud, the app syncs your inventory between your own devices using Apple's CloudKit, in the private database of your Apple Account. Only you can read it; we have no access to it and no way to open it. Apple processes it under its own terms and privacy policy and encrypts it in transit and at rest. iCloud also uses Apple's push service to tell your other devices that something changed, which carries no inventory content. The iCloud row in the app's Settings shows the state of sync, and you control it in iOS Settings under your name, then iCloud. If iCloud is off, your inventory stays on the device only.</p>
+<h2>Receipts and serial numbers</h2>
+<p>When you scan a receipt, the app reads the price, date and store on your device with Apple's Vision framework, and reads serial numbers from the camera with Apple's Live Text. The images and the recognised text are never sent to us or to anyone else.</p>
+<h2>Camera, photos and files</h2>
+<p>The camera is used only to photograph items and to scan receipts, documents and serial numbers. The app reads your photo library only for the photos you choose to attach, and writes to it only when you save a photo. Files you import, such as a backup, are read only when you pick them. Each permission is optional and can be changed in iOS Settings. What you capture is stored inside the app and is not sent to us.</p>
+<h2>Reminders</h2>
+<p>Warranty and return reminders are notifications scheduled on your device. No server of ours sends them. You can turn them off in the app or in iOS Settings.</p>
+<h2>Face ID and passcode lock</h2>
+<p>You can lock the app with Face ID or your device passcode. iOS performs the check and tells the app only whether it succeeded; the app never receives your face data or your passcode.</p>
+<h2>Spotlight, Siri and Shortcuts</h2>
+<p>So that you can find an item from the Home Screen, the app adds each active item's name, brand, model, store, serial number and category to your device's Spotlight index, which stays on your device. Items you archive or delete are removed from it, and while the Face ID lock or "Hide values when switching apps" is on, the app adds nothing to Spotlight. Siri and Shortcuts actions run on your device and use only what the app already holds.</p>
+<h2>Exports, claim packs and backups</h2>
+<p>PDF reports, claim packs, CSV files and backups are created on your device when you ask. They leave the app only through the iOS share sheet, to the place you choose, such as Mail, Files or AirDrop. They contain what you select, including prices, serial numbers, photos and receipts, so treat them like the original documents. Once you share one, the recipient's own practices apply.</p>
+<h2>Purchases and RevenueCat</h2>
+<p>Pro (monthly, yearly or lifetime) is sold through Apple In-App Purchase. Apple handles payment and billing, and we never receive your card details or your Apple Account details. The app verifies your purchase on your device with Apple's StoreKit. If you bought Master of Inventory when it was a paid app, the app checks with Apple, on your device, which version you first downloaded and unlocks Pro for you.</p>
+<p>To understand purchases and subscriptions, the app also uses RevenueCat (RevenueCat, Inc., United States). The RevenueCat software in the app sends RevenueCat your Apple transaction records (which product, price, dates and subscription status, and your App Store country) together with an anonymous identifier created on your device, and standard technical information such as the app and iOS version and your IP address. It receives no name, no email address and no inventory content. We use it to see how purchases and subscriptions are doing; it does not decide whether Pro is unlocked. RevenueCat processes this on our behalf and under its own privacy policy at <a href="https://www.revenuecat.com/privacy">revenuecat.com/privacy</a>. Because it is based in the United States, the information may be processed there.</p>
+<h2>More apps</h2>
+<p>Settings has a "More apps" screen that shows our other apps. Only when you open it, the app downloads the list from a catalogue service we run on Cloudflare, and the artwork from Apple's servers. It also sends the catalogue service a small anonymous event when an app is shown or tapped: the kind of event, which app, the bundle identifier of this app, and your App Store country. It carries no identifier for you or your device. Like any web service, Cloudflare may keep standard request logs, such as your IP address, for a limited time.</p>
+<h2>Help and diagnostics</h2>
+<p>The app keeps a short activity log on your device to help find faults. It is never sent automatically. In Settings, under Help and contact, you can copy a diagnostic summary (app and iOS version, device model, iCloud state, the number of items and the latest log lines) or start an email to us with a short header filled in. Read it first: nothing is sent unless you send it. If you have chosen in iOS to share analytics with app developers, Apple may give us anonymous crash and usage reports, which contain nothing we can link to you.</p>
+<h2>What we don't do</h2>
+<p>We do not sell your data, show advertising, or use third-party tracking or advertising identifiers. The app does not ask for tracking permission and contains no advertising or analytics software. We do not use your data to train AI models, and nothing in the app sends your content to an AI service.</p>
+<h2>How long we keep data</h2>
+<ul>
+<li>Your inventory: only on your devices and in your iCloud, until you delete it.</li>
+<li>Purchase records at Apple and RevenueCat: kept under their policies.</li>
+<li>"More apps" events: anonymous counts, kept as long as they are useful for measuring our own promotion.</li>
+</ul>
+<h2>Deleting your data</h2>
+<p>Delete items in the app, or delete the app to remove everything stored on that device. To remove the iCloud copy, open iOS Settings, your name, iCloud, Manage Account Storage, then Master of Inventory, and choose Delete Data. Deleting the app does not cancel a subscription: manage or cancel it in iOS Settings under your Apple Account, then Subscriptions. We hold no account for you, so there is nothing else for us to delete; if you want the purchase records that RevenueCat holds erased, contact us and we will ask RevenueCat to do it.</p>
+<h2>Your rights</h2>
+<p>Because we keep almost no information about you, most requests are answered by the controls above. Where privacy law, such as the GDPR, gives you rights to access, correct, erase, restrict or move information about you, or to object to its use, contact us and we will help. We process purchase records to provide and support the purchases you make and, for the anonymous counts, in our legitimate interest in measuring our own promotion. You may complain to your local data protection authority; in Finland that is the Office of the Data Protection Ombudsman (tietosuoja.fi).</p>
+<h2>Children</h2>
+<p>Master of Inventory is not directed at children, and we do not knowingly collect personal information from anyone, including children.</p>
+<h2>Changes</h2>
+<p>If this policy changes we will publish the new version here with a new date, and mention material changes in the app's release notes.</p>
+<h2>Contact</h2>
+<p>For any questions, contact {contact}.</p>"#,
+        updated = last_updated("inventory"),
+        contact = r#"<a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>"#,
+    );
+    page("Master of Inventory", "Privacy Policy", &body)
 }
 
 pub fn payday_landing(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
@@ -1073,6 +1141,22 @@ mod tests {
         let support = render_support("livingdex");
         assert!(support.contains("no clear living thing"));
         assert!(support.contains("Restore"));
+    }
+
+
+    #[test]
+    fn inventory_policy_describes_local_data_revenuecat_and_more_apps() {
+        let privacy = render("inventory");
+        assert!(privacy.contains("Master of Inventory Privacy Policy"));
+        assert!(privacy.contains("October 2026"));
+        assert!(privacy.contains("no server of ours that holds your inventory"));
+        assert!(privacy.contains("never sent to us or to anyone else"));
+        assert!(privacy.contains("RevenueCat"));
+        assert!(privacy.contains("More apps"));
+        assert!(privacy.contains("support@midgarcorp.cc"));
+        assert!(privacy.contains("third-party tracking or advertising identifiers"));
+        assert!(!privacy.contains("AI processing"));
+        assert!(!privacy.contains("anonymous, device-based identity"));
     }
 
     #[test]
