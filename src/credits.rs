@@ -418,12 +418,26 @@ pub async fn deduct_credits_clamped(
     description: &str,
     db: &D1Database,
 ) -> Result<(i32, u32)> {
+    deduct_credits_clamped_with_reference(app_id, user_id, amount, transaction_type, description, None, db).await
+}
+
+/// `deduct_credits_clamped` that also stamps the ledger row with a reference,
+/// so a deduction such as a purchase refund can be found again by its id.
+pub async fn deduct_credits_clamped_with_reference(
+    app_id: &str,
+    user_id: &str,
+    amount: u32,
+    transaction_type: &str,
+    description: &str,
+    reference_id: Option<&str>,
+    db: &D1Database,
+) -> Result<(i32, u32)> {
     for _ in 0..8 {
         let current = get_user_balance(app_id, user_id, db).await?;
         if current <= 0 {
             return Ok((current.max(0), 0));
         }
-        let to_deduct = amount.min(current as u32);
+        let to_deduct = crate::purchases::refund_reversal(current, amount);
         let now = Utc::now().to_rfc3339();
 
         let row = db
@@ -450,7 +464,7 @@ pub async fn deduct_credits_clamped(
         let transaction_id = Uuid::new_v4().to_string();
         db.prepare(
             "INSERT INTO credit_transactions (id, app_id, user_id, type, amount, balance_after, description, reference_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&[
             transaction_id.into(),
@@ -460,6 +474,7 @@ pub async fn deduct_credits_clamped(
             (-(to_deduct as i32)).into(),
             new_balance.into(),
             description.into(),
+            reference_id.map(|r| r.into()).unwrap_or(worker::wasm_bindgen::JsValue::NULL),
             now.into(),
         ])?
         .run()

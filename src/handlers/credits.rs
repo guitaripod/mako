@@ -1044,8 +1044,14 @@ struct RevenueCatNonSubscription {
 /// True if `user_id` holds the app's configured premium entitlement, verified
 /// against the RevenueCat REST API (non-spoofable). Only apps with a non-null
 /// `premium_entitlement` incur the RC call; everyone else returns false with a
-/// single indexed D1 read. Fail-safe: any error/404 => false (charge normally),
-/// so a transient RC issue never silently hands out free unlimited usage.
+/// single indexed D1 read.
+///
+/// A tenant that is not on strict purchases keeps the original rule: any active
+/// entitlement counts, and any error/404 => false (charge normally), so a
+/// transient RC issue never silently hands out free unlimited usage. A strict
+/// tenant must hold its own configured entitlement, and when RevenueCat cannot be
+/// reached the last answer from the previous 24 hours is used instead of treating
+/// a paying user as free.
 pub async fn is_premium_user(
     env: &Env,
     db: &worker::D1Database,
@@ -1053,7 +1059,7 @@ pub async fn is_premium_user(
     user_id: &str,
 ) -> bool {
     let row = match db
-        .prepare("SELECT premium_entitlement, rc_project_id FROM apps WHERE app_id = ?1")
+        .prepare("SELECT * FROM apps WHERE app_id = ?1")
         .bind(&[app_id.into()])
     {
         Ok(stmt) => stmt.first::<serde_json::Value>(None).await.ok().flatten(),
@@ -1063,54 +1069,130 @@ pub async fn is_premium_user(
         Some(r) => r,
         None => return false,
     };
-    let configured = row
+    let required = row
         .get("premium_entitlement")
         .and_then(|v| v.as_str())
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let project_id = row.get("rc_project_id").and_then(|v| v.as_str()).unwrap_or("");
-    if !configured || project_id.is_empty() {
-        return false;
-    }
-
-    let key_name = format!("REVENUECAT_IOS_API_KEY_{}", app_id.to_uppercase());
-    let api_key = match env
-        .secret(&key_name)
-        .or_else(|_| env.secret("REVENUECAT_IOS_API_KEY"))
-    {
-        Ok(k) => k.to_string(),
-        Err(_) => return false,
+    let required = match required {
+        Some(r) if !project_id.is_empty() => r,
+        _ => return false,
     };
 
+    let entitlements = fetch_active_entitlements(env, app_id, project_id, user_id).await;
+    if !crate::tenant::TenantPolicy::from_row(&row).strict_purchases {
+        return entitlements.map(|items| !items.is_empty()).unwrap_or(false);
+    }
+
+    match entitlements {
+        Some(items) => {
+            let premium = holds_required_entitlement(env, app_id, project_id, &items, &required).await;
+            store_premium_cache(db, app_id, user_id, premium).await;
+            premium
+        }
+        None => read_premium_cache(db, app_id, user_id).await.unwrap_or(false),
+    }
+}
+
+fn revenuecat_api_key(env: &Env, app_id: &str) -> Option<String> {
+    let key_name = format!("REVENUECAT_IOS_API_KEY_{}", app_id.to_uppercase());
+    env.secret(&key_name)
+        .or_else(|_| env.secret("REVENUECAT_IOS_API_KEY"))
+        .ok()
+        .map(|k| k.to_string())
+}
+
+/// GETs a RevenueCat v2 resource; None on any transport error, non-200 or bad JSON.
+async fn revenuecat_get(api_key: &str, url: &str) -> Option<serde_json::Value> {
+    let headers = Headers::new();
+    headers.set("Authorization", &format!("Bearer {}", api_key)).ok()?;
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Get).with_headers(headers);
+    let request = Request::new_with_init(url, &init).ok()?;
+    let mut resp = Fetch::Request(request).send().await.ok()?;
+    if resp.status_code() != 200 {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+/// The customer's active entitlements, or None when they could not be fetched.
+async fn fetch_active_entitlements(
+    env: &Env,
+    app_id: &str,
+    project_id: &str,
+    user_id: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let api_key = revenuecat_api_key(env, app_id)?;
     let url = format!(
         "https://api.revenuecat.com/v2/projects/{}/customers/{}/active_entitlements",
         project_id, user_id
     );
-    let headers = Headers::new();
-    if headers.set("Authorization", &format!("Bearer {}", api_key)).is_err() {
-        return false;
+    revenuecat_get(&api_key, &url)
+        .await?
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+}
+
+/// True when one of the active entitlements is `required`. RevenueCat's v2 list
+/// gives internal entitlement ids, so an item that does not name the entitlement
+/// is looked up once to learn its lookup key.
+async fn holds_required_entitlement(
+    env: &Env,
+    app_id: &str,
+    project_id: &str,
+    items: &[serde_json::Value],
+    required: &str,
+) -> bool {
+    use crate::purchases::{entitlement_id_to_resolve, item_names_entitlement, resolved_entitlement_matches};
+    if items.iter().any(|item| item_names_entitlement(item, required)) {
+        return true;
     }
-    let mut init = worker::RequestInit::new();
-    init.with_method(Method::Get).with_headers(headers);
-    let request = match Request::new_with_init(&url, &init) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    let mut resp = match Fetch::Request(request).send().await {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    if resp.status_code() != 200 {
-        return false;
+    let Some(api_key) = revenuecat_api_key(env, app_id) else { return false };
+    for item in items {
+        let Some(entitlement_id) = entitlement_id_to_resolve(item, required) else { continue };
+        let url = format!(
+            "https://api.revenuecat.com/v2/projects/{}/entitlements/{}",
+            project_id, entitlement_id
+        );
+        if let Some(entitlement) = revenuecat_get(&api_key, &url).await {
+            if resolved_entitlement_matches(&entitlement, required) {
+                return true;
+            }
+        }
     }
-    match resp.json::<serde_json::Value>().await {
-        Ok(v) => v
-            .get("items")
-            .and_then(|i| i.as_array())
-            .map(|a| !a.is_empty())
-            .unwrap_or(false),
-        Err(_) => false,
+    false
+}
+
+async fn store_premium_cache(db: &worker::D1Database, app_id: &str, user_id: &str, premium: bool) {
+    let stmt = db
+        .prepare("UPDATE users SET premium_cached = ?1, premium_checked_at = ?2 WHERE id = ?3 AND app_id = ?4")
+        .bind(&[
+            (premium as i32).into(),
+            chrono::Utc::now().to_rfc3339().into(),
+            user_id.into(),
+            app_id.into(),
+        ]);
+    if let Ok(stmt) = stmt {
+        if let Err(e) = stmt.run().await {
+            worker::console_log!("premium cache write failed: {:?}", e);
+        }
     }
+}
+
+async fn read_premium_cache(db: &worker::D1Database, app_id: &str, user_id: &str) -> Option<bool> {
+    let row = db
+        .prepare("SELECT premium_checked_at, premium_cached FROM users WHERE id = ?1 AND app_id = ?2")
+        .bind(&[user_id.into(), app_id.into()])
+        .ok()?
+        .first::<serde_json::Value>(None)
+        .await
+        .ok()??;
+    let checked_at = row.get("premium_checked_at").and_then(|v| v.as_str());
+    let cached = row.get("premium_cached").and_then(|v| v.as_i64()).map(|n| n != 0);
+    crate::purchases::cached_premium(checked_at, cached, chrono::Utc::now())
 }
 
 /// Outcome of verifying a client-reported purchase against RevenueCat.
@@ -1142,6 +1224,9 @@ async fn validate_with_revenuecat(
     product_id: &str,
     platform: &str,
 ) -> Result<PurchaseVerification> {
+    if crate::mock::enabled(env) {
+        return Ok(PurchaseVerification::Verified);
+    }
     let key_name = format!("REVENUECAT_IOS_API_KEY_{}", app_id.to_uppercase());
     let api_key = env
         .secret(&key_name)
@@ -1364,19 +1449,16 @@ async fn tag_revenuecat_revenue(db: &worker::D1Database, event: &RevenueCatEvent
 pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
     
-    // Get the authorization header
     let auth_header = req.headers().get("Authorization")?;
     
-    // Verify the webhook authorization
     let expected_auth = env.secret("REVENUECAT_WEBHOOK_AUTH")
         .map_err(|_| AppError::InternalError("REVENUECAT_WEBHOOK_AUTH not configured".to_string()))?
         .to_string();
     
-    if auth_header != Some(format!("Bearer {}", expected_auth)) {
+    if !crate::purchases::webhook_authorized(auth_header.as_deref(), &expected_auth) {
         return AppError::Unauthorized("Invalid webhook authorization".to_string()).to_response();
     }
     
-    // Parse the webhook event
     let webhook_event: RevenueCatWebhookEvent = match req.json().await {
         Ok(event) => event,
         Err(e) => return AppError::BadRequest(format!("Invalid webhook body: {}", e)).to_response(),
@@ -1384,83 +1466,199 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
     
     let event = &webhook_event.event;
     worker::console_log!("RevenueCat webhook: {} for user {}", event.event_type, event.app_user_id);
-    
-    // Handle different event types
-    match event.event_type.as_str() {
-        "INITIAL_PURCHASE" | "RENEWAL" => {
-            let db = env.d1("DB")?;
 
-            // Resolve the tenant from the product id via apps.rc_product_prefix.
-            let (app_id, prefix) = match resolve_tenant_by_product(&db, &event.product_id).await {
-                Some(t) => t,
-                None => {
-                    worker::console_log!("No tenant matched product {}", event.product_id);
-                    tag_revenuecat_revenue(&db, event).await;
-                    return Response::ok("OK");
-                }
+    let db = env.d1("DB")?;
+    let tenant = resolve_tenant_by_product(&db, &event.product_id).await;
+    let strict = match &tenant {
+        Some((app_id, _)) => crate::tenant::TenantPolicy::load(&db, app_id)
+            .await
+            .map(|p| p.strict_purchases)
+            .unwrap_or(false),
+        None => false,
+    };
+    let production = crate::purchases::is_production(env.var("ENVIRONMENT").ok().map(|v| v.to_string()).as_deref());
+
+    use crate::purchases::{classify_event, should_ignore_event, EventAction};
+    match classify_event(&event.event_type, strict) {
+        EventAction::CreditPack => {
+            let Some((app_id, prefix)) = tenant else {
+                worker::console_log!("No tenant matched product {}", event.product_id);
+                tag_revenuecat_revenue(&db, event).await;
+                return Response::ok("OK");
             };
-
-            let pack_id = event
-                .product_id
-                .strip_prefix(prefix.as_str())
-                .unwrap_or(&event.product_id)
-                .to_string();
-
-            let packs = get_credit_packs_for_app(&app_id, &db).await;
-            let pack = match packs.iter().find(|p| p.id == pack_id) {
-                Some(p) => p,
-                None => {
-                    worker::console_log!("Unknown pack {} for app {} (product {})", pack_id, app_id, event.product_id);
-                    tag_revenuecat_revenue(&db, event).await;
-                    return Response::ok("OK");
-                }
-            };
-
-            let total_credits = pack.credits + pack.bonus_credits;
-
-            let existing = db.prepare(
-                "SELECT id FROM credit_purchases WHERE app_id = ? AND payment_id = ? AND payment_provider = 'revenuecat'"
-            )
-            .bind(&[app_id.clone().into(), event.transaction_id.clone().into()])?
-            .first::<serde_json::Value>(None)
-            .await?;
-
-            if existing.is_some() {
-                worker::console_log!("Transaction {} already processed", event.transaction_id);
+            if should_ignore_event(strict, production, &event.environment) {
+                worker::console_log!("Ignoring sandbox event {} in production", event.id);
                 return Response::ok("OK");
             }
-
-            let purchase_id = record_and_complete_purchase(
-                &app_id,
-                &event.app_user_id,
-                &pack_id,
-                total_credits as u32,
-                pack.price_usd_cents as u32,
-                "revenuecat",
-                &event.transaction_id,
-                &db,
-            ).await?;
-
-            worker::console_log!("Processed RevenueCat purchase {} for app {} user {}", purchase_id, app_id, event.app_user_id);
+            credit_pack_from_event(&db, event, &app_id, &prefix).await?;
         },
-        "NON_RENEWING_PURCHASE" => {
-            let db = env.d1("DB")?;
+        EventAction::TagRevenueOnly => {
             tag_revenuecat_revenue(&db, event).await;
         },
-        "CANCELLATION" | "UNCANCELLATION" | "EXPIRATION" => {
-            // Handle subscription events (we don't have subscriptions yet)
-            worker::console_log!("Subscription event {} for user {}", event.event_type, event.app_user_id);
+        EventAction::ReversePackRefund => {
+            if let Some((app_id, prefix)) = tenant {
+                if should_ignore_event(strict, production, &event.environment) {
+                    worker::console_log!("Ignoring sandbox event {} in production", event.id);
+                    return Response::ok("OK");
+                }
+                reverse_pack_refund(&db, event, &app_id, &prefix).await?;
+            }
         },
-        "BILLING_ISSUE" => {
-            worker::console_log!("Billing issue for user {}", event.app_user_id);
+        EventAction::LogOnly => {
+            if event.event_type == "BILLING_ISSUE" {
+                worker::console_log!("Billing issue for user {}", event.app_user_id);
+            } else {
+                worker::console_log!("Subscription event {} for user {}", event.event_type, event.app_user_id);
+            }
         },
-        _ => {
+        EventAction::Ignore => {
             worker::console_log!("Unhandled RevenueCat event type: {}", event.event_type);
         }
     }
     
     Response::ok("OK")
 }
+
+/// Credits the credit pack a purchase event names, once per store transaction:
+/// the client validate call records the same `(app, "revenuecat", transaction id)`
+/// row, so whichever path arrives first credits and the other finds it.
+async fn credit_pack_from_event(
+    db: &worker::D1Database,
+    event: &RevenueCatEvent,
+    app_id: &str,
+    prefix: &str,
+) -> Result<()> {
+    let pack_id = event
+        .product_id
+        .strip_prefix(prefix)
+        .unwrap_or(&event.product_id)
+        .to_string();
+
+    let packs = get_credit_packs_for_app(app_id, db).await;
+    let pack = match packs.iter().find(|p| p.id == pack_id) {
+        Some(p) => p,
+        None => {
+            worker::console_log!("Unknown pack {} for app {} (product {})", pack_id, app_id, event.product_id);
+            tag_revenuecat_revenue(db, event).await;
+            return Ok(());
+        }
+    };
+
+    let total_credits = pack.credits + pack.bonus_credits;
+
+    let existing = db.prepare(
+        "SELECT id FROM credit_purchases WHERE app_id = ? AND payment_id = ? AND payment_provider = 'revenuecat'"
+    )
+    .bind(&[app_id.into(), event.transaction_id.clone().into()])?
+    .first::<serde_json::Value>(None)
+    .await?;
+
+    if existing.is_some() {
+        worker::console_log!("Transaction {} already processed", event.transaction_id);
+        return Ok(());
+    }
+
+    let purchase_id = record_and_complete_purchase(
+        app_id,
+        &event.app_user_id,
+        &pack_id,
+        total_credits as u32,
+        pack.price_usd_cents as u32,
+        "revenuecat",
+        &event.transaction_id,
+        db,
+    ).await?;
+
+    worker::console_log!("Processed RevenueCat purchase {} for app {} user {}", purchase_id, app_id, event.app_user_id);
+    Ok(())
+}
+
+/// Takes back the credits of a refunded credit-pack purchase, down to a zero
+/// balance, once per transaction. A product that is not a credit pack, or a
+/// transaction that never credited anything, is left alone, so subscriptions
+/// are never touched. The claim row in `purchase_refunds` is what makes a
+/// repeated delivery a no-op; it is released again if the reversal fails so
+/// RevenueCat's retry can finish the job.
+async fn reverse_pack_refund(
+    db: &worker::D1Database,
+    event: &RevenueCatEvent,
+    app_id: &str,
+    prefix: &str,
+) -> Result<()> {
+    let pack_id = event.product_id.strip_prefix(prefix).unwrap_or(&event.product_id);
+    let packs = get_credit_packs_for_app(app_id, db).await;
+    if !packs.iter().any(|p| p.id == pack_id) {
+        worker::console_log!("Refund for {} is not a credit pack; ignored", event.product_id);
+        return Ok(());
+    }
+
+    let purchase = db
+        .prepare(
+            "SELECT id, user_id, credits FROM credit_purchases
+             WHERE app_id = ?1 AND payment_provider = 'revenuecat' AND payment_id = ?2 AND status IN ('completed', 'refunded')",
+        )
+        .bind(&[app_id.into(), event.transaction_id.clone().into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    let Some(purchase) = purchase else {
+        worker::console_log!("Refund for transaction {} has no credited purchase; nothing to reverse", event.transaction_id);
+        return Ok(());
+    };
+    let purchase_id = purchase.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let user_id = purchase.get("user_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let credits = purchase.get("credits").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32;
+
+    let claimed = db
+        .prepare(
+            "INSERT OR IGNORE INTO purchase_refunds (app_id, transaction_id, user_id, credits, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&[
+            app_id.into(),
+            event.transaction_id.clone().into(),
+            user_id.clone().into(),
+            credits.into(),
+            chrono::Utc::now().to_rfc3339().into(),
+        ])?
+        .run()
+        .await?;
+    let newly_claimed = claimed.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0;
+    if !newly_claimed {
+        worker::console_log!("Refund for transaction {} already reversed", event.transaction_id);
+        return Ok(());
+    }
+
+    let reference = crate::purchases::refund_reference(&event.transaction_id);
+    let reversed = crate::credits::deduct_credits_clamped_with_reference(
+        app_id,
+        &user_id,
+        credits,
+        "admin_adjustment",
+        &format!("App Store refund reversed: {} pack", pack_id),
+        Some(&reference),
+        db,
+    )
+    .await;
+    match reversed {
+        Ok((_, taken)) => {
+            db.prepare("UPDATE credit_purchases SET status = 'refunded' WHERE id = ?1")
+                .bind(&[purchase_id.into()])?
+                .run()
+                .await?;
+            worker::console_log!("Reversed {} of {} credits for refunded transaction {}", taken, credits, event.transaction_id);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = db
+                .prepare("DELETE FROM purchase_refunds WHERE app_id = ?1 AND transaction_id = ?2")
+                .bind(&[app_id.into(), event.transaction_id.clone().into()])?
+                .run()
+                .await;
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

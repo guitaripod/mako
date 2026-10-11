@@ -15,6 +15,7 @@ mod logger;
 mod providers;
 mod privacy;
 mod chat_alias;
+mod purchases;
 mod art;
 mod mock;
 mod redact;
