@@ -337,6 +337,7 @@ async fn call_provider(env: &Env, cfg: &AliasConfig, system: &str, turns: &[Turn
 fn reply_error(error: ReplyError) -> AppError {
     match error {
         ReplyError::Truncated => AppError::Truncated,
+        ReplyError::Blocked => AppError::ContentBlocked,
         ReplyError::Empty => AppError::InternalError("Empty AI response".to_string()),
     }
 }

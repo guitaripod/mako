@@ -474,13 +474,24 @@ pub struct Reply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyError {
     Truncated,
+    Blocked,
     Empty,
 }
 
+/// Gemini finish reasons that mean the provider refused to answer rather than ran out of room.
+const GEMINI_BLOCK_REASONS: [&str; 4] = ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"];
+
 pub fn parse_gemini_reply(value: &Value) -> Result<Reply, ReplyError> {
+    if value.get("promptFeedback").and_then(|f| f.get("blockReason")).is_some() {
+        return Err(ReplyError::Blocked);
+    }
     let candidate = value.get("candidates").and_then(|c| c.get(0));
-    if candidate.and_then(|c| c.get("finishReason")).and_then(|f| f.as_str()) == Some("MAX_TOKENS") {
+    let finish = candidate.and_then(|c| c.get("finishReason")).and_then(|f| f.as_str());
+    if finish == Some("MAX_TOKENS") {
         return Err(ReplyError::Truncated);
+    }
+    if finish.map(|f| GEMINI_BLOCK_REASONS.contains(&f)).unwrap_or(false) {
+        return Err(ReplyError::Blocked);
     }
     let text = candidate
         .and_then(|c| c.get("content"))
@@ -498,8 +509,18 @@ pub fn parse_gemini_reply(value: &Value) -> Result<Reply, ReplyError> {
 
 pub fn parse_openai_reply(value: &Value) -> Result<Reply, ReplyError> {
     let choice = value.get("choices").and_then(|c| c.get(0));
-    if choice.and_then(|c| c.get("finish_reason")).and_then(|f| f.as_str()) == Some("length") {
+    let finish = choice.and_then(|c| c.get("finish_reason")).and_then(|f| f.as_str());
+    if finish == Some("length") {
         return Err(ReplyError::Truncated);
+    }
+    let refused = choice
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("refusal"))
+        .and_then(|r| r.as_str())
+        .map(|r| !r.is_empty())
+        .unwrap_or(false);
+    if finish == Some("content_filter") || refused {
+        return Err(ReplyError::Blocked);
     }
     let text = choice
         .and_then(|c| c.get("message"))
@@ -518,6 +539,9 @@ pub fn parse_openai_reply(value: &Value) -> Result<Reply, ReplyError> {
 pub fn parse_anthropic_reply(value: &Value) -> Result<Reply, ReplyError> {
     if value.get("stop_reason").and_then(|s| s.as_str()) == Some("max_tokens") {
         return Err(ReplyError::Truncated);
+    }
+    if value.get("stop_reason").and_then(|s| s.as_str()) == Some("refusal") {
+        return Err(ReplyError::Blocked);
     }
     let blocks = value.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
     let tool_input = blocks
@@ -795,6 +819,26 @@ mod tests {
     }
 
     #[test]
+    fn a_gemini_prompt_block_is_a_blocked_reply_not_an_internal_error() {
+        let blocked_prompt = json!({ "promptFeedback": { "blockReason": "PROHIBITED_CONTENT" } });
+        assert_eq!(parse_gemini_reply(&blocked_prompt).unwrap_err(), ReplyError::Blocked);
+        let blocked_answer = json!({ "candidates": [ { "finishReason": "SAFETY" } ] });
+        assert_eq!(parse_gemini_reply(&blocked_answer).unwrap_err(), ReplyError::Blocked);
+        let truncated = json!({ "candidates": [ { "finishReason": "MAX_TOKENS" } ] });
+        assert_eq!(parse_gemini_reply(&truncated).unwrap_err(), ReplyError::Truncated);
+    }
+
+    #[test]
+    fn openai_and_anthropic_refusals_are_blocked_replies() {
+        let filtered = json!({ "choices": [ { "finish_reason": "content_filter", "message": { "content": "" } } ] });
+        assert_eq!(parse_openai_reply(&filtered).unwrap_err(), ReplyError::Blocked);
+        let refusal = json!({ "choices": [ { "finish_reason": "stop", "message": { "content": null, "refusal": "I can't help with that." } } ] });
+        assert_eq!(parse_openai_reply(&refusal).unwrap_err(), ReplyError::Blocked);
+        let anthropic = json!({ "stop_reason": "refusal", "content": [] });
+        assert_eq!(parse_anthropic_reply(&anthropic).unwrap_err(), ReplyError::Blocked);
+    }
+
+    #[test]
     fn ledger_references_carry_the_key() {
         assert_eq!(ledger_reference("abc-1"), "chat:abc-1");
     }
@@ -918,7 +962,7 @@ mod tests {
             Ok(Reply { text: "{\"a\":1}".to_string(), prompt_tokens: 11, output_tokens: 5 })
         );
         let blocked = json!({ "candidates": [ { "finishReason": "SAFETY" } ] });
-        assert_eq!(parse_gemini_reply(&blocked), Err(ReplyError::Empty));
+        assert_eq!(parse_gemini_reply(&blocked), Err(ReplyError::Blocked));
     }
 
     #[test]
@@ -931,7 +975,7 @@ mod tests {
         });
         assert_eq!(parse_openai_reply(&ok), Ok(Reply { text: "{}".to_string(), prompt_tokens: 3, output_tokens: 2 }));
         let refusal = json!({ "choices": [ { "finish_reason": "stop", "message": { "content": null, "refusal": "no" } } ] });
-        assert_eq!(parse_openai_reply(&refusal), Err(ReplyError::Empty));
+        assert_eq!(parse_openai_reply(&refusal), Err(ReplyError::Blocked));
     }
 
     #[test]

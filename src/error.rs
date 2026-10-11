@@ -12,6 +12,7 @@ pub enum AppError {
     InternalError(String),
     RateLimitExceeded,
     Truncated,
+    ContentBlocked,
 }
 
 impl AppError {
@@ -26,6 +27,7 @@ impl AppError {
             AppError::InternalError(_) => (500, "internal_error", "An internal error occurred. Please try again later.".to_string(), "internal_error"),
             AppError::RateLimitExceeded => (429, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.".to_string(), "rate_limit_exceeded"),
             AppError::Truncated => (422, "generation_error", "The reply was cut off before it finished. Nothing was charged. Try again.".to_string(), "truncated"),
+            AppError::ContentBlocked => (422, "generation_error", "The provider declined to process this text. Nothing was charged.".to_string(), "content_blocked"),
         };
 
         let error_response = ErrorResponse {
@@ -73,6 +75,9 @@ impl From<worker::Error> for AppError {
         if error_str.starts_with("AppError::Truncated::") {
             return AppError::Truncated;
         }
+        if error_str.starts_with("AppError::ContentBlocked::") {
+            return AppError::ContentBlocked;
+        }
         if let Some(msg) = error_str.strip_prefix("AppError::InternalError::") {
             return AppError::InternalError(msg.to_string());
         }
@@ -93,6 +98,7 @@ impl From<AppError> for worker::Error {
             AppError::InternalError(msg) => format!("AppError::InternalError::{}", msg),
             AppError::RateLimitExceeded => "AppError::RateLimitExceeded::".to_string(),
             AppError::Truncated => "AppError::Truncated::".to_string(),
+            AppError::ContentBlocked => "AppError::ContentBlocked::".to_string(),
         };
         worker::Error::RustError(encoded)
     }
