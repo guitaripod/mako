@@ -71,7 +71,8 @@ impl OpenAIProvider {
         let mut response = Fetch::Request(request).send().await?;
 
         if response.status_code() >= 400 {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let status = response.status_code();
+            let error_text = response.text().await.unwrap_or_default();
             
             if error_text.contains("content_policy_violation") {
                 return Err(AppError::BadRequest(
@@ -79,7 +80,10 @@ impl OpenAIProvider {
                 ).into());
             }
             
-            return Err(AppError::InternalError(format!("OpenAI API error: {}", error_text)).into());
+            return Err(AppError::InternalError(format!(
+                "OpenAI API error: {}",
+                crate::redact::provider_error_summary(status, &error_text)
+            )).into());
         }
 
         let openai_response: ImageResponse = response.json().await
@@ -236,7 +240,8 @@ impl ImageProvider for OpenAIProvider {
         let mut response = Fetch::Request(worker_request).send().await?;
 
         if response.status_code() >= 400 {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let status = response.status_code();
+            let error_text = response.text().await.unwrap_or_default();
             
             if error_text.contains("content_policy_violation") {
                 return Err(AppError::BadRequest(
@@ -244,7 +249,10 @@ impl ImageProvider for OpenAIProvider {
                 ).into());
             }
             
-            return Err(AppError::InternalError(format!("OpenAI API error: {}", error_text)).into());
+            return Err(AppError::InternalError(format!(
+                "OpenAI API error: {}",
+                crate::redact::provider_error_summary(status, &error_text)
+            )).into());
         }
 
         let openai_response: ImageResponse = response.json().await

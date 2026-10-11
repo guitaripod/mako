@@ -1175,7 +1175,7 @@ async fn validate_with_revenuecat(
     }
     if status_code < 200 || status_code >= 300 {
         let error_text = response.text().await.unwrap_or_default();
-        worker::console_log!("RevenueCat API error: {} - {}", status_code, error_text);
+        worker::console_log!("RevenueCat API error: {}", crate::redact::provider_error_summary(status_code, &error_text));
         return Err(format!("RevenueCat API error: {}", status_code).into());
     }
 

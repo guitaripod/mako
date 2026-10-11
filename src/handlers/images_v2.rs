@@ -4,6 +4,7 @@ use crate::error::AppError;
 use crate::auth;
 use crate::storage::store_image_from_bytes;
 use crate::credits::{check_and_reserve_credits, deduct_credits, get_flat_capability_cost, get_user_balance, record_paywall_event};
+use crate::tenant::TenantPolicy;
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 use crate::providers::{self, UnifiedImageRequest, UnifiedEditRequest};
 use crate::{log_debug, log_error};
@@ -40,6 +41,10 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
     }
     
     let db = env.d1("DB")?;
+    let policy = match TenantPolicy::load(&db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.to_response(),
+    };
 
     if let Err(_) = check_and_acquire_lock(&app_id, &user_id, &db).await {
         return Ok(Response::error("Another request is already in progress", 429)?);
@@ -97,7 +102,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
                 request_type: "generation",
                 provider: provider.get_name(),
                 model: &generation_req.model,
-                prompt: &generation_req.prompt,
+                prompt: policy.prompt_for_storage(&generation_req.prompt),
                 size: &generation_req.size,
                 quality: &generation_req.quality,
                 image_count: generation_req.n,
@@ -115,6 +120,12 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
     
     for (i, image_bytes) in provider_response.images.iter().enumerate() {
         let _base64_string = BASE64.encode(&image_bytes.data);
+
+        if !policy.store_images {
+            image_data_list.push(returned_image(&image_bytes.data, &provider_response.revised_prompts, i, &policy));
+            images_stored += 1;
+            continue;
+        }
         
         match store_image_from_bytes(
             &env,
@@ -144,7 +155,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
                         app_id.clone().into(),
                         stored_image.user_id.clone().into(),
                         stored_image.r2_key.clone().into(),
-                        stored_image.prompt.clone().into(),
+                        policy.prompt_for_storage(&stored_image.prompt).into(),
                         provider.get_name().into(),
                         stored_image.model.clone().into(),
                         stored_image.size.clone().into(),
@@ -175,8 +186,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
             Err(e) => {
                 log_error!("Failed to store image in R2", json!({
                     "error": e.to_string(),
-                    "user_id": &user_id,
-                    "prompt": &generation_req.prompt
+                    "user_id": &user_id
                 }));
             }
         }
@@ -211,7 +221,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         user_id: user_id.clone(),
         request_type: "generation".to_string(),
         model: generation_req.model.clone(),
-        prompt: generation_req.prompt.clone(),
+        prompt: policy.prompt_for_storage(&generation_req.prompt).to_string(),
         image_size: generation_req.size.clone(),
         image_quality: generation_req.quality.clone(),
         image_count: generation_req.n,
@@ -307,6 +317,10 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     }
     
     let db = env.d1("DB")?;
+    let policy = match TenantPolicy::load(&db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.to_response(),
+    };
 
     if let Err(_) = check_and_acquire_lock(&app_id, &user_id, &db).await {
         return Ok(Response::error("Another request is already in progress", 429)?);
@@ -368,7 +382,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
                 request_type: "edit",
                 provider: provider.get_name(),
                 model: &edit_req.model,
-                prompt: &edit_req.prompt,
+                prompt: policy.prompt_for_storage(&edit_req.prompt),
                 size: &edit_req.size,
                 quality: &edit_req.quality,
                 image_count: edit_req.n,
@@ -385,6 +399,12 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     let mut images_stored = 0;
     
     for (i, image_bytes) in provider_response.images.iter().enumerate() {
+        if !policy.store_images {
+            image_data_list.push(returned_image(&image_bytes.data, &provider_response.revised_prompts, i, &policy));
+            images_stored += 1;
+            continue;
+        }
+
         match store_image_from_bytes(
             &env,
             &user_id,
@@ -413,7 +433,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
                         app_id.clone().into(),
                         stored_image.user_id.clone().into(),
                         stored_image.r2_key.clone().into(),
-                        stored_image.prompt.clone().into(),
+                        policy.prompt_for_storage(&stored_image.prompt).into(),
                         provider.get_name().into(),
                         stored_image.model.clone().into(),
                         stored_image.size.clone().into(),
@@ -444,8 +464,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
             Err(e) => {
                 log_error!("Failed to store image in R2", json!({
                     "error": e.to_string(),
-                    "user_id": &user_id,
-                    "prompt": &edit_req.prompt
+                    "user_id": &user_id
                 }));
             }
         }
@@ -480,7 +499,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         user_id: user_id.clone(),
         request_type: "edit".to_string(),
         model: edit_req.model.clone(),
-        prompt: edit_req.prompt.clone(),
+        prompt: policy.prompt_for_storage(&edit_req.prompt).to_string(),
         image_size: edit_req.size.clone(),
         image_quality: edit_req.quality.clone(),
         image_count: edit_req.n,
@@ -546,6 +565,22 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     };
     
     Response::from_json(&response)
+}
+
+/// An image handed straight back to the client as base64 because the tenant keeps no
+/// images. The provider's revised prompt echoes the user's text, so it is only returned
+/// to tenants that keep prompts.
+fn returned_image(bytes: &[u8], revised_prompts: &[Option<String>], index: usize, policy: &TenantPolicy) -> ImageData {
+    let revised_prompt = if policy.store_prompts {
+        revised_prompts.get(index).and_then(|p| p.clone())
+    } else {
+        None
+    };
+    ImageData {
+        b64_json: Some(BASE64.encode(bytes)),
+        url: None,
+        revised_prompt,
+    }
 }
 
 /// A 402 from the credit check is a paywall hit; it is logged before answering so the

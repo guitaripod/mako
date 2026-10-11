@@ -165,8 +165,12 @@ impl GeminiProvider {
         let mut response = Fetch::Request(request).send().await?;
 
         if response.status_code() >= 400 {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(AppError::InternalError(format!("Gemini API error: {}", error_text)).into());
+            let status = response.status_code();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(AppError::InternalError(format!(
+                "Gemini API error: {}",
+                crate::redact::provider_error_summary(status, &error_text)
+            )).into());
         }
 
         let gemini_response: GeminiResponse = response.json().await

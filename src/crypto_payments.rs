@@ -169,7 +169,7 @@ pub async fn get_payment_status(env: &Env, payment_id: &str) -> Result<String> {
     
     if response.status_code() < 200 || response.status_code() >= 300 {
         let error_text = response.text().await?;
-        worker::console_log!("NOWPayments API error: {} - {}", response.status_code(), error_text);
+        worker::console_log!("NOWPayments API error: {}", crate::redact::provider_error_summary(response.status_code(), &error_text));
         return Err(AppError::BadRequest(format!("Failed to get payment status: {}", error_text)).into());
     }
     

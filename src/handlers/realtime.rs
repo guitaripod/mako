@@ -406,8 +406,9 @@ async fn mint_ephemeral(
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {
+        let status = resp.status_code();
         let detail = resp.text().await.unwrap_or_default();
-        console_log!("realtime mint error {}: {}", resp.status_code(), detail);
+        console_log!("realtime mint error {}", crate::redact::provider_error_summary(status, &detail));
         return Err(AppError::InternalError("Realtime mint failed".to_string()));
     }
 

@@ -271,7 +271,7 @@ impl DeviceCheckConfig {
             saw_http_response = true;
             last_status = status;
             let detail = resp.text().await.unwrap_or_default();
-            console_log!("DeviceCheck non-2xx on {}: {} {}", base, status, detail);
+            console_log!("DeviceCheck non-2xx on {}: {}", base, crate::redact::provider_error_summary(status, &detail));
         }
 
         if !saw_http_response {

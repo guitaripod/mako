@@ -14,6 +14,8 @@ mod rate_limit;
 mod logger;
 mod providers;
 mod privacy;
+mod redact;
+mod tenant;
 
 use handlers::{images, gallery, r2, usage, oauth, oauth_apple, oauth_apple_callback, oauth_native, device_auth, identity};
 

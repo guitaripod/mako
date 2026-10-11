@@ -283,8 +283,9 @@ async fn gemini_generate(
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {
+        let status = resp.status_code();
         let detail = resp.text().await.unwrap_or_default();
-        console_log!("Gemini chat error {}: {}", resp.status_code(), detail);
+        console_log!("Gemini chat error {}", crate::redact::provider_error_summary(status, &detail));
         return Err(AppError::InternalError("AI provider error".to_string()));
     }
 
@@ -380,8 +381,9 @@ async fn openai_generate(
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {
+        let status = resp.status_code();
         let detail = resp.text().await.unwrap_or_default();
-        console_log!("OpenAI chat error {}: {}", resp.status_code(), detail);
+        console_log!("OpenAI chat error {}", crate::redact::provider_error_summary(status, &detail));
         return Err(AppError::InternalError("AI provider error".to_string()));
     }
 
@@ -474,7 +476,7 @@ async fn anthropic_generate(
     if resp.status_code() >= 400 {
         let status = resp.status_code();
         let detail = resp.text().await.unwrap_or_default();
-        console_log!("Anthropic chat error {}: {}", status, detail);
+        console_log!("Anthropic chat error {}", crate::redact::provider_error_summary(status, &detail));
         // 429 (rate_limit) / 529 (overloaded) are transient — surface as a rate
         // limit so clients back off rather than treating it as a hard failure.
         if status == 429 || status == 529 {
