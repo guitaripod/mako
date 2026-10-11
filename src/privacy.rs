@@ -115,7 +115,7 @@ fn ad_measurement_section(app: &str, name: &str) -> String {
 }
 
 fn contact_link(app: &str) -> &'static str {
-    if app == "payday" || app == "psywave" {
+    if app == "payday" || app == "psywave" || app == "dreameater" {
         r#"<a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>"#
     } else if app == "livingdex" {
         r#"<a href="mailto:guitaripod@gmail.com">guitaripod@gmail.com</a> (or <a href="https://x.com/prblemslver">@prblemslver</a> on X)"#
@@ -251,7 +251,7 @@ fn render_dreameater() -> String {
 <p><em>Last updated: {updated}</em></p>
 <p>{name} is a private dream journal. This policy explains what stays on your device, what leaves it, who handles it and how to delete it.</p>
 <h2>What stays on your device</h2>
-<p>Your dreams, voice recordings, transcripts, journal, tags, birth details and the sky data worked out from them are stored on your device (and in your own iCloud if you turn sync on) and are not uploaded to us.</p>
+<p>Your dreams, voice recordings, transcripts, journal, tags, birth details and the sky data worked out from them are stored on your device and are not uploaded to us.</p>
 <h2>Readings</h2>
 <p>Only when you ask for a reading, {ai_reading}. Our server keeps no dream text, prompt or reading afterwards: it passes the request on, returns the answer to your device and forgets it. You can withdraw your permission for readings at any time in Settings, then Privacy, and everything else keeps working.</p>
 <h2>Art</h2>
@@ -269,7 +269,7 @@ fn render_dreameater() -> String {
 <ul>
 {providers}
 </ul>
-<p>Google handles the text sent for a reading or for art under its own terms and privacy policy. We do not use your dreams to train AI models, and nothing is sold or shared for advertising.</p>
+<p>Google handles the text sent for a reading or for art under its own terms and privacy policy. Under its terms for the paid Gemini API, Google does not use those prompts and responses to improve its products, and it keeps a log of them for a limited time solely to detect abuse. We do not use your dreams to train AI models, and nothing is sold or shared for advertising.</p>
 {ad_measurement}
 <h2>Deleting your data</h2>
 <p>In the app, open Settings, then Privacy, then Delete all data. This removes the dreams and everything else stored on your device, and deletes your server identity, credit ledger and weekly counters. It cannot be undone, and it does not cancel a subscription: manage or cancel that in iOS Settings under your Apple Account, then Subscriptions. Purchase records held by Apple and RevenueCat are kept under their own policies.</p>
@@ -1252,8 +1252,10 @@ mod tests {
         assert!(html.contains("Apple Ads attribution verdict"));
         assert!(html.contains("Settings, then Privacy, then Delete all data"));
         assert!(html.contains("not directed at children under 13"));
-        assert!(html.contains("@prblemslver"));
+        assert!(html.contains("support@midgarcorp.cc"));
         assert!(html.contains("show advertising inside the app"));
+        assert!(!html.contains("iCloud"));
+        assert!(html.contains("keeps a log of them for a limited time solely to detect abuse"));
     }
 
     #[test]
