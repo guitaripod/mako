@@ -372,6 +372,19 @@ pub fn rejects_temperature(model: &str) -> bool {
     m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
 }
 
+/// Thinking tokens count toward `maxOutputTokens`, so a structured reply on a thinking model must keep the reasoning short or
+/// the answer is cut off before the JSON ends. Gemini 3 takes a level, the 2.5 Flash models take a budget of zero.
+pub fn gemini_thinking_config(model: &str) -> Option<Value> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("gemini-3") {
+        Some(json!({ "thinkingLevel": "low" }))
+    } else if m.starts_with("gemini-2.5-flash") {
+        Some(json!({ "thinkingBudget": 0 }))
+    } else {
+        None
+    }
+}
+
 pub fn build_gemini_body(cfg: &AliasConfig, system: &str, turns: &[Turn]) -> Value {
     let contents: Vec<Value> = turns
         .iter()
@@ -387,6 +400,9 @@ pub fn build_gemini_body(cfg: &AliasConfig, system: &str, turns: &[Turn]) -> Val
     }
     if let Some(t) = cfg.temperature {
         generation.insert("temperature".to_string(), json!(t));
+    }
+    if let Some(thinking) = gemini_thinking_config(&cfg.model) {
+        generation.insert("thinkingConfig".to_string(), thinking);
     }
     let mut body = json!({
         "systemInstruction": { "parts": [ { "text": system } ] },
@@ -812,11 +828,26 @@ mod tests {
     #[test]
     fn gemini_without_a_schema_asks_for_no_json_mode() {
         let mut plain = cfg();
+        plain.model = "gemini-1.5-flash".to_string();
         plain.response_schema = None;
         plain.max_tokens = None;
         plain.temperature = None;
         let b = build_gemini_body(&plain, "SYS", &compose_turns(&[], "hi"));
         assert!(b.get("generationConfig").is_none());
+    }
+
+    #[test]
+    fn gemini_three_keeps_thinking_short_so_the_json_is_not_cut_off() {
+        let b = build_gemini_body(&cfg(), "SYS", &compose_turns(&[], "hi"));
+        assert_eq!(b["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
+        assert_eq!(gemini_thinking_config("gemini-3.8-flash"), Some(json!({ "thinkingLevel": "low" })));
+    }
+
+    #[test]
+    fn gemini_two_point_five_flash_turns_thinking_off_and_other_models_are_left_alone() {
+        assert_eq!(gemini_thinking_config("gemini-2.5-flash"), Some(json!({ "thinkingBudget": 0 })));
+        assert_eq!(gemini_thinking_config("gemini-2.5-pro"), None);
+        assert_eq!(gemini_thinking_config("gemini-1.5-flash"), None);
     }
 
     #[test]
