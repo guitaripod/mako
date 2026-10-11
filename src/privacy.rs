@@ -8,6 +8,16 @@ pub fn privacy_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response>
     })
 }
 
+const DREAM_EATER_AI: &str = "the dream text, the options you chose for it and short summaries of earlier dreams you had read are sent to Dream Eater's server, which passes them to Google's Gemini model to write the reading";
+
+/// Every outside service Dream Eater's pages may name: (name, what it does).
+const DREAM_EATER_PROVIDERS: [(&str, &str); 4] = [
+    ("Google (Gemini)", "writes readings and paints art from the text described above"),
+    ("RevenueCat", "processes purchases and tells our server whether you have the subscription"),
+    ("Apple", "StoreKit for purchases, and Apple Ads attribution that tells us which ad campaign an install came from"),
+    ("Cloudflare", "hosts our server"),
+];
+
 struct AppPrivacy {
     name: &'static str,
     ai: &'static str,
@@ -25,8 +35,8 @@ fn config(app: &str) -> AppPrivacy {
         },
         "dreameater" => AppPrivacy {
             name: "Dream Eater",
-            ai: "the dream you write is sent to Google Gemini to generate an interpretation, and an illustrative image is generated from it",
-            uses_location: true,
+            ai: DREAM_EATER_AI,
+            uses_location: false,
             voice_consent: false,
         },
         "doublekick" => AppPrivacy {
@@ -125,7 +135,7 @@ fn on_device_content(app: &str) -> &'static str {
 fn last_updated(app: &str) -> &'static str {
     match app {
         "psywave" => "September 2026",
-        "livingdex" | "inventory" => "October 2026",
+        "livingdex" | "inventory" | "dreameater" => "October 2026",
         _ => "June 2026",
     }
 }
@@ -151,6 +161,9 @@ fn render(app: &str) -> String {
     }
     if app == "inventory" {
         return render_inventory();
+    }
+    if app == "dreameater" {
+        return render_dreameater();
     }
     let c = config(app);
     let location = if c.uses_location {
@@ -220,6 +233,67 @@ fn render(app: &str) -> String {
         deletion = deletion,
         contact = contact,
     )
+}
+
+/// Dream Eater's privacy policy. Each statement matches what the app and the
+/// `dreameater` tenant do: the server keeps no dream text, prompt, reading or
+/// image, only an anonymous identity, the credit ledger, weekly counters and the
+/// ad attribution verdict, and deletion removes all of that.
+fn render_dreameater() -> String {
+    let c = config("dreameater");
+    let providers: String = DREAM_EATER_PROVIDERS
+        .iter()
+        .map(|(name, role)| format!("<li><strong>{}</strong>: {}.</li>", name, role))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        r#"<h1>{name} Privacy Policy</h1>
+<p><em>Last updated: {updated}</em></p>
+<p>{name} is a private dream journal. This policy explains what stays on your device, what leaves it, who handles it and how to delete it.</p>
+<h2>What stays on your device</h2>
+<p>Your dreams, voice recordings, transcripts, journal, tags, birth details and the sky data worked out from them are stored on your device (and in your own iCloud if you turn sync on) and are not uploaded to us.</p>
+<h2>Readings</h2>
+<p>Only when you ask for a reading, {ai_reading}. Our server keeps no dream text, prompt or reading afterwards: it passes the request on, returns the answer to your device and forgets it. You can withdraw your permission for readings at any time in Settings, then Privacy, and everything else keeps working.</p>
+<h2>Art</h2>
+<p>Art is made from a short scene summary, not from your dream text. The summary goes through our server to Google's image model, and the image is returned to your device and is not stored on our server.</p>
+<h2>What our server keeps</h2>
+<ul>
+<li>An anonymous identifier and key for your device. There is no name and no email address.</li>
+<li>Your credit balance and the ledger of credits granted, used and bought.</li>
+<li>Counters for your weekly free readings.</li>
+<li>The Apple Ads attribution verdict, if you installed the app after tapping one of our ads (see Advertising measurement below).</li>
+</ul>
+<h2>Purchases</h2>
+<p>Credit packs and the optional subscription are sold through Apple In-App Purchase and processed with RevenueCat. We receive purchase records (which product and a transaction identifier) to credit your balance or unlock the subscription. We never receive your payment-card details.</p>
+<h2>Who handles data</h2>
+<ul>
+{providers}
+</ul>
+<p>Google handles the text sent for a reading or for art under its own terms and privacy policy. We do not use your dreams to train AI models, and nothing is sold or shared for advertising.</p>
+{ad_measurement}
+<h2>Deleting your data</h2>
+<p>In the app, open Settings, then Privacy, then Delete all data. This removes the dreams and everything else stored on your device, and deletes your server identity, credit ledger and weekly counters. It cannot be undone, and it does not cancel a subscription: manage or cancel that in iOS Settings under your Apple Account, then Subscriptions. Purchase records held by Apple and RevenueCat are kept under their own policies.</p>
+<h2>Children</h2>
+<p>{name} is not directed at children under 13, and we do not knowingly collect data from them.</p>
+<h2>What we don't do</h2>
+<p>We do not sell your data, show advertising inside the app, or use third-party tracking or advertising identifiers.</p>
+<h2>Contact</h2>
+<p>For any questions, contact {contact}.</p>"#,
+        name = c.name,
+        updated = last_updated("dreameater"),
+        ai_reading = c.ai,
+        providers = providers,
+        ad_measurement = ad_measurement_section("dreameater", c.name),
+        contact = contact_link("dreameater"),
+    );
+    without_em_dashes(&page(c.name, "Privacy Policy", &body))
+}
+
+/// Dream Eater's pages are written without em dashes, including the shared
+/// advertising paragraph and the page title they are wrapped in.
+fn without_em_dashes(html: &str) -> String {
+    html.replace("<title>Dream Eater \u{2014} Privacy Policy", "<title>Dream Eater Privacy Policy")
+        .replace(" \u{2014} ", ", ")
 }
 
 /// Living Dex's privacy policy. Every statement here is tied to what the app and
@@ -1157,6 +1231,55 @@ mod tests {
         assert!(privacy.contains("third-party tracking or advertising identifiers"));
         assert!(!privacy.contains("AI processing"));
         assert!(!privacy.contains("anonymous, device-based identity"));
+    }
+
+    #[test]
+    fn dream_eater_policy_states_what_is_true_after_the_privacy_release() {
+        let html = render("dreameater");
+        assert!(html.contains("Dream Eater Privacy Policy"));
+        assert!(html.contains("October 2026"));
+        for stays in ["dreams", "voice recordings", "transcripts", "journal", "tags", "birth details", "sky data"] {
+            assert!(html.contains(stays), "missing {}", stays);
+        }
+        assert!(html.contains("short summaries of earlier dreams you had read"));
+        assert!(html.contains("Our server keeps no dream text, prompt or reading afterwards"));
+        assert!(html.contains("Art is made from a short scene summary"));
+        assert!(html.contains("is not stored on our server"));
+        assert!(html.contains("anonymous identifier and key"));
+        assert!(html.contains("no name and no email address"));
+        assert!(html.contains("credit balance"));
+        assert!(html.contains("weekly free readings"));
+        assert!(html.contains("Apple Ads attribution verdict"));
+        assert!(html.contains("Settings, then Privacy, then Delete all data"));
+        assert!(html.contains("not directed at children under 13"));
+        assert!(html.contains("@prblemslver"));
+        assert!(html.contains("show advertising inside the app"));
+    }
+
+    #[test]
+    fn dream_eater_policy_lists_every_provider() {
+        let html = render("dreameater");
+        for provider in ["Google (Gemini)", "RevenueCat", "Apple", "Cloudflare"] {
+            assert!(html.contains(provider), "missing {}", provider);
+        }
+        assert!(!html.contains("sent to Google Gemini to generate an interpretation"));
+        assert!(!html.contains("approximate location"));
+        assert!(!html.contains("Sign in with Apple"));
+    }
+
+    #[test]
+    fn dream_eater_policy_has_no_em_dashes() {
+        assert!(!render("dreameater").contains('\u{2014}'));
+        assert!(!DREAM_EATER_AI.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn other_tenants_keep_their_pages() {
+        assert!(render("pixie").contains("<title>PixiePocket \u{2014} Privacy Policy</title>"));
+        assert!(render("pixie").contains("sent to OpenAI and Google to generate or edit images"));
+        assert!(render("doublekick").contains("Google Gemini to read and translate the items"));
+        assert!(!render("livingdex").contains("Delete all data"));
+        assert!(!render("payday").contains("Delete all data"));
     }
 
     #[test]
