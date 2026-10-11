@@ -499,11 +499,36 @@ async fn relink_anonymous_to_apple(
     Ok(())
 }
 
-/// Delete the authenticated user's account (App Store 5.1.1(v)): removes the
-/// user row, every per-user credit record, the user's ad-attribution rows, and
-/// all of the user's generated images (R2 objects + rows + reports) so nothing of
-/// theirs lingers in the public gallery feed. Scoped to the api-key's own
-/// user_id, so a caller can only ever delete their own account.
+/// Every table with a `user_id` column that account deletion empties with
+/// `DELETE ... WHERE user_id = ?`, in the order it runs. `stored_images` is not
+/// listed because `purge_user_images` removes it together with its R2 objects and
+/// reports; the `users` row goes last. Children come first because
+/// `usage_records`, `device_auth_flows`, `credit_transactions` and
+/// `credit_purchases` hold a foreign key to `users(id)`, which D1 enforces: deleting
+/// the user while any of them still has a row makes the whole deletion fail. The
+/// test `every_user_table_is_deleted_with_the_account` derives the tables with a
+/// `user_id` column from the migrations and fails when one is missing here.
+const USER_DATA_TABLES: &[&str] = &[
+    "usage_records",
+    "paywall_events",
+    "device_auth_flows",
+    "credit_transactions",
+    "credit_purchases",
+    "credit_refunds",
+    "user_credits",
+    "user_locks",
+    "realtime_sessions",
+    "shared_playlists",
+    "install_attributions",
+    "purchase_attributions",
+];
+
+/// Delete the authenticated user's account (App Store 5.1.1(v)): removes every
+/// table in `USER_DATA_TABLES` (prompts and usage history, paywall events, credit
+/// records, ad attribution, weekly counters), all of the user's generated images
+/// (R2 objects + rows + reports) so nothing of theirs lingers in the public gallery
+/// feed, and finally the user row. Scoped to the api-key's own user_id, so a
+/// caller can only ever delete their own account.
 pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
     let auth = match authenticate(&req, &db).await {
@@ -514,14 +539,7 @@ pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Resp
 
     purge_user_images(&ctx.env, &db, &uid).await?;
 
-    for table in [
-        "credit_transactions",
-        "credit_purchases",
-        "user_credits",
-        "user_locks",
-        "install_attributions",
-        "purchase_attributions",
-    ] {
+    for table in USER_DATA_TABLES {
         db.prepare(&format!("DELETE FROM {} WHERE user_id = ?", table))
             .bind(&[uid.clone().into()])?
             .run()
@@ -640,4 +658,161 @@ async fn drain_wallet(db: &D1Database, app_id: &str, user_id: &str) -> std::resu
         }
     }
     Err(AppError::InternalError("drain_wallet: too much contention".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USER_DATA_TABLES;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const IMAGE_TABLE: &str = "stored_images";
+
+    fn migration_sql() -> String {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .map(|n| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations").join(n)).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn strip_comments(sql: &str) -> String {
+        sql.lines()
+            .map(|l| l.split("--").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn top_level_items(body: &str) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut depth = 0;
+        let mut current = String::new();
+        for c in body.chars() {
+            match c {
+                '(' => { depth += 1; current.push(c); }
+                ')' => { depth -= 1; current.push(c); }
+                ',' if depth == 0 => { items.push(std::mem::take(&mut current)); }
+                _ => current.push(c),
+            }
+        }
+        items.push(current);
+        items
+    }
+
+    fn name_after(words: &[&str], skip: &[&str]) -> String {
+        words
+            .iter()
+            .skip_while(|w| skip.contains(&w.to_ascii_uppercase().as_str()))
+            .next()
+            .unwrap()
+            .trim_matches(|c| c == '"' || c == '`')
+            .to_string()
+    }
+
+    struct Schema {
+        columns: BTreeMap<String, BTreeSet<String>>,
+        references_users: BTreeSet<String>,
+    }
+
+    fn replay_migrations() -> Schema {
+        let sql = strip_comments(&migration_sql());
+        let mut columns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut references_users = BTreeSet::new();
+        for statement in sql.split(';') {
+            let text = statement.trim();
+            let words: Vec<&str> = text.split_whitespace().collect();
+            let upper = text.to_ascii_uppercase();
+            if upper.starts_with("CREATE TABLE") {
+                let rest: Vec<&str> = words[2..].to_vec();
+                let name = name_after(&rest, &["IF", "NOT", "EXISTS"]);
+                let name = name.split('(').next().unwrap().to_string();
+                let open = text.find('(').unwrap();
+                let close = text.rfind(')').unwrap();
+                let mut cols = BTreeSet::new();
+                for item in top_level_items(&text[open + 1..close]) {
+                    let first = item.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+                    if matches!(first.as_str(), "PRIMARY" | "FOREIGN" | "UNIQUE" | "CHECK" | "CONSTRAINT" | "") {
+                        continue;
+                    }
+                    cols.insert(item.split_whitespace().next().unwrap().to_ascii_lowercase());
+                }
+                if upper.contains("REFERENCES USERS") {
+                    references_users.insert(name.clone());
+                }
+                columns.insert(name, cols);
+            } else if upper.starts_with("DROP TABLE") {
+                let rest: Vec<&str> = words[2..].to_vec();
+                let name = name_after(&rest, &["IF", "EXISTS"]);
+                columns.remove(&name);
+                references_users.remove(&name);
+            } else if upper.starts_with("ALTER TABLE") {
+                let table = words[2].to_string();
+                if upper.contains(" RENAME TO ") {
+                    let target = words[words.len() - 1].to_string();
+                    if let Some(cols) = columns.remove(&table) {
+                        columns.insert(target.clone(), cols);
+                    }
+                    if references_users.remove(&table) {
+                        references_users.insert(target);
+                    }
+                } else if upper.contains(" ADD COLUMN ") {
+                    columns.entry(table).or_default().insert(words[5].to_ascii_lowercase());
+                }
+            }
+        }
+        Schema { columns, references_users }
+    }
+
+    fn covered_tables() -> BTreeSet<String> {
+        USER_DATA_TABLES.iter().map(|t| t.to_string()).chain([IMAGE_TABLE.to_string()]).collect()
+    }
+
+    #[test]
+    fn every_user_table_is_deleted_with_the_account() {
+        let schema = replay_migrations();
+        let covered = covered_tables();
+        let missing: Vec<_> = schema
+            .columns
+            .iter()
+            .filter(|(_, cols)| cols.contains("user_id"))
+            .map(|(name, _)| name.clone())
+            .filter(|name| !covered.contains(name))
+            .collect();
+        assert!(missing.is_empty(), "tables with a user_id column that account deletion skips: {:?}", missing);
+    }
+
+    #[test]
+    fn every_listed_table_exists_and_has_a_user_id_column() {
+        let schema = replay_migrations();
+        for table in USER_DATA_TABLES {
+            let cols = schema.columns.get(*table).unwrap_or_else(|| panic!("{} is not created by any migration", table));
+            assert!(cols.contains("user_id"), "{} has no user_id column", table);
+        }
+    }
+
+    #[test]
+    fn tables_with_a_foreign_key_to_users_are_deleted_before_the_user() {
+        let schema = replay_migrations();
+        let covered = covered_tables();
+        for table in &schema.references_users {
+            assert!(covered.contains(table), "{} references users(id) and would block the user delete", table);
+        }
+        assert!(!USER_DATA_TABLES.contains(&"users"));
+    }
+
+    #[test]
+    fn the_migration_replay_understands_the_rebuilds() {
+        let schema = replay_migrations();
+        assert!(schema.columns["user_credits"].contains("user_id"));
+        assert!(schema.columns["user_credits"].contains("app_id"));
+        assert!(schema.columns["users"].contains("api_key"));
+        assert!(!schema.columns.contains_key("user_credits_new"));
+        assert!(schema.columns["usage_records"].contains("capability"));
+    }
 }
