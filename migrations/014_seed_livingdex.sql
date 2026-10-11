@@ -45,7 +45,7 @@ VALUES
 INSERT OR REPLACE INTO credit_packs
   (app_id, pack_id, name, credits, bonus_credits, price_usd_cents, description, sort_order)
 VALUES
-  ('livingdex', 'starter', 'Starter',  100,  0,  299, '~30 cloud identifications',            0),
-  ('livingdex', 'regular', 'Regular',  400,  0,  999, 'A season of discovery (~130 IDs)',      1),
-  ('livingdex', 'propack', 'Explorer', 1200, 0, 2499, 'For the relentless collector (~400)',   2),
-  ('livingdex', 'science', 'Naturalist', 2600, 0, 4999, 'Identify everything (~860 IDs)',       3);
+  ('livingdex', 'starter', 'Starter',  100,  0,  299, '100 identifications',            0),
+  ('livingdex', 'regular', 'Regular',  400,  0,  999, '400 identifications, a season of discovery',      1),
+  ('livingdex', 'propack', 'Explorer', 1200, 0, 2499, '1,200 identifications for the relentless collector',   2),
+  ('livingdex', 'science', 'Naturalist', 2600, 0, 4999, '2,600 identifications: identify everything',       3);
