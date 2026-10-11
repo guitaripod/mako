@@ -14,6 +14,8 @@ mod rate_limit;
 mod logger;
 mod providers;
 mod privacy;
+mod chat_alias;
+mod mock;
 mod redact;
 mod tenant;
 

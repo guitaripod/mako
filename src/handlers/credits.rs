@@ -12,6 +12,8 @@ use serde_json::json;
 pub struct CreditBalanceResponse {
     pub balance: i32,
     pub currency: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly: Option<std::collections::BTreeMap<String, crate::handlers::chat_alias::WeeklyBalance>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,9 +87,12 @@ pub async fn get_balance(req: Request, ctx: RouteContext<()>) -> Result<Response
 
     let balance = get_user_balance(&auth.app_id, &auth.user_id, &db).await?;
 
+    let weekly = crate::handlers::chat_alias::weekly_balances(&db, &auth.app_id, &auth.user_id).await;
+
     Response::from_json(&CreditBalanceResponse {
         balance,
         currency: "credits".to_string(),
+        weekly,
     })
 }
 
@@ -1455,4 +1460,30 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
     }
     
     Response::ok("OK")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_balance_without_weekly_buckets_serializes_exactly_as_before() {
+        let response = CreditBalanceResponse { balance: 5, currency: "credits".to_string(), weekly: None };
+        assert_eq!(serde_json::to_string(&response).unwrap(), r#"{"balance":5,"currency":"credits"}"#);
+    }
+
+    #[test]
+    fn weekly_buckets_are_additive() {
+        let mut weekly = std::collections::BTreeMap::new();
+        weekly.insert(
+            "reading.v2".to_string(),
+            crate::handlers::chat_alias::WeeklyBalance { limit: 3, remaining: 2, resets_at: "2026-10-12T00:00:00Z".to_string() },
+        );
+        let response = CreditBalanceResponse { balance: 5, currency: "credits".to_string(), weekly: Some(weekly) };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["balance"], 5);
+        assert_eq!(value["currency"], "credits");
+        assert_eq!(value["weekly"]["reading.v2"]["limit"], 3);
+        assert_eq!(value["weekly"]["reading.v2"]["remaining"], 2);
+        assert_eq!(value["weekly"]["reading.v2"]["resets_at"], "2026-10-12T00:00:00Z");
+    }
 }

@@ -7,7 +7,7 @@ use crate::auth::authenticate;
 use crate::credits::{check_and_reserve_credits, deduct_credits, get_flat_capability_cost};
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 
-const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+pub(crate) const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_CHAT_MODEL: &str = "gemini-3-flash-preview";
 const CREDIT_MULTIPLIER: f64 = 3.0;
 const MIN_BALANCE_GUARD: u32 = 2;
@@ -38,14 +38,14 @@ fn model_prices(model: &str) -> (f64, f64) {
 
 /// Which upstream a chat model routes to. Selected purely by model id so a
 /// tenant (or request) can pick any model and hit the right provider + key.
-enum Provider {
+pub(crate) enum Provider {
     Gemini,
     OpenAI,
     Anthropic,
 }
 
 impl Provider {
-    fn for_model(model: &str) -> Provider {
+    pub(crate) fn for_model(model: &str) -> Provider {
         let m = model.to_ascii_lowercase();
         if m.starts_with("claude") || m.starts_with("anthropic") {
             Provider::Anthropic
@@ -58,7 +58,7 @@ impl Provider {
         }
     }
 
-    fn secret_name(&self) -> &'static str {
+    pub(crate) fn secret_name(&self) -> &'static str {
         match self {
             Provider::Gemini => "GEMINI_API_KEY",
             Provider::OpenAI => "OPENAI_API_KEY",
@@ -139,9 +139,16 @@ async fn chat_completion_inner(
     let auth = authenticate(&req, &db).await?;
     crate::rate_limit::enforce_write_rate_limit(&ctx.env, &auth.app_id, &auth.user_id, "chat.completion").await?;
 
-    let body: ChatRequest = req
-        .json()
+    let raw = req
+        .text()
         .await
+        .map_err(|_| AppError::BadRequest("Invalid request body".to_string()))?;
+    if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+        if crate::chat_alias::is_alias_request(&value) {
+            return crate::handlers::chat_alias::handle(&ctx.env, &db, &auth, &value).await;
+        }
+    }
+    let body: ChatRequest = serde_json::from_str(&raw)
         .map_err(|_| AppError::BadRequest("Invalid request body".to_string()))?;
     if body.messages.is_empty() {
         return Err(AppError::BadRequest("messages must not be empty".to_string()));
@@ -169,18 +176,24 @@ async fn chat_completion_inner(
     }
 
     let provider = Provider::for_model(&model);
+    let mocked = crate::mock::enabled(&ctx.env);
     let api_key = match ctx.env.secret(provider.secret_name()) {
         Ok(k) => k.to_string(),
+        Err(_) if mocked => String::new(),
         Err(_) => {
             let _ = release_lock(&auth.app_id, &auth.user_id, &db).await;
             return Err(AppError::InternalError(format!("{} not configured", provider.secret_name())));
         }
     };
 
-    let result = match provider {
+    let result = if mocked {
+        Ok(crate::mock::legacy_chat_reply())
+    } else {
+        match provider {
         Provider::Gemini => gemini_generate(&api_key, &model, &body).await,
         Provider::OpenAI => openai_generate(&api_key, &model, &body).await,
         Provider::Anthropic => anthropic_generate(&api_key, &model, &body).await,
+        }
     };
     let (content, prompt_tokens, output_tokens) = match result {
         Ok(v) => v,
@@ -326,7 +339,7 @@ async fn gemini_generate(
     Ok((text, prompt_tokens, output_tokens))
 }
 
-const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
+pub(crate) const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 /// True for OpenAI reasoning-class models, which take `reasoning_effort` and
 /// run faster when it's pinned to `minimal` for this latency-sensitive task.
@@ -418,8 +431,8 @@ async fn openai_generate(
     Ok((text, prompt_tokens, output_tokens))
 }
 
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
 /// Calls the Anthropic Messages API with the messages (joined into one user
@@ -525,4 +538,48 @@ async fn anthropic_generate(
         .unwrap_or(0);
 
     Ok((text, prompt_tokens, output_tokens))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_legacy_chat_body_still_parses_and_is_not_an_alias_request() {
+        let raw = r#"{"messages":[{"role":"system","content":"S"},{"role":"user","content":"dream"}],"response_json":true,"model":"gemini-3-flash-preview","unknown_field":1}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        assert!(!crate::chat_alias::is_alias_request(&value));
+        let parsed: ChatRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.messages.len(), 2);
+        assert!(parsed.response_json);
+        assert_eq!(parsed.model.as_deref(), Some("gemini-3-flash-preview"));
+    }
+
+    #[test]
+    fn a_legacy_body_with_a_null_alias_stays_on_the_legacy_path() {
+        let value: Value = serde_json::from_str(r#"{"messages":[{"role":"user","content":"x"}],"alias":null}"#).unwrap();
+        assert!(!crate::chat_alias::is_alias_request(&value));
+    }
+
+    #[test]
+    fn model_routing_is_unchanged() {
+        assert!(matches!(Provider::for_model("claude-haiku-4-5"), Provider::Anthropic));
+        assert!(matches!(Provider::for_model("gpt-5-mini"), Provider::OpenAI));
+        assert!(matches!(Provider::for_model("gemini-3-flash-preview"), Provider::Gemini));
+        assert_eq!(credits_from_tokens("gemini-3-flash-preview", 0, 0), 1);
+    }
+
+    #[test]
+    fn the_legacy_response_shape_has_no_alias_fields() {
+        let response = ChatResponse {
+            content: "x".into(),
+            model: "m".into(),
+            credits_charged: 1,
+            charge_reference: None,
+            usage: ChatUsage { prompt_tokens: 1, output_tokens: 2, total_tokens: 3 },
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        let keys: Vec<&str> = value.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, vec!["content", "credits_charged", "model", "usage"]);
+    }
 }

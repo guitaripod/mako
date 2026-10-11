@@ -521,6 +521,8 @@ const USER_DATA_TABLES: &[&str] = &[
     "shared_playlists",
     "install_attributions",
     "purchase_attributions",
+    "weekly_usage",
+    "chat_requests",
 ];
 
 /// Delete the authenticated user's account (App Store 5.1.1(v)): removes every

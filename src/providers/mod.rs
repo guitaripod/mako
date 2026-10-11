@@ -87,6 +87,9 @@ pub trait ImageProvider {
 }
 
 pub fn get_provider(model: &str, env: &worker::Env) -> Result<Box<dyn ImageProvider>> {
+    if crate::mock::enabled(env) {
+        return Ok(Box::new(crate::mock::MockImageProvider));
+    }
     if let Some(gemini_model) = gemini::GeminiImageModel::from_model_id(model) {
         return Ok(Box::new(gemini::GeminiProvider::new(env, gemini_model)?));
     }
