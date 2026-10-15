@@ -1,4 +1,4 @@
-use worker::{Request, Response, RouteContext, Result, console_log};
+use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
 use crate::auth::resolve_app_id;
 use crate::credits::initialize_user_credits;
@@ -151,7 +151,6 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     let mut token_resp = worker::Fetch::Request(token_req).send().await?;
     let token_body = token_resp.text().await?;
     
-    console_log!("GitHub token response: {}", token_body);
     
     let token_data: GitHubAccessTokenResponse = serde_json::from_str(&token_body)
         .map_err(|e| AppError::InternalError(format!("Failed to parse GitHub token response: {}", e)))?;
@@ -172,7 +171,6 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     let mut user_resp = worker::Fetch::Request(user_req).send().await?;
     let user_body = user_resp.text().await?;
     
-    console_log!("GitHub user response: {}", user_body);
     
     let mut github_user: GitHubUser = serde_json::from_str(&user_body)
         .map_err(|e| AppError::InternalError(format!("Failed to parse GitHub user response: {}", e)))?;
@@ -195,7 +193,6 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
         let mut emails_resp = worker::Fetch::Request(emails_req).send().await?;
         let emails_body = emails_resp.text().await?;
         
-        console_log!("GitHub emails response: {}", emails_body);
         
         let github_emails: Vec<GitHubEmail> = serde_json::from_str(&emails_body)
             .map_err(|e| AppError::InternalError(format!("Failed to parse GitHub emails response: {}", e)))?;
@@ -339,7 +336,6 @@ pub async fn google_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     let mut token_resp = worker::Fetch::Request(token_req).send().await?;
     let token_body = token_resp.text().await?;
     
-    console_log!("Google token response: {}", token_body);
     
     let token_data: GoogleAccessTokenResponse = serde_json::from_str(&token_body)
         .map_err(|e| AppError::InternalError(format!("Failed to parse Google token response: {}", e)))?;
@@ -359,7 +355,6 @@ pub async fn google_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     let mut user_resp = worker::Fetch::Request(user_req).send().await?;
     let user_body = user_resp.text().await?;
     
-    console_log!("Google user response: {}", user_body);
     
     let google_user: GoogleUser = serde_json::from_str(&user_body)
         .map_err(|e| AppError::InternalError(format!("Failed to parse Google user response: {}", e)))?;

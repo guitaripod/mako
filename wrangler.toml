@@ -8,6 +8,9 @@ routes = [
   { pattern = "psywave.midgarcorp.cc", custom_domain = true }
 ]
 
+[observability]
+enabled = true
+
 # Note: This file has multiple environments defined (production and development)
 # Use --env="" for production or --env="development" for development deployment
 

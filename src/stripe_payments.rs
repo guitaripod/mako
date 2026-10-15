@@ -294,10 +294,7 @@ pub fn verify_webhook_signature(env: &Env, signature: &str, body: &str, timestam
     
     let expected_signature = hex::encode(mac.finalize().into_bytes());
     
-    worker::console_log!("Expected signature: {}", expected_signature);
-    worker::console_log!("Received signature: {}", sig_value);
-    
-    Ok(sig_value == expected_signature)
+    Ok(crate::purchases::constant_time_eq(sig_value.as_bytes(), expected_signature.as_bytes()))
 }
 
 // Helper function to get Stripe price IDs for each pack from environment variables

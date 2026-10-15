@@ -201,8 +201,5 @@ pub fn verify_webhook_signature(env: &Env, signature: &str, body: &str) -> Resul
     
     let expected_signature = hex::encode(mac.finalize().into_bytes());
     
-    worker::console_log!("Expected signature: {}", expected_signature);
-    worker::console_log!("Received signature: {}", signature);
-    
-    Ok(signature == expected_signature)
+    Ok(crate::purchases::constant_time_eq(signature.as_bytes(), expected_signature.as_bytes()))
 }

@@ -1,4 +1,4 @@
-use worker::{Request, Response, RouteContext, Result, console_log};
+use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
 use crate::credits::initialize_user_credits;
 #[cfg(not(target_os = "windows"))]
@@ -132,8 +132,6 @@ pub async fn apple_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Res
     
     let mut token_resp = worker::Fetch::Request(token_req).send().await?;
     let token_response_text = token_resp.text().await?;
-    
-    console_log!("Apple token response: {}", token_response_text);
     
     let token_data: AppleTokenResponse = serde_json::from_str(&token_response_text)
         .map_err(|e| AppError::InternalError(format!("Failed to parse Apple token response: {}", e)))?;

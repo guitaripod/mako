@@ -1620,27 +1620,6 @@ paths:
           $ref: '#/components/responses/InternalServerError'
 
   # Webhook Endpoints
-  /v1/credits/webhook:
-    post:
-      operationId: creditWebhook
-      summary: Complete purchase webhook
-      description: Generic webhook endpoint for payment providers to notify of completed purchases
-      tags: [Webhooks]
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-      responses:
-        '200':
-          description: Webhook processed
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-
   /v1/credits/webhook/crypto:
     post:
       operationId: cryptoWebhook

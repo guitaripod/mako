@@ -42,11 +42,6 @@ pub struct PurchaseRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletePurchaseRequest {
-    pub purchase_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateStripeCheckoutRequest {
     pub pack_id: String,
     pub success_url: String,
@@ -289,20 +284,6 @@ pub async fn purchase_credits(mut req: Request, ctx: RouteContext<()>) -> Result
         },
         _ => AppError::BadRequest("Invalid payment provider".to_string()).to_response()
     }
-}
-
-pub async fn complete_purchase_webhook(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let env = ctx.env;
-    
-    let complete_req: CompletePurchaseRequest = match req.json().await {
-        Ok(req) => req,
-        Err(e) => return AppError::BadRequest(format!("Invalid request body: {}", e)).to_response(),
-    };
-    
-    let db = env.d1("DB")?;
-    complete_purchase(&complete_req.purchase_id, &db).await?;
-    
-    Response::ok("Purchase completed")
 }
 
 // Admin endpoints

@@ -1,4 +1,4 @@
-use worker::{Request, Response, RouteContext, Result, console_log};
+use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
 use crate::auth::resolve_app_id;
 use crate::credits::initialize_user_credits;
@@ -142,7 +142,6 @@ pub async fn start_device_flow(mut req: Request, ctx: RouteContext<()>) -> Resul
             let mut device_resp = worker::Fetch::Request(device_req).send().await?;
             let device_body = device_resp.text().await?;
             
-            console_log!("GitHub device response: {}", device_body);
             
             let github_response: GitHubDeviceCodeResponse = serde_json::from_str(&device_body)
                 .map_err(|e| AppError::InternalError(format!("Failed to parse GitHub device response: {}", e)))?;
@@ -206,7 +205,6 @@ pub async fn start_device_flow(mut req: Request, ctx: RouteContext<()>) -> Resul
             let mut device_resp = worker::Fetch::Request(device_req).send().await?;
             let device_body = device_resp.text().await?;
             
-            console_log!("Google device response: {}", device_body);
             
             let google_response: GoogleDeviceCodeResponse = serde_json::from_str(&device_body)
                 .map_err(|e| AppError::InternalError(format!("Failed to parse Google device response: {}", e)))?;
@@ -349,8 +347,6 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
             let mut token_resp = worker::Fetch::Request(token_req).send().await?;
             let token_body = token_resp.text().await?;
             
-            console_log!("GitHub token response: {}", token_body);
-            
             if let Ok(error_response) = serde_json::from_str::<GitHubErrorResponse>(&token_body) {
                 if error_response.error == "authorization_pending" {
                     return AppError::BadRequest("Authorization pending".to_string()).to_response();
@@ -384,7 +380,6 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
             let mut user_resp = worker::Fetch::Request(user_req).send().await?;
             let user_body = user_resp.text().await?;
             
-            console_log!("GitHub user response: {}", user_body);
             
             let github_user: GitHubUser = serde_json::from_str(&user_body)
                 .map_err(|e| AppError::InternalError(format!("Failed to parse GitHub user response: {}", e)))?;
@@ -466,8 +461,6 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
             let mut token_resp = worker::Fetch::Request(token_req).send().await?;
             let token_body = token_resp.text().await?;
             
-            console_log!("Google token response: {}", token_body);
-            
             if let Ok(error_response) = serde_json::from_str::<GoogleErrorResponse>(&token_body) {
                 match error_response.error.as_str() {
                     "authorization_pending" => return AppError::BadRequest("Authorization pending".to_string()).to_response(),
@@ -496,7 +489,6 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
             let mut user_resp = worker::Fetch::Request(user_req).send().await?;
             let user_body = user_resp.text().await?;
             
-            console_log!("Google user response: {}", user_body);
             
             let google_user: GoogleUser = serde_json::from_str(&user_body)
                 .map_err(|e| AppError::InternalError(format!("Failed to parse Google user response: {}", e)))?;
