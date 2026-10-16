@@ -1,3 +1,4 @@
+use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -5,6 +6,7 @@ use crate::purchases::constant_time_eq;
 
 pub const PLACEHOLDER_PREFIX: &str = "hashed:";
 pub const BACKFILL_BATCH: u32 = 500;
+pub const LAST_USED_REFRESH_HOURS: i64 = 1;
 
 /// SQL `LIKE` pattern that matches every placeholder, used to keep the
 /// backfill and the plaintext fallback away from rows that are already hashed.
@@ -80,6 +82,34 @@ pub fn plaintext_fallback(presented_key: &str, stored_plaintext: &str) -> Plaint
 /// plaintext lookup is skipped.
 pub fn skips_plaintext_lookup(presented_key: &str) -> bool {
     is_placeholder(presented_key)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupStep {
+    KeyTable,
+    LegacyHash,
+    LegacyPlaintext,
+}
+
+/// The order authentication tries to resolve a presented key: the per-device
+/// `api_keys` table, then the single legacy hash on `users`, then the legacy
+/// plaintext column with upgrade on use. A placeholder can only ever be a
+/// stored value, so it never reaches the plaintext step.
+pub fn lookup_steps(presented_key: &str) -> &'static [LookupStep] {
+    if skips_plaintext_lookup(presented_key) {
+        &[LookupStep::KeyTable, LookupStep::LegacyHash]
+    } else {
+        &[LookupStep::KeyTable, LookupStep::LegacyHash, LookupStep::LegacyPlaintext]
+    }
+}
+
+/// True when a key's `last_used_at` is missing, unreadable or older than the
+/// refresh interval, so at most one write per key and hour reaches D1.
+pub fn should_refresh_last_used(last_used_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    match last_used_at.and_then(|t| DateTime::parse_from_rfc3339(t).ok()) {
+        Some(previous) => now.signed_duration_since(previous.with_timezone(&Utc)) >= Duration::hours(LAST_USED_REFRESH_HOURS),
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +192,30 @@ mod tests {
         let prefix = PLACEHOLDER_LIKE.trim_end_matches('%');
         assert_eq!(prefix, PLACEHOLDER_PREFIX);
         assert!(placeholder_for("u").starts_with(prefix));
+    }
+
+    #[test]
+    fn lookup_tries_the_key_table_then_the_legacy_hash_then_plaintext() {
+        assert_eq!(
+            lookup_steps("pixie_abc"),
+            &[LookupStep::KeyTable, LookupStep::LegacyHash, LookupStep::LegacyPlaintext]
+        );
+    }
+
+    #[test]
+    fn a_placeholder_is_never_looked_up_as_plaintext() {
+        assert_eq!(lookup_steps("hashed:u-1"), &[LookupStep::KeyTable, LookupStep::LegacyHash]);
+    }
+
+    #[test]
+    fn last_used_is_refreshed_only_after_an_hour() {
+        let now = DateTime::parse_from_rfc3339("2026-10-16T12:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(should_refresh_last_used(None, now));
+        assert!(should_refresh_last_used(Some("not a time"), now));
+        assert!(should_refresh_last_used(Some("2026-10-16T10:59:59Z"), now));
+        assert!(should_refresh_last_used(Some("2026-10-16T11:00:00Z"), now));
+        assert!(!should_refresh_last_used(Some("2026-10-16T11:00:01Z"), now));
+        assert!(!should_refresh_last_used(Some("2026-10-16T12:00:00Z"), now));
+        assert!(!should_refresh_last_used(Some("2026-10-16T13:30:00+02:00"), now));
     }
 }

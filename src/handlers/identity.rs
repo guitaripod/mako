@@ -505,6 +505,7 @@ async fn relink_anonymous_to_apple(
 /// test `every_user_table_is_deleted_with_the_account` derives the tables with a
 /// `user_id` column from the migrations and fails when one is missing here.
 const USER_DATA_TABLES: &[&str] = &[
+    "api_keys",
     "usage_records",
     "paywall_events",
     "device_auth_flows",

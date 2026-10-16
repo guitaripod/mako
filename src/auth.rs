@@ -1,5 +1,5 @@
 use worker::{console_error, Request, D1Database};
-use crate::api_keys::{self, NewCredentials, PlaintextFallback};
+use crate::api_keys::{self, LookupStep, PlaintextFallback};
 use crate::error::AppError;
 
 pub fn validate_api_key(req: &Request) -> Result<String, AppError> {
@@ -47,8 +47,53 @@ fn authed_user_from(value: &serde_json::Value, app_id: String) -> AuthedUser {
     }
 }
 
-/// Looks the presented key up by its SHA-256, the path every hashed row takes.
-async fn find_by_hash(db: &D1Database, app_id: &str, api_key: &str) -> Result<Option<serde_json::Value>, AppError> {
+/// Looks the presented key up in the per-device `api_keys` table by its
+/// SHA-256 and refreshes `last_used_at` at most once an hour.
+async fn find_in_key_table(db: &D1Database, app_id: &str, api_key: &str) -> Result<Option<serde_json::Value>, AppError> {
+    let hash = api_keys::hash_api_key(api_key);
+    let row = db
+        .prepare(
+            "SELECT u.id, u.is_admin, u.preferred_model, k.key_hash, k.last_used_at
+             FROM api_keys k JOIN users u ON u.id = k.user_id AND u.app_id = k.app_id
+             WHERE k.app_id = ? AND k.key_hash = ?",
+        )
+        .bind(&[app_id.into(), hash.clone().into()])
+        .map_err(AppError::from)?
+        .first::<serde_json::Value>(None)
+        .await
+        .map_err(AppError::from)?
+        .filter(|r| stored_hash_matches(r, "key_hash", api_key));
+    if let Some(row) = &row {
+        let last_used = row.get("last_used_at").and_then(|v| v.as_str());
+        if api_keys::should_refresh_last_used(last_used, chrono::Utc::now()) {
+            touch_last_used(db, &hash).await;
+        }
+    }
+    Ok(row)
+}
+
+/// Records that a key was just used. A failure only costs the timestamp, so it
+/// is logged and never fails the request.
+async fn touch_last_used(db: &D1Database, key_hash: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let outcome = match db.prepare("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?").bind(&[now.into(), key_hash.into()]) {
+        Ok(statement) => statement.run().await.map(|_| ()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = outcome {
+        console_error!("api key last_used_at update failed: {:?}", e);
+    }
+}
+
+fn stored_hash_matches(row: &serde_json::Value, column: &str, api_key: &str) -> bool {
+    row.get(column)
+        .and_then(|v| v.as_str())
+        .map(|stored| api_keys::hash_matches(stored, api_key))
+        .unwrap_or(false)
+}
+
+/// Looks the presented key up by the single legacy hash on `users`.
+async fn find_by_legacy_hash(db: &D1Database, app_id: &str, api_key: &str) -> Result<Option<serde_json::Value>, AppError> {
     let hash = api_keys::hash_api_key(api_key);
     let row = db
         .prepare("SELECT id, is_admin, preferred_model, api_key_hash FROM users WHERE app_id = ? AND api_key_hash = ?")
@@ -57,21 +102,13 @@ async fn find_by_hash(db: &D1Database, app_id: &str, api_key: &str) -> Result<Op
         .first::<serde_json::Value>(None)
         .await
         .map_err(AppError::from)?;
-    Ok(row.filter(|r| {
-        r.get("api_key_hash")
-            .and_then(|v| v.as_str())
-            .map(|stored| api_keys::hash_matches(stored, api_key))
-            .unwrap_or(false)
-    }))
+    Ok(row.filter(|r| stored_hash_matches(r, "api_key_hash", api_key)))
 }
 
 /// Looks the presented key up in the legacy plaintext column and, on a match,
 /// writes its hash in the same request and replaces the plaintext with the
 /// placeholder. Placeholders never match.
 async fn find_by_plaintext_and_upgrade(db: &D1Database, app_id: &str, api_key: &str) -> Result<Option<serde_json::Value>, AppError> {
-    if api_keys::skips_plaintext_lookup(api_key) {
-        return Ok(None);
-    }
     let row = db
         .prepare(&format!(
             "SELECT id, is_admin, preferred_model, api_key FROM users WHERE app_id = ? AND api_key = ? AND api_key NOT LIKE '{}'",
@@ -111,33 +148,35 @@ pub async fn authenticate(req: &Request, db: &D1Database) -> Result<AuthedUser, 
     let api_key = validate_api_key(req)?;
     let app_id = resolve_app_id(req);
 
-    let row = match find_by_hash(db, &app_id, &api_key).await? {
-        Some(row) => Some(row),
-        None => find_by_plaintext_and_upgrade(db, &app_id, &api_key).await?,
-    };
+    let mut row = None;
+    for step in api_keys::lookup_steps(&api_key) {
+        row = match step {
+            LookupStep::KeyTable => find_in_key_table(db, &app_id, &api_key).await?,
+            LookupStep::LegacyHash => find_by_legacy_hash(db, &app_id, &api_key).await?,
+            LookupStep::LegacyPlaintext => find_by_plaintext_and_upgrade(db, &app_id, &api_key).await?,
+        };
+        if row.is_some() {
+            break;
+        }
+    }
 
     let value = row.ok_or_else(|| AppError::Unauthorized("Invalid API key".to_string()))?;
     Ok(authed_user_from(&value, app_id))
 }
 
-/// Issues a new key for an existing user and stores only its hash. The old key
-/// stops working. Used wherever a login has to hand a key back and the database
-/// no longer holds one.
+/// Issues an additional key for an existing user and stores only its hash in
+/// `api_keys`. Every other key of that user, on any device, keeps working. Used
+/// wherever a login has to hand a key back and the database holds no plaintext.
 pub async fn issue_api_key(db: &D1Database, app_id: &str, user_id: &str) -> Result<String, AppError> {
-    let creds = NewCredentials::generate(user_id);
+    let api_key = api_keys::generate_api_key();
     let now = chrono::Utc::now().to_rfc3339();
-    let result = db
-        .prepare("UPDATE users SET api_key = ?, api_key_hash = ?, updated_at = ? WHERE app_id = ? AND id = ?")
-        .bind(&[creds.placeholder.clone().into(), creds.api_key_hash.clone().into(), now.into(), app_id.into(), user_id.into()])
+    db.prepare("INSERT INTO api_keys (key_hash, user_id, app_id, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&[api_keys::hash_api_key(&api_key).into(), user_id.into(), app_id.into(), now.into()])
         .map_err(AppError::from)?
         .run()
         .await
         .map_err(AppError::from)?;
-    let changed = result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0;
-    if !changed {
-        return Err(AppError::InternalError("User vanished while issuing an API key".to_string()));
-    }
-    Ok(creds.api_key)
+    Ok(api_key)
 }
 
 /// Hashes up to `BACKFILL_BATCH` legacy plaintext keys and swaps each for the

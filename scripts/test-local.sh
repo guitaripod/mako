@@ -216,12 +216,31 @@ check "a new user stores the placeholder, not the key" "hashed:$NEW_ID" "$(sql_v
 check "a new user stores the key hash" "$(printf %s "$NEW_KEY" | shasum -a 256 | cut -d' ' -f1)" "$(sql_value "SELECT api_key_hash FROM users WHERE id = '$NEW_ID'")"
 call GET /v1/credits/balance "$NEW_KEY"
 check "a new user's key authenticates" 200 "$STATUS"
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymous" -H "X-App-ID: dreameater" -H "Content-Type: application/json" --data '{"unverified":true,"device_id":"local-device-1"}')
-ROTATED_KEY="$(json_get api_key)"
-call GET /v1/credits/balance "$ROTATED_KEY"
-check "registering the same device again issues a working key" 200 "$STATUS"
-call GET /v1/credits/balance "$NEW_KEY"
-check "the previous key stops working after re-registration" 401 "$STATUS"
+register_local_device() {
+  curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymous" -H "X-App-ID: dreameater" -H "Content-Type: application/json" --data '{"unverified":true,"device_id":"local-device-1"}'
+}
+STATUS=$(register_local_device)
+SECOND_KEY="$(json_get api_key)"
+check "a second login for the same account returns a key" 200 "$STATUS"
+STATUS=$(register_local_device)
+THIRD_KEY="$(json_get api_key)"
+for key in "$NEW_KEY" "$SECOND_KEY" "$THIRD_KEY"; do
+  call GET /v1/credits/balance "$key"
+  check "every login's key authenticates" 200 "$STATUS"
+done
+check "the three logins hold three different keys" 3 "$(printf '%s\n' "$NEW_KEY" "$SECOND_KEY" "$THIRD_KEY" | sort -u | wc -l | tr -d ' ')"
+check "extra logins add key rows and never replace the account's first key" 2 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE user_id = '$NEW_ID'")"
+check "the key table stores the hash of the second key" 1 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = '$(printf %s "$SECOND_KEY" | shasum -a 256 | cut -d' ' -f1)'")"
+check "no plaintext key is stored in the key table" 0 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash IN ('$SECOND_KEY', '$THIRD_KEY')")"
+check "using a key stamps last_used_at" 2 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE user_id = '$NEW_ID' AND last_used_at IS NOT NULL")"
+call DELETE /v1/identity "$SECOND_KEY"
+check "deleting the account with one key succeeds" 200 "$STATUS"
+check "account deletion removed every key row" 0 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE user_id = '$NEW_ID'")"
+check "account deletion removed the user row" 0 "$(sql_value "SELECT COUNT(*) FROM users WHERE id = '$NEW_ID'")"
+for key in "$NEW_KEY" "$SECOND_KEY" "$THIRD_KEY"; do
+  call GET /v1/credits/balance "$key"
+  check "no key of the deleted account authenticates" 401 "$STATUS"
+done
 
 echo "== balance"
 call GET /v1/credits/balance key_free
