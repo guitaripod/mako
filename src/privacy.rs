@@ -20,7 +20,7 @@ fn legal_redirect(app: &str, doc: &str) -> Option<String> {
     LEGAL_MOVES
         .iter()
         .find(|(tenant, _, docs)| *tenant == app && docs.contains(&doc))
-        .map(|(_, slug, _)| format!("https://midgarcorp.cc/legal/{slug}/{doc}"))
+        .map(|(_, slug, _)| format!("https://midgarcorp.cc/legal/{slug}/{doc}/"))
 }
 
 /// Answers `301` to the midgarcorp.cc page when the tenant's legal page moved, else `None`.
@@ -1181,12 +1181,12 @@ mod tests {
 
     #[test]
     fn moved_legal_pages_redirect_to_their_registry_slug() {
-        assert_eq!(legal_redirect("pixie", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/pixiepocket/privacy"));
-        assert_eq!(legal_redirect("dreameater", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/dream-eater/privacy"));
-        assert_eq!(legal_redirect("inventory", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/master-of-inventory/privacy"));
-        assert_eq!(legal_redirect("payday", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/pay-day/privacy"));
-        assert_eq!(legal_redirect("payday", "terms").as_deref(), Some("https://midgarcorp.cc/legal/pay-day/terms"));
-        assert_eq!(legal_redirect("livingdex", "terms").as_deref(), Some("https://midgarcorp.cc/legal/living-dex/terms"));
+        assert_eq!(legal_redirect("pixie", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/pixiepocket/privacy/"));
+        assert_eq!(legal_redirect("dreameater", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/dream-eater/privacy/"));
+        assert_eq!(legal_redirect("inventory", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/master-of-inventory/privacy/"));
+        assert_eq!(legal_redirect("payday", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/pay-day/privacy/"));
+        assert_eq!(legal_redirect("payday", "terms").as_deref(), Some("https://midgarcorp.cc/legal/pay-day/terms/"));
+        assert_eq!(legal_redirect("livingdex", "terms").as_deref(), Some("https://midgarcorp.cc/legal/living-dex/terms/"));
     }
 
     #[test]
