@@ -1,7 +1,38 @@
-use worker::{Request, Response, Result, RouteContext};
+use worker::{Request, Response, Result, RouteContext, Url};
+
+/// Each mako tenant whose legal pages now live on midgarcorp.cc, with its registry slug and the
+/// documents the site serves. Solar Beam is absent: it has no tenant page of its own, only the
+/// generic fallback, so there is nothing to move.
+const LEGAL_MOVES: [(&str, &str, &[&str]); 9] = [
+    ("pixie", "pixiepocket", &["privacy"]),
+    ("dreameater", "dream-eater", &["privacy"]),
+    ("doublekick", "double-kick", &["privacy"]),
+    ("psywave", "psywave", &["privacy"]),
+    ("psybeam", "psybeam", &["privacy"]),
+    ("payday", "pay-day", &["privacy", "terms"]),
+    ("livingdex", "living-dex", &["privacy", "terms"]),
+    ("flaccy", "flaccy", &["privacy"]),
+    ("inventory", "master-of-inventory", &["privacy"]),
+];
+
+/// The midgarcorp.cc URL that replaces an old mako legal page, or `None` when that page stays on mako.
+fn legal_redirect(app: &str, doc: &str) -> Option<String> {
+    LEGAL_MOVES
+        .iter()
+        .find(|(tenant, _, docs)| *tenant == app && docs.contains(&doc))
+        .map(|(_, slug, _)| format!("https://midgarcorp.cc/legal/{slug}/{doc}"))
+}
+
+/// Answers `301` to the midgarcorp.cc page when the tenant's legal page moved, else `None`.
+fn moved_legal_page(app: &str, doc: &str) -> Option<Result<Response>> {
+    legal_redirect(app, doc).map(|target| Url::parse(&target).map_err(Into::into).and_then(|url| Response::redirect_with_status(url, 301)))
+}
 
 pub fn privacy_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let app = ctx.param("app").map(|s| s.as_str()).unwrap_or("");
+    if let Some(moved) = moved_legal_page(app, "privacy") {
+        return moved;
+    }
     Response::ok(render(app)).map(|mut r| {
         let _ = r.headers_mut().set("Content-Type", "text/html; charset=utf-8");
         r
@@ -1024,6 +1055,9 @@ pub fn payday_landing(_req: Request, _ctx: RouteContext<()>) -> Result<Response>
 
 pub fn terms_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let app = ctx.param("app").map(|s| s.as_str()).unwrap_or("");
+    if let Some(moved) = moved_legal_page(app, "terms") {
+        return moved;
+    }
     Response::ok(render_terms(app)).map(|mut r| {
         let _ = r.headers_mut().set("Content-Type", "text/html; charset=utf-8");
         r
@@ -1144,6 +1178,31 @@ fn render_support(app: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moved_legal_pages_redirect_to_their_registry_slug() {
+        assert_eq!(legal_redirect("pixie", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/pixiepocket/privacy"));
+        assert_eq!(legal_redirect("dreameater", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/dream-eater/privacy"));
+        assert_eq!(legal_redirect("inventory", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/master-of-inventory/privacy"));
+        assert_eq!(legal_redirect("payday", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/pay-day/privacy"));
+        assert_eq!(legal_redirect("payday", "terms").as_deref(), Some("https://midgarcorp.cc/legal/pay-day/terms"));
+        assert_eq!(legal_redirect("livingdex", "terms").as_deref(), Some("https://midgarcorp.cc/legal/living-dex/terms"));
+    }
+
+    #[test]
+    fn legal_pages_without_a_moved_target_stay_on_mako() {
+        assert_eq!(legal_redirect("pixie", "terms"), None);
+        assert_eq!(legal_redirect("flaccy", "terms"), None);
+        assert_eq!(legal_redirect("solarbeam", "privacy"), None);
+        assert_eq!(legal_redirect("unknown-app", "privacy"), None);
+    }
+
+    #[test]
+    fn every_moved_slug_is_a_registry_slug() {
+        for (_, slug, _) in LEGAL_MOVES {
+            assert!(!slug.is_empty() && slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'), "{} is not kebab-case", slug);
+        }
+    }
 
     #[test]
     fn campaign_apps_disclose_apple_ads_measurement() {
