@@ -1,6 +1,6 @@
 # mako
 
-**mako** is Midgar's shared, multi-tenant AI-credits backend — a Rust Cloudflare Worker that fronts LLM/image providers (OpenAI, Gemini, Anthropic Claude) behind a single credits ledger, per-app isolation, and RevenueCat entitlement handling. It serves every Midgar app (Helia, Pay Day, Psybeam, Dream Eater, Living Dex, the Pixie image apps, …) from one deployment.
+**mako** is Midgar's shared, multi-tenant AI-credits backend, a Rust Cloudflare Worker that fronts LLM/image providers (OpenAI, Gemini, Anthropic Claude) behind a single credits ledger, per-app isolation, and RevenueCat entitlement handling. It serves every Midgar app (Helia, Pay Day, Psybeam, Dream Eater, Living Dex, the Pixie image apps, …) from one deployment.
 
 > Deployed as the Cloudflare Worker `openai-image-proxy` at `mako.midgarcorp.cc`. The worker/D1/R2 retain the `openai-image-proxy` names (id-bound, invisible to clients); **mako** is the service identity.
 
@@ -8,12 +8,12 @@
 
 - **Multi-tenant** via the `X-App-ID` header; every app has its own credits, packs, capability costs, and premium entitlement in D1.
 - **Credits ledger** with a reserve/settle pattern and a scheduled sweep for orphaned reservations.
-- **RevenueCat** entitlement verification — premium users bypass credits (`credits_charged: 0`).
+- **RevenueCat** entitlement verification: premium users bypass credits (`credits_charged: 0`).
 - **Capabilities** exposed under `/v1/run/<capability>`:
-  - `chat.completion` — text + vision, routed by model id to Gemini / OpenAI / **Anthropic Claude**.
+  - `chat.completion`: text + vision, routed by model id to Gemini / OpenAI / **Anthropic Claude**.
   - `image` generation/editing (OpenAI, Gemini).
-  - `realtime.translate` — reserved-minute realtime sessions.
-- **Apple Ads attribution** — `POST /v1/attribution` exchanges an AdServices token with Apple server-side and records the campaign/ad group/keyword behind an install; purchases are tagged with it, and `GET /v1/attribution/keywords` reports installs, payers and revenue per keyword. No advertising identifier, no ATT prompt, and the token itself is never stored (only a SHA-256 fingerprint, for idempotency).
+  - `realtime.translate`: reserved-minute realtime sessions.
+- **Apple Ads attribution**: `POST /v1/attribution` exchanges an AdServices token with Apple server-side and records the campaign/ad group/keyword behind an install; purchases are tagged with it, and `GET /v1/attribution/keywords` reports installs, payers and revenue per keyword. No advertising identifier, no ATT prompt, and the token itself is never stored (only a SHA-256 fingerprint, for idempotency).
 
 ## Providers
 
@@ -27,7 +27,7 @@ Chat routing is by model-id prefix (`src/handlers/chat.rs`):
 
 ## Onboarding a tenant
 
-Data-only, no deploy — add a `migrations/0XX_seed_<app>.sql` (see `migrations/014_seed_livingdex.sql`) with `apps` + optional `capability_costs` + `credit_packs` rows, then:
+Data-only, no deploy, add a `migrations/0XX_seed_<app>.sql` (see `migrations/014_seed_livingdex.sql`) with `apps` + optional `capability_costs` + `credit_packs` rows, then:
 
 ```sh
 CLOUDFLARE_API_TOKEN=$(cat ~/.cloudflare-api-token) \

@@ -1,15 +1,15 @@
 ---
 name: revenue-ops
-description: Weekly PixiePocket revenue ritual — pull metrics, append docs/metrics.csv, evaluate the 30/60/90 gates from docs/store-playbook.md, and output one decision. Use when asked to "run revenue ops", "check the numbers", or on a weekly cadence.
+description: Weekly PixiePocket revenue ritual, pull metrics, append docs/metrics.csv, evaluate the 30/60/90 gates from docs/store-playbook.md, and output one decision. Use when asked to "run revenue ops", "check the numbers", or on a weekly cadence.
 ---
 
 # Revenue ops ritual (PixiePocket)
 
-App Store id `6751730339`, mako tenant `pixie` (this repo IS the backend — the D1 ledger is first-party truth). Run the whole ritual; end with a gate verdict, not raw numbers.
+App Store id `6751730339`, mako tenant `pixie` (this repo IS the backend; the D1 ledger is first-party truth). Run the whole ritual; end with a gate verdict, not raw numbers.
 
 ## 1. Pull metrics
 
-Ratings + listing state (keyless, per storefront — at minimum us, gb, de):
+Ratings + listing state (keyless, per storefront, at minimum us, gb, de):
 
 ```bash
 curl -s "https://itunes.apple.com/lookup?id=6751730339&country=us" | python3 -c "import json,sys; r=json.load(sys.stdin)['results'][0]; print(r['averageUserRating'], r['userRatingCount'], r['version'], r['price'])"
@@ -17,9 +17,9 @@ curl -s "https://itunes.apple.com/lookup?id=6751730339&country=us" | python3 -c 
 
 ASC sales/downloads (API key `DSS2FFU68G`, issuer `a5ebdab5-0ceb-463c-8151-195b902f117b`, p8 in `~/.appstoreconnect/private_keys/`). Mint an ES256 JWT (pyjwt) and call:
 
-- `GET /v1/salesReports?filter[frequency]=WEEKLY&filter[reportType]=SALES&filter[reportSubType]=SUMMARY&filter[vendorNumber]=93803823&filter[reportDate]=<YYYY-MM-DD of week>` — gzip TSV; SKU `pixie` rows separate app downloads from credit-pack IAP units/proceeds.
+- `GET /v1/salesReports?filter[frequency]=WEEKLY&filter[reportType]=SALES&filter[reportSubType]=SUMMARY&filter[vendorNumber]=93803823&filter[reportDate]=<YYYY-MM-DD of week>`: gzip TSV; SKU `pixie` rows separate app downloads from credit-pack IAP units/proceeds.
 
-D1 ledger truth (run from the repo root — no cd needed):
+D1 ledger truth (run from the repo root, no cd needed):
 
 ```bash
 npx wrangler d1 execute openai-image-proxy --remote --command "SELECT COUNT(*) n FROM users WHERE app_id='pixie' AND created_at >= datetime('now','-7 days')"
@@ -36,13 +36,13 @@ Review texts (for the reply-within-48h duty):
 curl -s "https://itunes.apple.com/us/rss/customerreviews/page=1/id=6751730339/sortby=mostrecent/json"
 ```
 
-Image reports (UGC duty — Guideline 1.2 requires timely action):
+Image reports (UGC duty, Guideline 1.2 requires timely action):
 
 ```bash
 npx wrangler d1 execute openai-image-proxy --remote --command "SELECT image_id, reason, created_at FROM image_reports WHERE app_id='pixie' ORDER BY created_at DESC LIMIT 20"
 ```
 
-Any reported image: review the prompt via stored_images, propose keep/remove. Removal is `DELETE FROM stored_images WHERE id=?` plus the R2 object — propose, never auto-act.
+Any reported image: review the prompt via stored_images, propose keep/remove. Removal is `DELETE FROM stored_images WHERE id=?` plus the R2 object; propose, never auto-act.
 
 ## 2. Record
 
