@@ -3,6 +3,7 @@ use worker::*;
 mod models;
 mod error;
 mod attribution;
+mod api_keys;
 mod auth;
 mod handlers;
 mod storage;
@@ -30,6 +31,14 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         Ok(n) if n > 0 => console_log!("realtime sweep refunded {} orphaned reservations", n),
         Ok(_) => {}
         Err(e) => console_error!("realtime sweep failed: {:?}", e),
+    }
+    match env.d1("DB") {
+        Ok(db) => match auth::backfill_api_key_hashes(&db).await {
+            Ok(n) if n > 0 => console_log!("api key backfill hashed {} users", n),
+            Ok(_) => {}
+            Err(e) => console_error!("api key backfill failed: {:?}", e),
+        },
+        Err(e) => console_error!("api key backfill could not open the database: {:?}", e),
     }
 }
 

@@ -1,6 +1,7 @@
 use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
-use crate::auth::resolve_app_id;
+use crate::auth::{issue_api_key, resolve_app_id};
+use crate::api_keys::NewCredentials;
 use crate::credits::initialize_user_credits;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -209,7 +210,7 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     
     let provider_id = github_user.id.to_string();
     let existing_user_stmt = db.prepare(
-        "SELECT id, api_key, is_admin FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
+        "SELECT id, is_admin FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
     );
 
     let existing_user = existing_user_stmt
@@ -218,19 +219,21 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
         .await?;
 
     let (user_id, api_key, is_admin) = if let Some(user_data) = existing_user {
+        let existing_id = user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let api_key = issue_api_key(&db, &app_id, &existing_id).await?;
         (
-            user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            user_data.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            existing_id,
+            api_key,
             user_data.get("is_admin").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
         )
     } else {
         let new_user_id = Uuid::new_v4().to_string();
-        let new_api_key = generate_api_key();
+        let creds = NewCredentials::generate(&new_user_id);
         let now = Utc::now().to_rfc3339();
 
         let insert_stmt = db.prepare(
-            "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, api_key_hash, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
 
         insert_stmt
@@ -241,7 +244,8 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
                 provider_id.into(),
                 github_user.email.clone().unwrap_or_default().into(),
                 github_user.name.clone().unwrap_or(github_user.login.clone()).into(),
-                new_api_key.clone().into(),
+                creds.placeholder.clone().into(),
+                creds.api_key_hash.clone().into(),
                 now.clone().into(),
                 now.into(),
             ])?
@@ -251,7 +255,7 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
         // Initialize credits for new user
         initialize_user_credits(&app_id, &new_user_id, &db).await?;
 
-        (new_user_id, new_api_key, false)
+        (new_user_id, creds.api_key, false)
     };
     
     let response = OAuthTokenResponse {
@@ -261,10 +265,6 @@ pub async fn github_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     };
     
     Response::from_json(&response)
-}
-
-pub fn generate_api_key() -> String {
-    format!("pixie_{}", Uuid::new_v4().to_string().replace("-", ""))
 }
 
 pub async fn google_auth_start(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -363,7 +363,7 @@ pub async fn google_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
     
     let provider_id = google_user.id;
     let existing_user_stmt = db.prepare(
-        "SELECT id, api_key, is_admin FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
+        "SELECT id, is_admin FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
     );
 
     let existing_user = existing_user_stmt
@@ -372,19 +372,21 @@ pub async fn google_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
         .await?;
 
     let (user_id, api_key, is_admin) = if let Some(user_data) = existing_user {
+        let existing_id = user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let api_key = issue_api_key(&db, &app_id, &existing_id).await?;
         (
-            user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            user_data.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            existing_id,
+            api_key,
             user_data.get("is_admin").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
         )
     } else {
         let new_user_id = Uuid::new_v4().to_string();
-        let new_api_key = generate_api_key();
+        let creds = NewCredentials::generate(&new_user_id);
         let now = Utc::now().to_rfc3339();
 
         let insert_stmt = db.prepare(
-            "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, api_key_hash, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
 
         insert_stmt
@@ -395,7 +397,8 @@ pub async fn google_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
                 provider_id.into(),
                 google_user.email.into(),
                 google_user.name.unwrap_or_else(|| "Google User".to_string()).into(),
-                new_api_key.clone().into(),
+                creds.placeholder.clone().into(),
+                creds.api_key_hash.clone().into(),
                 now.clone().into(),
                 now.into(),
             ])?
@@ -405,7 +408,7 @@ pub async fn google_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Re
         // Initialize credits for new user
         initialize_user_credits(&app_id, &new_user_id, &db).await?;
 
-        (new_user_id, new_api_key, false)
+        (new_user_id, creds.api_key, false)
     };
     
     let response = OAuthTokenResponse {

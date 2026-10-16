@@ -2107,9 +2107,6 @@ components:
             Whether the generated image appears in the public gallery feed.
             Defaults to true when omitted (historical behaviour). Set false to
             store the image privately.
-        openai_api_key:
-          type: string
-          description: Optional OpenAI API key (self-hosted mode only)
 
     VisibilityRequest:
       type: object

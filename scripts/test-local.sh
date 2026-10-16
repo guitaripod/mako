@@ -138,7 +138,8 @@ INSERT INTO users (id, provider, provider_id, name, api_key, created_at, updated
  ('u-broke',    'anonymous', 'broke',    'Broke',    'key_broke',    '$NOW', '$NOW', 'dreameater'),
  ('u-throw',    'anonymous', 'throw',    'Throw',    'key_throw',    '$NOW', '$NOW', 'dreameater'),
  ('u-pixie',    'anonymous', 'pixie',    'Pixie',    'key_pixie',    '$NOW', '$NOW', 'pixie'),
- ('u-scrub',    'anonymous', 'scrub',    'Scrub',    'key_scrub',    '$NOW', '$NOW', 'scrubme');
+ ('u-scrub',    'anonymous', 'scrub',    'Scrub',    'key_scrub',    '$NOW', '$NOW', 'scrubme'),
+ ('u-backfill', 'anonymous', 'backfill', 'Backfill', 'key_backfill', '$NOW', '$NOW', 'pixie');
 UPDATE users SET premium_cached = 1, premium_checked_at = '$NOW' WHERE id = 'u-premium';
 INSERT INTO user_credits (app_id, user_id, balance, created_at, updated_at) VALUES
  ('dreameater', 'u-free', 5, '$NOW', '$NOW'),
@@ -169,7 +170,7 @@ rm -f "$SEED"
 echo "PASS  seeded tenants, users, the test aliases and rows to delete"
 
 echo "== starting wrangler dev --local with mock providers"
-npx wrangler dev --local --config "$CONFIG" --persist-to "$STATE" --port "$PORT" >"$LOG" 2>&1 &
+npx wrangler dev --local --test-scheduled --config "$CONFIG" --persist-to "$STATE" --port "$PORT" >"$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 240); do
   if curl -s -o /dev/null "$BASE/docs"; then
@@ -188,6 +189,39 @@ if ! curl -s -o /dev/null "$BASE/docs"; then
   exit 1
 fi
 echo "PASS  server is up"
+
+echo "== api key hashing"
+call GET /v1/credits/balance key_free
+check "a legacy plaintext key still authenticates" 200 "$STATUS"
+check "the first request wrote the hash" "$(printf key_free | shasum -a 256 | cut -d' ' -f1)" "$(sql_value "SELECT api_key_hash FROM users WHERE id = 'u-free'")"
+check "the first request replaced the plaintext with the placeholder" "hashed:u-free" "$(sql_value "SELECT api_key FROM users WHERE id = 'u-free'")"
+call GET /v1/credits/balance key_free
+check "the same key authenticates by hash afterwards" 200 "$STATUS"
+call GET /v1/credits/balance hashed:u-free
+check "a placeholder is never a credential" 401 "$STATUS"
+call GET /v1/credits/balance key_unknown
+check "an unknown key is rejected" 401 "$STATUS"
+check "the backfill candidate is still plaintext before the cron" key_backfill "$(sql_value "SELECT api_key FROM users WHERE id = 'u-backfill'")"
+curl -s -o /dev/null "$BASE/__scheduled?cron=*/30+*+*+*+*"
+check "the scheduled backfill stored the hash" "$(printf key_backfill | shasum -a 256 | cut -d' ' -f1)" "$(sql_value "SELECT api_key_hash FROM users WHERE id = 'u-backfill'")"
+check "the scheduled backfill replaced the plaintext" "hashed:u-backfill" "$(sql_value "SELECT api_key FROM users WHERE id = 'u-backfill'")"
+check "no plaintext key is left after the backfill" 0 "$(sql_value "SELECT COUNT(*) FROM users WHERE api_key_hash IS NULL AND api_key NOT LIKE 'hashed:%'")"
+call GET /v1/credits/balance key_backfill "" pixie
+check "a backfilled key authenticates by hash" 200 "$STATUS"
+STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymous" -H "X-App-ID: dreameater" -H "Content-Type: application/json" --data '{"unverified":true,"device_id":"local-device-1"}')
+check "anonymous registration succeeds" 200 "$STATUS"
+NEW_KEY="$(json_get api_key)"
+NEW_ID="$(json_get user_id)"
+check "a new user stores the placeholder, not the key" "hashed:$NEW_ID" "$(sql_value "SELECT api_key FROM users WHERE id = '$NEW_ID'")"
+check "a new user stores the key hash" "$(printf %s "$NEW_KEY" | shasum -a 256 | cut -d' ' -f1)" "$(sql_value "SELECT api_key_hash FROM users WHERE id = '$NEW_ID'")"
+call GET /v1/credits/balance "$NEW_KEY"
+check "a new user's key authenticates" 200 "$STATUS"
+STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymous" -H "X-App-ID: dreameater" -H "Content-Type: application/json" --data '{"unverified":true,"device_id":"local-device-1"}')
+ROTATED_KEY="$(json_get api_key)"
+call GET /v1/credits/balance "$ROTATED_KEY"
+check "registering the same device again issues a working key" 200 "$STATUS"
+call GET /v1/credits/balance "$NEW_KEY"
+check "the previous key stops working after re-registration" 401 "$STATUS"
 
 echo "== balance"
 call GET /v1/credits/balance key_free

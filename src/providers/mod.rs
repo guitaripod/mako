@@ -20,7 +20,6 @@ pub struct UnifiedImageRequest {
     pub output_format: Option<String>,
     pub partial_images: Option<u8>,
     pub user: Option<String>,
-    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +37,6 @@ pub struct UnifiedEditRequest {
     pub output_format: Option<String>,
     pub partial_images: Option<u8>,
     pub user: Option<String>,
-    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]

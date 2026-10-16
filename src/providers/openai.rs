@@ -14,7 +14,6 @@ const OPENAI_EDIT_URL: &str = "https://api.openai.com/v1/images/edits";
 
 pub struct OpenAIProvider {
     api_key: String,
-    deployment_config: DeploymentConfig,
 }
 
 impl OpenAIProvider {
@@ -29,32 +28,11 @@ impl OpenAIProvider {
                     .to_string()
             }
             DeploymentMode::SelfHosted => {
-                return Err(worker::Error::RustError("Self-hosted mode requires API key in request".to_string()));
+                return Err(worker::Error::RustError("Self-hosted OpenAI is not supported".to_string()));
             }
         };
 
-        Ok(Self {
-            api_key,
-            deployment_config,
-        })
-    }
-
-    pub fn with_api_key(api_key: String, deployment_config: DeploymentConfig) -> Self {
-        Self {
-            api_key,
-            deployment_config,
-        }
-    }
-
-    fn get_api_key(&self, request_api_key: Option<String>) -> Result<String> {
-        match self.deployment_config.mode {
-            DeploymentMode::Official => Ok(self.api_key.clone()),
-            DeploymentMode::SelfHosted => {
-                request_api_key.ok_or_else(|| {
-                    worker::Error::RustError("OpenAI API key required for self-hosted mode".to_string())
-                })
-            }
-        }
+        Ok(Self { api_key })
     }
 
     async fn call_openai_api(&self, url: &str, body: serde_json::Value, api_key: &str) -> Result<ImageResponse> {
@@ -96,7 +74,7 @@ impl OpenAIProvider {
 #[async_trait(?Send)]
 impl ImageProvider for OpenAIProvider {
     async fn generate_image(&self, request: &UnifiedImageRequest) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key(request.api_key.clone())?;
+        let api_key = self.api_key.clone();
 
         let request_body = json!({
             "model": "gpt-image-2",
@@ -148,7 +126,7 @@ impl ImageProvider for OpenAIProvider {
     }
 
     async fn edit_image(&self, request: &UnifiedEditRequest) -> Result<ProviderResponse> {
-        let api_key = self.get_api_key(request.api_key.clone())?;
+        let api_key = self.api_key.clone();
 
         let boundary = format!("----WebKitFormBoundary{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let mut body_parts = Vec::new();

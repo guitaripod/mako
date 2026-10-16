@@ -77,7 +77,6 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         output_format: Some(generation_req.output_format.clone()),
         partial_images: Some(generation_req.partial_images),
         user: generation_req.user.clone(),
-        api_key: generation_req.openai_api_key.clone(),
     };
 
     let mut cost_estimate = provider.estimate_cost(&unified_request);
@@ -360,7 +359,6 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         output_format: Some(edit_req.output_format.clone()),
         partial_images: Some(edit_req.partial_images),
         user: edit_req.user.clone(),
-        api_key: edit_req.openai_api_key.clone(),
     };
 
     let cost_estimate = provider.estimate_edit_cost(&unified_request);

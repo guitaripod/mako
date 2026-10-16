@@ -1,6 +1,7 @@
 use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
-use crate::auth::resolve_app_id;
+use crate::auth::{issue_api_key, resolve_app_id};
+use crate::api_keys::NewCredentials;
 use crate::credits::initialize_user_credits;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -286,26 +287,25 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
     }
     
     if let Some(user_id) = device_data.get("user_id").and_then(|v| v.as_str()) {
-        let user_stmt = db.prepare("SELECT api_key FROM users WHERE app_id = ? AND id = ?");
-        let user_result = user_stmt
+        let user_exists = db
+            .prepare("SELECT id FROM users WHERE app_id = ? AND id = ?")
             .bind(&[app_id.clone().into(), user_id.into()])?
             .first::<serde_json::Value>(None)
-            .await?;
-        
-        if let Some(user_data) = user_result {
-            let api_key = user_data.get("api_key")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::InternalError("User has no API key".to_string()))?;
-            
+            .await?
+            .is_some();
+
+        if user_exists {
+            let api_key = issue_api_key(&db, &app_id, user_id).await?;
+
             let response = DeviceTokenResponse {
-                api_key: api_key.to_string(),
+                api_key,
                 user_id: user_id.to_string(),
             };
-            
+
             return Response::from_json(&response);
         }
     }
-    
+
     let device_code = device_data.get("device_code")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::InternalError("Invalid device code data".to_string()))?;
@@ -386,7 +386,7 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
             
             let provider_id = github_user.id.to_string();
             let existing_user_stmt = db.prepare(
-                "SELECT id, api_key FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
+                "SELECT id FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
             );
 
             let existing_user = existing_user_stmt
@@ -395,18 +395,17 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                 .await?;
 
             if let Some(user_data) = existing_user {
-                (
-                    user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    user_data.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                )
+                let existing_id = user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let api_key = issue_api_key(&db, &app_id, &existing_id).await?;
+                (existing_id, api_key)
             } else {
                 let new_user_id = Uuid::new_v4().to_string();
-                let new_api_key = generate_api_key();
+                let creds = NewCredentials::generate(&new_user_id);
                 let now = Utc::now().to_rfc3339();
 
                 let insert_stmt = db.prepare(
-                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, api_key_hash, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 );
 
                 insert_stmt
@@ -417,7 +416,8 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                         provider_id.into(),
                         github_user.email.clone().unwrap_or_default().into(),
                         github_user.name.clone().unwrap_or(github_user.login.clone()).into(),
-                        new_api_key.clone().into(),
+                        creds.placeholder.clone().into(),
+                        creds.api_key_hash.clone().into(),
                         now.clone().into(),
                         now.into(),
                     ])?
@@ -427,7 +427,7 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                 // Initialize credits for new user
                 initialize_user_credits(&app_id, &new_user_id, &db).await?;
 
-                (new_user_id, new_api_key)
+                (new_user_id, creds.api_key)
             }
         },
         "google" => {
@@ -495,7 +495,7 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
             
             let provider_id = google_user.id;
             let existing_user_stmt = db.prepare(
-                "SELECT id, api_key FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
+                "SELECT id FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?"
             );
 
             let existing_user = existing_user_stmt
@@ -504,18 +504,17 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                 .await?;
 
             if let Some(user_data) = existing_user {
-                (
-                    user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    user_data.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                )
+                let existing_id = user_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let api_key = issue_api_key(&db, &app_id, &existing_id).await?;
+                (existing_id, api_key)
             } else {
                 let new_user_id = Uuid::new_v4().to_string();
-                let new_api_key = generate_api_key();
+                let creds = NewCredentials::generate(&new_user_id);
                 let now = Utc::now().to_rfc3339();
 
                 let insert_stmt = db.prepare(
-                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, api_key_hash, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 );
 
                 insert_stmt
@@ -526,7 +525,8 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                         provider_id.into(),
                         google_user.email.into(),
                         google_user.name.unwrap_or_else(|| "Google User".to_string()).into(),
-                        new_api_key.clone().into(),
+                        creds.placeholder.clone().into(),
+                        creds.api_key_hash.clone().into(),
                         now.clone().into(),
                         now.into(),
                     ])?
@@ -536,7 +536,7 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                 // Initialize credits for new user
                 initialize_user_credits(&app_id, &new_user_id, &db).await?;
 
-                (new_user_id, new_api_key)
+                (new_user_id, creds.api_key)
             }
         },
         _ => {
@@ -559,10 +559,6 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
     };
     
     Response::from_json(&response)
-}
-
-fn generate_api_key() -> String {
-    format!("oip_{}", Uuid::new_v4().to_string().replace("-", ""))
 }
 
 pub async fn device_auth_status(_req: Request, ctx: RouteContext<()>) -> Result<Response> {

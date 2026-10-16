@@ -68,8 +68,6 @@ pub struct ImageGenerationRequest {
     #[serde(default = "default_stream")]
     pub stream: bool,
     pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub openai_api_key: Option<String>, // For self-hosted deployments
     /// When false, the image is stored privately and never appears in the public
     /// gallery feed. Absent/None preserves the historical default of public.
     #[serde(default)]
@@ -102,8 +100,6 @@ pub struct ImageEditRequest {
     #[serde(default = "default_stream")]
     pub stream: bool,
     pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub openai_api_key: Option<String>, // For self-hosted deployments
     /// When false, the edited image is stored privately and never appears in the
     /// public gallery feed. Absent/None preserves the historical default of public.
     #[serde(default)]

@@ -119,7 +119,6 @@ async fn run(
         output_format: None,
         partial_images: None,
         user: None,
-        api_key: None,
     };
 
     let unit = match policy.art_credits {

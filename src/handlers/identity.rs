@@ -1,6 +1,7 @@
 use worker::{Request, Response, RouteContext, Result, console_log, D1Database, Fetch, Method, Headers, RequestInit, RateLimiter};
 use crate::error::AppError;
-use crate::auth::{resolve_app_id, authenticate};
+use crate::auth::{resolve_app_id, authenticate, issue_api_key, validate_api_key};
+use crate::api_keys::NewCredentials;
 use crate::credits::{initialize_user_credits, add_credits, get_user_balance};
 use crate::handlers::oauth_native::validate_apple_identity_token;
 use serde::{Deserialize, Serialize};
@@ -331,13 +332,13 @@ async fn create_or_reuse_anonymous(
     device_key: &str,
 ) -> std::result::Result<(String, String), AppError> {
     let new_user_id = Uuid::new_v4().to_string();
-    let new_api_key = format!("pixie_{}", Uuid::new_v4().to_string().replace("-", ""));
+    let creds = NewCredentials::generate(&new_user_id);
     let now = Utc::now().to_rfc3339();
 
     let result = db
         .prepare(
-            "INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key, api_key_hash, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(app_id, provider, provider_id) DO NOTHING",
         )
         .bind(&[
@@ -347,7 +348,8 @@ async fn create_or_reuse_anonymous(
             ANON_PROVIDER.into(),
             device_key.into(),
             "Anonymous".into(),
-            new_api_key.clone().into(),
+            creds.placeholder.clone().into(),
+            creds.api_key_hash.clone().into(),
             now.clone().into(),
             now.into(),
         ])?
@@ -359,21 +361,21 @@ async fn create_or_reuse_anonymous(
     if inserted {
         initialize_user_credits(app_id, &new_user_id, db).await?;
         console_log!("Created anonymous user: {}", new_user_id);
-        return Ok((new_user_id, new_api_key));
+        return Ok((new_user_id, creds.api_key));
     }
 
     let existing = db
-        .prepare("SELECT id, api_key FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?")
+        .prepare("SELECT id FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?")
         .bind(&[app_id.into(), ANON_PROVIDER.into(), device_key.into()])?
         .first::<Value>(None)
         .await?
         .ok_or_else(|| AppError::InternalError("Anonymous user lookup failed".to_string()))?;
 
     let user_id = existing.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let api_key = existing.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if user_id.is_empty() || api_key.is_empty() {
+    if user_id.is_empty() {
         return Err(AppError::InternalError("Anonymous user lookup failed".to_string()));
     }
+    let api_key = issue_api_key(db, app_id, &user_id).await?;
     console_log!("Reusing anonymous user: {}", user_id);
     Ok((user_id, api_key))
 }
@@ -393,6 +395,7 @@ async fn link_inner(
     let db = ctx.env.d1("DB")?;
 
     let anon = authenticate(&req, &db).await?;
+    let presented_key = validate_api_key(&req)?;
 
     let body: LinkRequest = req
         .json()
@@ -403,18 +406,17 @@ async fn link_inner(
     let claims = validate_apple_identity_token(&body.identity_token, &bundle_id).await?;
 
     let existing_apple = db
-        .prepare("SELECT id, api_key FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?")
+        .prepare("SELECT id FROM users WHERE app_id = ? AND provider = ? AND provider_id = ?")
         .bind(&[app_id.clone().into(), "apple".into(), claims.sub.clone().into()])?
         .first::<Value>(None)
         .await?;
 
     if let Some(apple_user) = existing_apple {
         let existing_id = apple_user.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let existing_api_key = apple_user.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         if existing_id == anon.user_id {
             return Response::from_json(&IdentityResponse {
-                api_key: existing_api_key,
+                api_key: presented_key,
                 user_id: existing_id,
             })
             .map_err(AppError::from);
@@ -436,6 +438,8 @@ async fn link_inner(
 
         crate::attribution::carry_attribution_across_merge(&db, &app_id, &anon.user_id, &existing_id).await?;
 
+        let existing_api_key = issue_api_key(&db, &app_id, &existing_id).await?;
+
         console_log!("Merged anonymous {} into apple user {}", anon.user_id, existing_id);
         return Response::from_json(&IdentityResponse {
             api_key: existing_api_key,
@@ -446,17 +450,9 @@ async fn link_inner(
 
     relink_anonymous_to_apple(&db, &app_id, &anon.user_id, &claims).await?;
 
-    let api_key = db
-        .prepare("SELECT api_key FROM users WHERE app_id = ? AND id = ?")
-        .bind(&[app_id.clone().into(), anon.user_id.clone().into()])?
-        .first::<Value>(None)
-        .await?
-        .and_then(|v| v.get("api_key").and_then(|k| k.as_str()).map(|s| s.to_string()))
-        .ok_or_else(|| AppError::InternalError("User vanished during link".to_string()))?;
-
     console_log!("Relinked anonymous {} to apple", anon.user_id);
     Response::from_json(&IdentityResponse {
-        api_key,
+        api_key: presented_key,
         user_id: anon.user_id,
     })
     .map_err(AppError::from)
