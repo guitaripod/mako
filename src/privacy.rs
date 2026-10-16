@@ -1,10 +1,12 @@
 use worker::{Request, Response, Result, RouteContext, Url};
 
 /// Each mako tenant whose legal pages now live on midgarcorp.cc, with its registry slug and the
-/// documents the site serves. Solar Beam is absent: it has no tenant page of its own, only the
-/// generic fallback, so there is nothing to move.
-const LEGAL_MOVES: [(&str, &str, &[&str]); 9] = [
+/// documents the site serves. PixiePocket answers to both its tenant name `pixie` and its store
+/// name `pixiepocket`. Solar Beam is absent: it has no page of its own, so there is nothing to move.
+const LEGAL_MOVES: [(&str, &str, &[&str]); 11] = [
     ("pixie", "pixiepocket", &["privacy"]),
+    ("pixiepocket", "pixiepocket", &["privacy"]),
+    ("helia", "helia", &["privacy"]),
     ("dreameater", "dream-eater", &["privacy"]),
     ("doublekick", "double-kick", &["privacy"]),
     ("psywave", "psywave", &["privacy"]),
@@ -28,15 +30,57 @@ fn moved_legal_page(app: &str, doc: &str) -> Option<Result<Response>> {
     legal_redirect(app, doc).map(|target| Url::parse(&target).map_err(Into::into).and_then(|url| Response::redirect_with_status(url, 301)))
 }
 
+/// Apple's Standard Licensed Application End User License Agreement, which governs every app
+/// that has no custom EULA in App Store Connect.
+const STANDARD_EULA_URL: &str = "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/";
+
+/// Tenants whose privacy policy mako still renders itself. Every policy has moved to midgarcorp.cc,
+/// so the list is empty; the templates stay compiled until they are retired.
+const MAKO_PRIVACY_PAGES: [&str; 0] = [];
+
+/// Tenants whose terms mako still renders itself. Pay Day and Living Dex terms live on
+/// midgarcorp.cc, so the list is empty; the template stays compiled until it is retired.
+const MAKO_TERMS_PAGES: [&str; 0] = [];
+
+/// Where a `/terms/<app>` request goes: the moved midgarcorp.cc page, else Apple's Standard EULA
+/// for an app without terms of its own, or `None` when mako renders the page itself.
+fn terms_redirect(app: &str) -> Option<(String, u16)> {
+    if let Some(target) = legal_redirect(app, "terms") {
+        return Some((target, 301));
+    }
+    if MAKO_TERMS_PAGES.contains(&app) {
+        return None;
+    }
+    Some((STANDARD_EULA_URL.to_string(), 302))
+}
+
+/// The short page served in place of a privacy policy mako does not have.
+fn no_policy_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy not found</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1c1c1e}a{color:#06c}@media(prefers-color-scheme:dark){body{background:#000;color:#e5e5ea}a{color:#4da3ff}}</style>
+</head><body><h1>Privacy Policy not found</h1><p>There is no privacy policy at this address. Privacy policies are published at <a href="https://midgarcorp.cc/legal/">midgarcorp.cc/legal</a>, or write to <a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>.</p></body></html>"#
+        .to_string()
+}
+
+fn html_response(html: String, status: u16) -> Result<Response> {
+    Response::ok(html).map(|r| {
+        let mut r = r.with_status(status);
+        let _ = r.headers_mut().set("Content-Type", "text/html; charset=utf-8");
+        r
+    })
+}
+
 pub fn privacy_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let app = ctx.param("app").map(|s| s.as_str()).unwrap_or("");
     if let Some(moved) = moved_legal_page(app, "privacy") {
         return moved;
     }
-    Response::ok(render(app)).map(|mut r| {
-        let _ = r.headers_mut().set("Content-Type", "text/html; charset=utf-8");
-        r
-    })
+    if MAKO_PRIVACY_PAGES.contains(&app) {
+        return html_response(render(app), 200);
+    }
+    html_response(no_policy_page(), 404)
 }
 
 const DREAM_EATER_AI: &str = "the dream text, the options you chose for it and short summaries of earlier dreams you had read are sent to Dream Eater's server, which passes them to Google's Gemini model to write the reading";
@@ -1055,13 +1099,10 @@ pub fn payday_landing(_req: Request, _ctx: RouteContext<()>) -> Result<Response>
 
 pub fn terms_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let app = ctx.param("app").map(|s| s.as_str()).unwrap_or("");
-    if let Some(moved) = moved_legal_page(app, "terms") {
-        return moved;
+    if let Some((target, status)) = terms_redirect(app) {
+        return Url::parse(&target).map_err(Into::into).and_then(|url| Response::redirect_with_status(url, status));
     }
-    Response::ok(render_terms(app)).map(|mut r| {
-        let _ = r.headers_mut().set("Content-Type", "text/html; charset=utf-8");
-        r
-    })
+    html_response(render_terms(app), 200)
 }
 
 pub fn support_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -1190,11 +1231,63 @@ mod tests {
     }
 
     #[test]
-    fn legal_pages_without_a_moved_target_stay_on_mako() {
+    fn pixiepocket_privacy_moves_under_both_names() {
+        let expected = Some("https://midgarcorp.cc/legal/pixiepocket/privacy/".to_string());
+        assert_eq!(legal_redirect("pixie", "privacy"), expected);
+        assert_eq!(legal_redirect("pixiepocket", "privacy"), expected);
+    }
+
+    #[test]
+    fn helia_privacy_moves_to_its_own_page() {
+        assert_eq!(legal_redirect("helia", "privacy").as_deref(), Some("https://midgarcorp.cc/legal/helia/privacy/"));
+    }
+
+    #[test]
+    fn terms_without_a_moved_target_are_not_a_moved_legal_page() {
         assert_eq!(legal_redirect("pixie", "terms"), None);
         assert_eq!(legal_redirect("flaccy", "terms"), None);
+        assert_eq!(legal_redirect("helia", "terms"), None);
+    }
+
+    #[test]
+    fn privacy_without_a_moved_target_is_not_a_moved_legal_page() {
         assert_eq!(legal_redirect("solarbeam", "privacy"), None);
         assert_eq!(legal_redirect("unknown-app", "privacy"), None);
+    }
+
+    #[test]
+    fn payday_and_livingdex_terms_still_move_to_midgarcorp() {
+        assert_eq!(terms_redirect("payday"), Some(("https://midgarcorp.cc/legal/pay-day/terms/".to_string(), 301)));
+        assert_eq!(terms_redirect("livingdex"), Some(("https://midgarcorp.cc/legal/living-dex/terms/".to_string(), 301)));
+    }
+
+    #[test]
+    fn every_other_app_gets_apples_standard_eula() {
+        let eula = Some((STANDARD_EULA_URL.to_string(), 302));
+        for app in ["helia", "pixie", "pixiepocket", "dreameater", "doublekick", "psywave", "psybeam", "flaccy", "inventory", "solarbeam", "unknown-app"] {
+            assert_eq!(terms_redirect(app), eula, "{} terms", app);
+        }
+        assert_eq!(STANDARD_EULA_URL, "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/");
+    }
+
+    #[test]
+    fn no_app_is_left_on_a_generic_privacy_page() {
+        for app in ["solarbeam", "strata", "embr", "unknown-app", ""] {
+            assert_eq!(legal_redirect(app, "privacy"), None, "{} should have no moved policy", app);
+            assert!(!MAKO_PRIVACY_PAGES.contains(&app), "{} would render a generic policy", app);
+        }
+        for (tenant, _, docs) in LEGAL_MOVES {
+            assert!(docs.contains(&"privacy"), "{} has no privacy policy to move", tenant);
+        }
+    }
+
+    #[test]
+    fn missing_policy_page_is_short_plain_and_names_no_app() {
+        let html = no_policy_page();
+        assert!(html.contains("Privacy Policy not found"));
+        assert!(html.contains("https://midgarcorp.cc/legal/"));
+        assert!(!html.contains("This app"));
+        assert!(!html.contains('\u{2014}'));
     }
 
     #[test]
