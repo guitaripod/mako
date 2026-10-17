@@ -605,7 +605,7 @@ pub async fn identity_me(req: Request, ctx: RouteContext<()>) -> Result<Response
 /// Returns 402 if the balance is insufficient.
 pub async fn charge_capability(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
-    let auth = match authenticate(&req, &db).await {
+    let auth = match crate::auth::authenticate_with_token(&req, &ctx.env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -624,7 +624,7 @@ pub async fn charge_capability(mut req: Request, ctx: RouteContext<()>) -> Resul
         return AppError::BadRequest(format!("Unknown or free capability: {}", capability)).to_response();
     }
     let reference = body.get("reference").and_then(|v| v.as_str()).unwrap_or(capability);
-    match crate::credits::deduct_credits(&auth.app_id, &auth.user_id, cost, capability, reference, &db).await {
+    match crate::ledgers::Ledgers::new(&db).deduct_credits(&auth.account, cost, capability, reference).await {
         Ok(balance) => Response::from_json(&json!({ "charged": cost, "balance": balance })),
         Err(_) => AppError::PaymentRequired(format!("Insufficient credits for {}", capability)).to_response(),
     }

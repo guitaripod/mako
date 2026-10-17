@@ -21,6 +21,8 @@ mod art;
 mod mock;
 mod redact;
 mod tenant;
+mod ledgers;
+mod midgar_token;
 pub mod wallet;
 
 use handlers::{images, gallery, r2, usage, oauth, oauth_apple, oauth_apple_callback, oauth_native, device_auth, identity};
@@ -43,10 +45,24 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     }
 }
 
+/// Loads the tenant spellings table before a request that names a tenant or carries a Midgar token, so the
+/// synchronous `X-App-ID` resolution can accept both `dreameater` and `dream-eater`.
+async fn warm_app_aliases_for(req: &Request, env: &Env) {
+    let headers = req.headers();
+    let names_tenant = headers.has("X-App-ID").unwrap_or(false) || headers.has(midgar_token::TOKEN_HEADER).unwrap_or(false);
+    if !names_tenant {
+        return;
+    }
+    if let Ok(db) = env.d1("DB") {
+        tenant::warm_app_aliases(&db).await;
+    }
+}
+
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
-    
+    warm_app_aliases_for(&req, &env).await;
+
     let router = Router::new();
     
     router

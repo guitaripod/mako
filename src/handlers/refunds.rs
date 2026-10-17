@@ -4,7 +4,7 @@ use serde_json::json;
 use worker::{Request, Response, Result, RouteContext};
 
 use crate::auth;
-use crate::credits::add_credits;
+use crate::ledgers::Ledgers;
 use crate::error::AppError;
 use crate::rate_limit::enforce_write_rate_limit;
 
@@ -37,7 +37,7 @@ pub async fn refund_charge(req: Request, ctx: RouteContext<()>) -> Result<Respon
 
 async fn refund_charge_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Result<Response, AppError> {
     let db = ctx.env.d1("DB")?;
-    let auth = auth::authenticate(&req, &db).await?;
+    let auth = auth::authenticate_with_token(&req, &ctx.env, &db).await?;
     if !REFUNDABLE_APPS.contains(&auth.app_id.as_str()) {
         return Err(AppError::Forbidden("Refunds are not available for this app".to_string()));
     }
@@ -109,16 +109,9 @@ async fn refund_charge_inner(mut req: Request, ctx: RouteContext<()>) -> std::re
     }
 
     let refund_reference = format!("refund:{}", reference);
-    let balance = match add_credits(
-        &auth.app_id,
-        &auth.user_id,
-        amount as u32,
-        "refund",
-        "Refund: result unavailable",
-        Some(&refund_reference),
-        &db,
-    )
-    .await
+    let balance = match Ledgers::new(&db)
+        .add_credits(&auth.account, amount as u32, "refund", "Refund: result unavailable", Some(&refund_reference))
+        .await
     {
         Ok(balance) => balance,
         Err(e) => {

@@ -117,6 +117,10 @@ class_name = "Wallet"
 tag = "v1"
 new_sqlite_classes = ["Wallet"]
 
+[[services]]
+binding = "IDENTITY"
+service = "midgar-identity"
+
 # Development configuration
 [env.development]
 vars = { ENVIRONMENT = "development" }

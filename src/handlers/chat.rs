@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use crate::error::AppError;
-use crate::auth::authenticate;
-use crate::credits::{check_and_reserve_credits, deduct_credits, get_flat_capability_cost};
+use crate::auth::authenticate_with_token;
+use crate::credits::get_flat_capability_cost;
+use crate::ledgers::Ledgers;
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 
 pub(crate) const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -136,7 +137,8 @@ async fn chat_completion_inner(
     ctx: RouteContext<()>,
 ) -> std::result::Result<Response, AppError> {
     let db = ctx.env.d1("DB")?;
-    let auth = authenticate(&req, &db).await?;
+    let auth = authenticate_with_token(&req, &ctx.env, &db).await?;
+    let ledgers = Ledgers::new(&db);
     crate::rate_limit::enforce_write_rate_limit(&ctx.env, &auth.app_id, &auth.user_id, "chat.completion").await?;
 
     let raw = req
@@ -169,7 +171,7 @@ async fn chat_completion_inner(
 
     if !premium {
         let guard = flat_cost.unwrap_or(MIN_BALANCE_GUARD);
-        if let Err(e) = check_and_reserve_credits(&auth.app_id, &auth.user_id, guard, &db).await {
+        if let Err(e) = ledgers.check_and_reserve_credits(&auth.account, guard).await {
             let _ = release_lock(&auth.app_id, &auth.user_id, &db).await;
             return Err(AppError::from(e));
         }
@@ -211,7 +213,7 @@ async fn chat_completion_inner(
     let mut charge_reference = None;
     if credits > 0 {
         let reference = format!("chat:{}", Uuid::new_v4());
-        if let Err(e) = deduct_credits(&auth.app_id, &auth.user_id, credits, "chat.completion", &reference, &db).await {
+        if let Err(e) = ledgers.deduct_credits(&auth.account, credits, "chat.completion", &reference).await {
             let _ = release_lock(&auth.app_id, &auth.user_id, &db).await;
             return Err(AppError::from(e));
         }

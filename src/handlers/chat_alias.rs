@@ -8,7 +8,7 @@ use crate::chat_alias::{
     parse_anthropic_reply, parse_gemini_reply, parse_openai_reply, plan_after_lost_weekly_race, plan_charge,
     week_key, week_start, AliasConfig, AliasRequest, ChargeKind, ChargePlan, Reply, ReplyError, Settlement, Turn,
 };
-use crate::credits::{check_and_reserve_credits, deduct_credits, get_user_balance, record_paywall_event};
+use crate::ledgers::Ledgers;
 use crate::error::AppError;
 use crate::handlers::chat::{Provider, ANTHROPIC_MESSAGES_URL, ANTHROPIC_VERSION, GEMINI_BASE, OPENAI_CHAT_URL};
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
@@ -67,7 +67,8 @@ async fn run(
     let reference = ledger_reference(&request.idempotency_key);
     let mut charge_reference = None;
     if plan.credits > 0 {
-        deduct_credits(&auth.app_id, &auth.user_id, plan.credits, &format!("chat.completion:{}", cfg.alias), &reference, db)
+        Ledgers::new(db)
+            .deduct_credits(&auth.account, plan.credits, &format!("chat.completion:{}", cfg.alias), &reference)
             .await
             .map_err(AppError::from)?;
         charge_reference = Some(reference.clone());
@@ -82,11 +83,12 @@ async fn ensure_affordable(db: &D1Database, auth: &AuthedUser, plan: &ChargePlan
     if plan.credits == 0 {
         return Ok(());
     }
-    if let Err(e) = check_and_reserve_credits(&auth.app_id, &auth.user_id, plan.credits, db).await {
+    let ledgers = Ledgers::new(db);
+    if let Err(e) = ledgers.check_and_reserve_credits(&auth.account, plan.credits).await {
         let error = AppError::from(e);
         if matches!(error, AppError::PaymentRequired(_)) {
-            let balance = get_user_balance(&auth.app_id, &auth.user_id, db).await.unwrap_or(0);
-            record_paywall_event(db, &auth.app_id, &auth.user_id, "chat.completion", balance).await;
+            let balance = ledgers.get_user_balance(&auth.account).await.unwrap_or(0);
+            ledgers.record_paywall_event(&auth.account, "chat.completion", balance).await;
         }
         return Err(error);
     }

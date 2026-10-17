@@ -14,6 +14,9 @@ DEV_VARS="$ROOT/.dev.vars"
 DEV_VARS_BACKUP="$ROOT/.dev.vars.test-local-backup"
 LOG="$(mktemp "${TMPDIR:-/tmp}/mako-local-log.XXXXXX")"
 BODY="$(mktemp -t mako-local-body.XXXXXX)"
+IDENTITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mako-local-identity.XXXXXX")"
+IDENTITY_CONFIG="$IDENTITY_DIR/wrangler.toml"
+MINTED="$IDENTITY_DIR/minted.json"
 WEBHOOK_SECRET="local-webhook-secret"
 SERVER_PID=""
 FAILURES=0
@@ -24,7 +27,7 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
   fi
-  rm -f "$CONFIG" "$BODY"
+  rm -rf "$CONFIG" "$BODY" "$IDENTITY_DIR"
   if [ -f "$DEV_VARS_BACKUP" ]; then
     mv "$DEV_VARS_BACKUP" "$DEV_VARS"
   else
@@ -117,6 +120,24 @@ MOCK_PROVIDERS=1
 REVENUECAT_WEBHOOK_AUTH=$WEBHOOK_SECRET
 EOF
 
+prepare_local_identity() {
+  node scripts/local-identity/mint.mjs dream-eater > "$MINTED" || return 1
+  local jwks
+  jwks="$(python3 -I -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["jwks"]))' "$MINTED")" || return 1
+  cat > "$IDENTITY_CONFIG" <<TOML
+name = "midgar-identity"
+main = "$ROOT/scripts/local-identity/worker.mjs"
+compatibility_date = "2024-01-01"
+
+[vars]
+JWKS = '$jwks'
+TOML
+}
+
+minted_token() {
+  python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["tokens"][sys.argv[2]])' "$MINTED" "$1"
+}
+
 rm -rf "$STATE"
 mkdir -p "$STATE"
 
@@ -177,7 +198,11 @@ rm -f "$SEED"
 echo "PASS  seeded tenants, users, the test aliases and rows to delete"
 
 echo "== starting wrangler dev --local with mock providers"
-npx wrangler dev --local --test-scheduled --config "$CONFIG" --persist-to "$STATE" --port "$PORT" >"$LOG" 2>&1 &
+if ! prepare_local_identity; then
+  echo "FAIL  could not mint the throwaway identity key and tokens"
+  exit 1
+fi
+npx wrangler dev --local --test-scheduled --config "$CONFIG" --config "$IDENTITY_CONFIG" --persist-to "$STATE" --port "$PORT" >"$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 240); do
   if curl -s -o /dev/null "$BASE/docs"; then
@@ -247,6 +272,76 @@ for key in "$NEW_KEY" "$SECOND_KEY" "$THIRD_KEY"; do
   call GET /v1/credits/balance "$key"
   check "no key of the deleted account authenticates" 401 "$STATUS"
 done
+
+echo "== tenant spellings and the Midgar token"
+call_with_token() {
+  local path="$1" key="$2" token="$3" app="${4:-dreameater}"
+  STATUS=$(curl -s -o "$BODY" -w '%{http_code}' "$BASE$path" -H "X-App-ID: $app" -H "Authorization: Bearer $key" -H "X-Midgar-Token: $token")
+}
+log_mark() {
+  wc -l < "$LOG" | tr -d ' '
+}
+log_since_has() {
+  local mark="$1" pattern="$2"
+  for _ in $(seq 1 24); do
+    if tail -n +"$((mark + 1))" "$LOG" | grep -q -- "$pattern"; then
+      echo yes
+      return
+    fi
+    sleep 0.25
+  done
+  echo no
+}
+check_token_outcome() {
+  local label="$1" token_name="$2" app="$3" expected_log="$4" token mark
+  token="$(minted_token "$token_name")"
+  mark="$(log_mark)"
+  call_with_token /v1/credits/balance key_free "$token" "$app"
+  check "$label: the request still succeeds on its API key" 200 "$STATUS"
+  check "$label: the balance is the API key's own" 5 "$(json_get balance)"
+  check "$label: logged as '$expected_log'" yes "$(log_since_has "$mark" "$expected_log")"
+}
+check_token_outcome "a valid token" valid dreameater "midgar_token recognised app=dreameater tier=app_attest id=0194f3a2"
+check_token_outcome "a valid token with the registry slug as X-App-ID" valid dream-eater "midgar_token recognised app=dreameater tier=app_attest id=0194f3a2"
+check_token_outcome "a development tier token" development dreameater "midgar_token recognised app=dreameater tier=development id=0194f3a2"
+check_token_outcome "an expired token" expired dreameater "midgar_token ignored app=dreameater reason=expired"
+check_token_outcome "a token with a forged payload" tampered dreameater "midgar_token ignored app=dreameater reason=bad_signature"
+check_token_outcome "a token signed by another key under the published kid" other_key dreameater "midgar_token ignored app=dreameater reason=bad_signature"
+check_token_outcome "a token naming a key identity does not publish" unknown_kid dreameater "midgar_token ignored app=dreameater reason=unknown_key"
+check_token_outcome "a token issued to another app" wrong_app dreameater "midgar_token ignored app=dreameater reason=wrong_app"
+check_token_outcome "a token from another issuer" wrong_issuer dreameater "midgar_token ignored app=dreameater reason=invalid_claims"
+MARK="$(log_mark)"
+call_with_token /v1/credits/balance key_free "not-a-token"
+check "garbage in the token header does not fail the request" 200 "$STATUS"
+check "garbage in the token header is logged as malformed" yes "$(log_since_has "$MARK" "midgar_token ignored app=dreameater reason=malformed")"
+MARK="$(log_mark)"
+call GET /v1/credits/balance key_free
+check "a request without a token is unchanged" 200 "$STATUS"
+sleep 1
+check "a request without a token never touches the token path" no "$(tail -n +"$((MARK + 1))" "$LOG" | grep -q midgar_token && echo yes || echo no)"
+VALID_TOKEN="$(minted_token valid)"
+call GET /v1/credits/balance "$VALID_TOKEN"
+check "a token alone in the bearer slot is not a credential" 401 "$STATUS"
+call_with_token /v1/credits/balance key_unknown "$VALID_TOKEN"
+check "a valid token does not rescue an invalid API key" 401 "$STATUS"
+call GET /v1/credits/balance key_pixie "" pixiepocket
+check "the registry slug of Pixie resolves to its stored tenant" 200 "$STATUS"
+check "the registry slug of Pixie reads the same balance as its own id" 100 "$(json_get balance)"
+call GET /v1/credits/balance key_free "" dream-eater
+check "the registry slug reaches the same user as the stored id" 5 "$(json_get balance)"
+call GET /v1/credits/balance key_pixie "" dream-eater
+check "a user is still only reachable in its own tenant" 401 "$STATUS"
+STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymous" -H "X-App-ID: dream-eater" -H "Content-Type: application/json" --data '{"unverified":true,"device_id":"local-device-slug"}')
+check "anonymous registration with the registry slug succeeds" 200 "$STATUS"
+SLUG_KEY="$(json_get api_key)"
+SLUG_ID="$(json_get user_id)"
+check "a user registered under the slug is stored under the mako id" dreameater "$(sql_value "SELECT app_id FROM users WHERE id = '$SLUG_ID'")"
+check "its welcome credits are stored under the mako id" 1 "$(sql_value "SELECT COUNT(*) FROM user_credits WHERE user_id = '$SLUG_ID' AND app_id = 'dreameater'")"
+check "nothing is stored under the slug" 0 "$(sql_value "SELECT (SELECT COUNT(*) FROM users WHERE app_id = 'dream-eater') + (SELECT COUNT(*) FROM user_credits WHERE app_id = 'dream-eater') + (SELECT COUNT(*) FROM credit_transactions WHERE app_id = 'dream-eater')")"
+call GET /v1/credits/balance "$SLUG_KEY" "" dreameater
+check "that user authenticates under the mako id too" 200 "$STATUS"
+call DELETE /v1/identity "$SLUG_KEY" "" dream-eater
+check "the slug user can delete itself" 200 "$STATUS"
 
 echo "== balance"
 call GET /v1/credits/balance key_free

@@ -3,7 +3,8 @@ use crate::models::{ImageGenerationRequest, ImageEditRequest, ImageResponse, Ima
 use crate::error::AppError;
 use crate::auth;
 use crate::storage::store_image_from_bytes;
-use crate::credits::{check_and_reserve_credits, deduct_credits, get_flat_capability_cost, get_user_balance, record_paywall_event};
+use crate::credits::get_flat_capability_cost;
+use crate::ledgers::{Account, Ledgers};
 use crate::tenant::TenantPolicy;
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 use crate::providers::{self, UnifiedImageRequest, UnifiedEditRequest};
@@ -19,7 +20,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
 
     let auth = {
         let db = env.d1("DB")?;
-        match auth::authenticate(&req, &db).await {
+        match auth::authenticate_with_token(&req, &env, &db).await {
             Ok(a) => a,
             Err(e) => return e.to_response(),
         }
@@ -84,9 +85,9 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         cost_estimate.credits = flat;
     }
 
-    if let Err(e) = check_and_reserve_credits(&app_id, &user_id, cost_estimate.credits, &db).await {
+    if let Err(e) = Ledgers::new(&db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
         let _ = release_lock(&app_id, &user_id, &db).await;
-        return credit_check_failure_response(e, &db, &app_id, &user_id, "image.generate").await;
+        return credit_check_failure_response(e, &db, &auth.account, "image.generate").await;
     }
 
     log_debug!("Sending request to provider", json!({
@@ -202,13 +203,11 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / generation_req.n as u32;
         let description = format!("Generated {} image(s) using {}", images_stored, generation_req.model);
         
-        if let Err(e) = deduct_credits(
-            &app_id,
-            &user_id,
+        if let Err(e) = Ledgers::new(&db).deduct_credits(
+            &auth.account,
             actual_credits_to_charge,
             &description,
             &r2_keys.join(","),
-            &db
         ).await {
             log_error!("Failed to deduct credits", json!({
                 "error": e.to_string(),
@@ -301,7 +300,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
 
     let auth = {
         let db = env.d1("DB")?;
-        match auth::authenticate(&req, &db).await {
+        match auth::authenticate_with_token(&req, &env, &db).await {
             Ok(a) => a,
             Err(e) => return e.to_response(),
         }
@@ -363,9 +362,9 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
 
     let cost_estimate = provider.estimate_edit_cost(&unified_request);
 
-    if let Err(e) = check_and_reserve_credits(&app_id, &user_id, cost_estimate.credits, &db).await {
+    if let Err(e) = Ledgers::new(&db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
         let _ = release_lock(&app_id, &user_id, &db).await;
-        return credit_check_failure_response(e, &db, &app_id, &user_id, "image.edit").await;
+        return credit_check_failure_response(e, &db, &auth.account, "image.edit").await;
     }
 
     log_debug!("Sending edit request to provider", json!({
@@ -479,13 +478,11 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / edit_req.n as u32;
         let description = format!("Edited {} image(s) using {}", images_stored, edit_req.model);
         
-        if let Err(e) = deduct_credits(
-            &app_id,
-            &user_id,
+        if let Err(e) = Ledgers::new(&db).deduct_credits(
+            &auth.account,
             actual_credits_to_charge,
             &description,
             &r2_keys.join(","),
-            &db
         ).await {
             log_error!("Failed to deduct credits", json!({
                 "error": e.to_string(),
@@ -593,14 +590,14 @@ fn returned_image(bytes: &[u8], revised_prompts: &[Option<String>], index: usize
 pub(crate) async fn credit_check_failure_response(
     error: worker::Error,
     db: &D1Database,
-    app_id: &str,
-    user_id: &str,
+    account: &Account,
     capability: &str,
 ) -> Result<Response> {
     let app_error = AppError::from(error);
     if matches!(app_error, AppError::PaymentRequired(_)) {
-        let balance = get_user_balance(app_id, user_id, db).await.unwrap_or(0);
-        record_paywall_event(db, app_id, user_id, capability, balance).await;
+        let ledgers = Ledgers::new(db);
+        let balance = ledgers.get_user_balance(account).await.unwrap_or(0);
+        ledgers.record_paywall_event(account, capability, balance).await;
     }
     app_error.to_response()
 }

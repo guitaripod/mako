@@ -4,8 +4,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use chrono::{Utc, Duration};
 use crate::error::AppError;
-use crate::auth::authenticate;
-use crate::credits::{get_user_balance, get_flat_capability_cost, deduct_credits, add_credits, record_paywall_event};
+use crate::auth::{authenticate, authenticate_with_token};
+use crate::credits::{get_user_balance, get_flat_capability_cost, deduct_credits, add_credits};
+use crate::ledgers::Ledgers;
 
 const CAPABILITY: &str = "realtime.translate";
 const DEFAULT_RATE_CREDITS: u32 = 1; // 1 credit per minute
@@ -74,7 +75,8 @@ pub async fn settle(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 
 async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Result<Response, AppError> {
     let db = ctx.env.d1("DB")?;
-    let auth = authenticate(&req, &db).await?;
+    let auth = authenticate_with_token(&req, &ctx.env, &db).await?;
+    let ledgers = Ledgers::new(&db);
     crate::rate_limit::enforce_write_rate_limit(&ctx.env, &auth.app_id, &auth.user_id, "realtime.start").await?;
 
     let body: StartRequest = req
@@ -90,10 +92,10 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
         .await
         .unwrap_or(DEFAULT_RATE_CREDITS)
         .max(1);
-    let balance = get_user_balance(&auth.app_id, &auth.user_id, &db).await?;
+    let balance = ledgers.get_user_balance(&auth.account).await?;
     let affordable_minutes = balance / rate as i32;
     if affordable_minutes < 1 {
-        record_paywall_event(&db, &auth.app_id, &auth.user_id, CAPABILITY, balance).await;
+        ledgers.record_paywall_event(&auth.account, CAPABILITY, balance).await;
         return Err(AppError::PaymentRequired(format!(
             "Insufficient credits. Need {} per minute, have {}.",
             rate, balance
@@ -105,31 +107,18 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
 
     // Reserve up-front; settle refunds the unused remainder. Deduct BEFORE the
     // mint so a session can never be opened without being paid for.
-    let new_balance = deduct_credits(
-        &auth.app_id,
-        &auth.user_id,
-        reserved_credits,
-        "realtime.translate reservation",
-        &session_id,
-        &db,
-    )
-    .await
+    let new_balance = ledgers
+        .deduct_credits(&auth.account, reserved_credits, "realtime.translate reservation", &session_id)
+        .await
     .map_err(AppError::from)?;
 
     let (client_secret, expires_at) = match mint_ephemeral(&ctx.env, &model, &body.language).await {
         Ok(m) => m,
         Err(e) => {
             // No session was opened — give the reservation back.
-            if let Err(refund_err) = add_credits(
-                &auth.app_id,
-                &auth.user_id,
-                reserved_credits,
-                "refund",
-                "realtime.translate mint failed",
-                Some(&session_id),
-                &db,
-            )
-            .await
+            if let Err(refund_err) = ledgers
+                .add_credits(&auth.account, reserved_credits, "refund", "realtime.translate mint failed", Some(&session_id))
+                .await
             {
                 console_log!(
                     "realtime start: mint failed AND refund of {} credits failed for {}/{}: {:?}",

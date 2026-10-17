@@ -1,5 +1,7 @@
+use std::cell::RefCell;
+
 use serde_json::Value;
-use worker::D1Database;
+use worker::{console_error, D1Database};
 use crate::error::AppError;
 
 /// Per-tenant data-handling and billing switches read from the `apps` row.
@@ -58,6 +60,120 @@ impl TenantPolicy {
     }
 }
 
+/// How long the app table is used before it is read again.
+const ALIASES_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// How long after a failed read the next one waits.
+const ALIASES_RETRY_MS: u64 = 60 * 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppRow {
+    app_id: String,
+    registry_slug: Option<String>,
+}
+
+/// The tenants' two spellings: mako's `apps.app_id` (`dreameater`) and the registry slug (`dream-eater`) that
+/// MidgarKit 4 sends and the Midgar access token carries. Everything mako stores keeps the `app_id`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppAliases {
+    rows: Vec<AppRow>,
+}
+
+impl AppAliases {
+    /// Builds the table from `SELECT app_id, registry_slug FROM apps`; rows without an `app_id` are skipped.
+    pub fn from_rows(rows: &[Value]) -> Self {
+        let rows = rows
+            .iter()
+            .filter_map(|row| {
+                let app_id = row.get("app_id")?.as_str()?.to_string();
+                let registry_slug = row.get("registry_slug").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+                Some(AppRow { app_id, registry_slug })
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// The `apps.app_id` a header value stands for: the value itself when it is an `app_id`, else the app whose
+    /// registry slug it is, else the value unchanged (an unknown tenant behaves exactly as before).
+    pub fn canonical(&self, raw: &str) -> String {
+        if self.rows.iter().any(|row| row.app_id == raw) {
+            return raw.to_string();
+        }
+        self.rows
+            .iter()
+            .find(|row| row.registry_slug.as_deref() == Some(raw))
+            .map(|row| row.app_id.clone())
+            .unwrap_or_else(|| raw.to_string())
+    }
+
+    /// The slug the Midgar access token carries for a canonical `app_id`; an app without one uses its `app_id`,
+    /// which is what migration 030 sets for every tenant whose two names agree.
+    pub fn registry_slug(&self, app_id: &str) -> String {
+        self.rows
+            .iter()
+            .find(|row| row.app_id == app_id)
+            .and_then(|row| row.registry_slug.clone())
+            .unwrap_or_else(|| app_id.to_string())
+    }
+}
+
+/// The alias table of one isolate and when it may be read again.
+#[derive(Debug, Default)]
+struct AliasCache {
+    aliases: AppAliases,
+    next_read_at: u64,
+}
+
+impl AliasCache {
+    fn due(&self, now: u64) -> bool {
+        now >= self.next_read_at
+    }
+
+    fn loaded(&mut self, aliases: AppAliases, now: u64) {
+        self.aliases = aliases;
+        self.next_read_at = now + ALIASES_TTL_MS;
+    }
+
+    fn failed(&mut self, now: u64) {
+        self.next_read_at = now + ALIASES_RETRY_MS;
+    }
+}
+
+thread_local! {
+    static ALIASES: RefCell<AliasCache> = RefCell::new(AliasCache::default());
+}
+
+/// Reads the app table into the isolate's cache when it is older than five minutes. A failed read (for example a
+/// database that predates migration 030) keeps the previous table, an empty one at first, which maps every header
+/// value to itself, and is retried after a minute.
+pub async fn warm_app_aliases(db: &D1Database) {
+    let now = worker::Date::now().as_millis();
+    if !ALIASES.with(|cache| cache.borrow().due(now)) {
+        return;
+    }
+    let read = match db.prepare("SELECT app_id, registry_slug FROM apps ORDER BY app_id").all().await {
+        Ok(result) => result.results::<Value>(),
+        Err(e) => Err(e),
+    };
+    match read {
+        Ok(rows) => ALIASES.with(|cache| cache.borrow_mut().loaded(AppAliases::from_rows(&rows), now)),
+        Err(e) => {
+            console_error!("app alias table could not be read: {:?}", e);
+            ALIASES.with(|cache| cache.borrow_mut().failed(now));
+        }
+    }
+}
+
+/// The `apps.app_id` an `X-App-ID` value stands for, per the cached alias table.
+pub fn canonical_app_id(raw: &str) -> String {
+    ALIASES.with(|cache| cache.borrow().aliases.canonical(raw))
+}
+
+/// The registry slug of a canonical `apps.app_id`, per the cached alias table.
+pub fn registry_slug(app_id: &str) -> String {
+    ALIASES.with(|cache| cache.borrow().aliases.registry_slug(app_id))
+}
+
 fn flag(row: &Value, key: &str, default: bool) -> bool {
     match row.get(key) {
         Some(Value::Bool(b)) => *b,
@@ -109,5 +225,74 @@ mod tests {
     fn boolean_columns_are_understood() {
         let row = json!({"store_prompts": false});
         assert!(!TenantPolicy::from_row(&row).store_prompts);
+    }
+
+    fn production_table() -> AppAliases {
+        AppAliases::from_rows(&[
+            json!({"app_id": "dreameater", "registry_slug": "dream-eater"}),
+            json!({"app_id": "payday", "registry_slug": "pay-day"}),
+            json!({"app_id": "pixie", "registry_slug": "pixiepocket"}),
+            json!({"app_id": "helia", "registry_slug": "helia"}),
+            json!({"app_id": "legacy", "registry_slug": null}),
+        ])
+    }
+
+    #[test]
+    fn both_spellings_resolve_to_the_stored_app_id() {
+        let table = production_table();
+        assert_eq!(table.canonical("dreameater"), "dreameater");
+        assert_eq!(table.canonical("dream-eater"), "dreameater");
+        assert_eq!(table.canonical("pay-day"), "payday");
+        assert_eq!(table.canonical("pixiepocket"), "pixie");
+        assert_eq!(table.canonical("pixie"), "pixie");
+        assert_eq!(table.canonical("helia"), "helia");
+    }
+
+    #[test]
+    fn an_unknown_value_is_left_alone() {
+        let table = production_table();
+        assert_eq!(table.canonical("scrubme"), "scrubme");
+        assert_eq!(table.canonical(""), "");
+        assert_eq!(table.canonical("Dream-Eater"), "Dream-Eater");
+        assert_eq!(AppAliases::default().canonical("dream-eater"), "dream-eater");
+    }
+
+    #[test]
+    fn an_app_id_wins_over_another_apps_slug() {
+        let table = AppAliases::from_rows(&[
+            json!({"app_id": "a", "registry_slug": "b"}),
+            json!({"app_id": "b", "registry_slug": "c"}),
+        ]);
+        assert_eq!(table.canonical("b"), "b");
+        assert_eq!(table.canonical("c"), "b");
+    }
+
+    #[test]
+    fn the_token_slug_of_an_app_falls_back_to_its_app_id() {
+        let table = production_table();
+        assert_eq!(table.registry_slug("dreameater"), "dream-eater");
+        assert_eq!(table.registry_slug("pixie"), "pixiepocket");
+        assert_eq!(table.registry_slug("legacy"), "legacy");
+        assert_eq!(table.registry_slug("unknown"), "unknown");
+    }
+
+    #[test]
+    fn rows_without_an_app_id_and_empty_slugs_are_skipped() {
+        let table = AppAliases::from_rows(&[json!({"registry_slug": "x"}), json!({"app_id": "y", "registry_slug": ""})]);
+        assert_eq!(table.canonical("x"), "x");
+        assert_eq!(table.registry_slug("y"), "y");
+    }
+
+    #[test]
+    fn the_cache_is_read_when_empty_then_every_five_minutes_and_retried_after_a_minute() {
+        let mut cache = AliasCache::default();
+        assert!(cache.due(0));
+        cache.loaded(production_table(), 1_000);
+        assert!(!cache.due(1_000 + ALIASES_TTL_MS - 1));
+        assert!(cache.due(1_000 + ALIASES_TTL_MS));
+        cache.failed(10_000);
+        assert!(!cache.due(10_000 + ALIASES_RETRY_MS - 1));
+        assert!(cache.due(10_000 + ALIASES_RETRY_MS));
+        assert_eq!(cache.aliases.canonical("pay-day"), "payday");
     }
 }

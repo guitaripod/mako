@@ -1,6 +1,8 @@
-use worker::{console_error, Request, D1Database};
+use worker::{console_error, D1Database, Env, Request};
 use crate::api_keys::{self, LookupStep};
 use crate::error::AppError;
+use crate::ledgers::Account;
+use crate::midgar_token::{self, MidgarCaller};
 
 pub fn validate_api_key(req: &Request) -> Result<String, AppError> {
     let auth_header = req.headers()
@@ -21,26 +23,37 @@ pub fn validate_api_key(req: &Request) -> Result<String, AppError> {
     Ok(api_key.to_string())
 }
 
+/// The tenant a request is for: `X-App-ID` (default `pixie`), accepted as either mako's `apps.app_id` or the
+/// registry slug and always returned as the `apps.app_id` every table stores.
 pub fn resolve_app_id(req: &Request) -> String {
-    req.headers()
+    let raw = req.headers()
         .get("X-App-ID")
         .ok()
         .flatten()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "pixie".to_string())
+        .unwrap_or_else(|| "pixie".to_string());
+    crate::tenant::canonical_app_id(&raw)
 }
 
 pub struct AuthedUser {
     pub user_id: String,
     pub app_id: String,
     pub is_admin: bool,
+    pub account: Account,
+    /// The Midgar identity behind a valid `X-Midgar-Token`, when the request carried one. Nothing routes on it
+    /// yet: every account stays `Account::Local` until linking lands.
+    #[allow(dead_code)]
+    pub midgar: Option<MidgarCaller>,
     #[allow(dead_code)]
     pub preferred_model: Option<String>,
 }
 
 fn authed_user_from(value: &serde_json::Value, app_id: String) -> AuthedUser {
+    let user_id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     AuthedUser {
-        user_id: value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        account: Account::local(&app_id, &user_id),
+        midgar: None,
+        user_id,
         app_id,
         is_admin: value.get("is_admin").and_then(|v| v.as_i64()).map(|v| v != 0).unwrap_or(false),
         preferred_model: value.get("preferred_model").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -122,6 +135,15 @@ pub async fn authenticate(req: &Request, db: &D1Database) -> Result<AuthedUser, 
 
     let value = row.ok_or_else(|| AppError::Unauthorized("Invalid API key".to_string()))?;
     Ok(authed_user_from(&value, app_id))
+}
+
+/// Authenticates by API key like `authenticate`, then looks at `X-Midgar-Token`. A valid token is recorded on
+/// the user; a bad or expired one is logged and ignored, so the request proceeds on its API key alone. A request
+/// with a token and no valid API key is rejected exactly as before.
+pub async fn authenticate_with_token(req: &Request, env: &Env, db: &D1Database) -> Result<AuthedUser, AppError> {
+    let mut user = authenticate(req, db).await?;
+    user.midgar = midgar_token::caller_from_request(req, env, &user.app_id).await;
+    Ok(user)
 }
 
 /// Issues an additional key for an existing user and stores only its hash in

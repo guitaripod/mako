@@ -72,7 +72,7 @@ pub async fn get_balance(req: Request, ctx: RouteContext<()>) -> Result<Response
     let env = ctx.env;
 
     let db = env.d1("DB")?;
-    let auth = match auth::authenticate(&req, &db).await {
+    let auth = match auth::authenticate_with_token(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -80,7 +80,7 @@ pub async fn get_balance(req: Request, ctx: RouteContext<()>) -> Result<Response
         return e.to_response();
     }
 
-    let balance = get_user_balance(&auth.app_id, &auth.user_id, &db).await?;
+    let balance = crate::ledgers::Ledgers::new(&db).get_user_balance(&auth.account).await?;
 
     let weekly = crate::handlers::chat_alias::weekly_balances(&db, &auth.app_id, &auth.user_id).await;
 
