@@ -18,6 +18,7 @@ IDENTITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mako-local-identity.XXXXXX")"
 IDENTITY_CONFIG="$IDENTITY_DIR/wrangler.toml"
 MINTED="$IDENTITY_DIR/minted.json"
 WEBHOOK_SECRET="local-webhook-secret"
+LOOKUP_SECRET="local-lookup-secret"
 SERVER_PID=""
 FAILURES=0
 STEPS=0
@@ -131,6 +132,8 @@ compatibility_date = "2024-01-01"
 
 [vars]
 JWKS = '$jwks'
+LOOKUP_SECRET = "$LOOKUP_SECRET"
+KNOWN_IDS = "$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["ids"]["second"].lower())' "$MINTED")"
 TOML
 }
 
@@ -542,6 +545,8 @@ else
   echo "FAIL  scripts/smoke-dreameater.sh"
   FAILURES=$((FAILURES + 1))
 fi
+
+. "$ROOT/scripts/test-local-wallet.sh"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
