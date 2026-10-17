@@ -405,8 +405,9 @@ check "another tenant's consumable event still only tags revenue" "$PIXIE_BEFORE
 
 echo "== privacy page"
 STATUS=$(curl -s -o "$BODY" -w '%{http_code}' "$BASE/privacy/dreameater")
-check "dreameater privacy page 200" 200 "$STATUS"
-check "the page describes deletion" 1 "$(grep -c 'Delete all data' "$BODY")"
+check "dreameater privacy page moves to midgarcorp.cc (P3.08)" 301 "$STATUS"
+LOCATION=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/privacy/dreameater")
+check "the redirect names the registry page" "https://midgarcorp.cc/legal/dream-eater/privacy/" "$LOCATION"
 
 echo "== account deletion"
 call DELETE /v1/identity key_throw
