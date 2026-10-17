@@ -33,19 +33,12 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         Err(e) => console_error!("realtime sweep failed: {:?}", e),
     }
     match env.d1("DB") {
-        Ok(db) => {
-            match auth::backfill_api_key_hashes(&db).await {
-                Ok(n) if n > 0 => console_log!("api key backfill hashed {} users", n),
-                Ok(_) => {}
-                Err(e) => console_error!("api key backfill failed: {:?}", e),
-            }
-            match auth::prune_unused_api_keys(&db).await {
-                Ok(n) if n > 0 => console_log!("api key prune deleted {} unused keys", n),
-                Ok(_) => {}
-                Err(e) => console_error!("api key prune failed: {:?}", e),
-            }
-        }
-        Err(e) => console_error!("api key maintenance could not open the database: {:?}", e),
+        Ok(db) => match auth::prune_unused_api_keys(&db).await {
+            Ok(n) if n > 0 => console_log!("api key prune deleted {} unused keys", n),
+            Ok(_) => {}
+            Err(e) => console_error!("api key prune failed: {:?}", e),
+        },
+        Err(e) => console_error!("api key prune could not open the database: {:?}", e),
     }
 }
 

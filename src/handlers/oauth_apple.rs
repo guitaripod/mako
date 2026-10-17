@@ -173,12 +173,12 @@ pub async fn apple_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Res
         )
     } else {
         let new_user_id = Uuid::new_v4().to_string();
-        let creds = NewCredentials::generate(&new_user_id);
+        let creds = NewCredentials::generate();
         let now = Utc::now().to_rfc3339();
 
         let insert_stmt = db.prepare(
-            "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, api_key_hash, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key_hash, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
 
         insert_stmt
@@ -189,7 +189,6 @@ pub async fn apple_auth_callback(mut req: Request, ctx: RouteContext<()>) -> Res
                 provider_id.into(),
                 claims.email.clone().unwrap_or_default().into(),
                 "Apple User".into(), // Apple doesn't provide name in ID token
-                creds.placeholder.clone().into(),
                 creds.api_key_hash.clone().into(),
                 now.clone().into(),
                 now.into(),

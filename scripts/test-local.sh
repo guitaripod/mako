@@ -131,15 +131,17 @@ echo "PASS  all migrations applied in order to a fresh local D1"
 
 SEED="$(mktemp -t mako-local-seed.XXXXXX)"
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+key_hash() {
+  printf %s "$1" | shasum -a 256 | cut -d' ' -f1
+}
 cat > "$SEED" <<EOF
-INSERT INTO users (id, provider, provider_id, name, api_key, created_at, updated_at, app_id) VALUES
- ('u-free',     'anonymous', 'free',     'Free',     'key_free',     '$NOW', '$NOW', 'dreameater'),
- ('u-premium',  'anonymous', 'premium',  'Premium',  'key_premium',  '$NOW', '$NOW', 'dreameater'),
- ('u-broke',    'anonymous', 'broke',    'Broke',    'key_broke',    '$NOW', '$NOW', 'dreameater'),
- ('u-throw',    'anonymous', 'throw',    'Throw',    'key_throw',    '$NOW', '$NOW', 'dreameater'),
- ('u-pixie',    'anonymous', 'pixie',    'Pixie',    'key_pixie',    '$NOW', '$NOW', 'pixie'),
- ('u-scrub',    'anonymous', 'scrub',    'Scrub',    'key_scrub',    '$NOW', '$NOW', 'scrubme'),
- ('u-backfill', 'anonymous', 'backfill', 'Backfill', 'key_backfill', '$NOW', '$NOW', 'pixie');
+INSERT INTO users (id, provider, provider_id, name, api_key_hash, created_at, updated_at, app_id) VALUES
+ ('u-free',     'anonymous', 'free',     'Free',     '$(key_hash key_free)',     '$NOW', '$NOW', 'dreameater'),
+ ('u-premium',  'anonymous', 'premium',  'Premium',  '$(key_hash key_premium)',  '$NOW', '$NOW', 'dreameater'),
+ ('u-broke',    'anonymous', 'broke',    'Broke',    '$(key_hash key_broke)',    '$NOW', '$NOW', 'dreameater'),
+ ('u-throw',    'anonymous', 'throw',    'Throw',    '$(key_hash key_throw)',    '$NOW', '$NOW', 'dreameater'),
+ ('u-pixie',    'anonymous', 'pixie',    'Pixie',    '$(key_hash key_pixie)',    '$NOW', '$NOW', 'pixie'),
+ ('u-scrub',    'anonymous', 'scrub',    'Scrub',    '$(key_hash key_scrub)',    '$NOW', '$NOW', 'scrubme');
 UPDATE users SET premium_cached = 1, premium_checked_at = '$NOW' WHERE id = 'u-premium';
 INSERT INTO api_keys (key_hash, user_id, app_id, created_at, last_used_at) VALUES
  ('prune-never-used-old', 'u-pixie', 'pixie', '2025-01-01T00:00:00+00:00', NULL),
@@ -197,22 +199,16 @@ echo "PASS  server is up"
 
 echo "== api key hashing"
 call GET /v1/credits/balance key_free
-check "a legacy plaintext key still authenticates" 200 "$STATUS"
-check "the first request wrote the hash" "$(printf key_free | shasum -a 256 | cut -d' ' -f1)" "$(sql_value "SELECT api_key_hash FROM users WHERE id = 'u-free'")"
-check "the first request replaced the plaintext with the placeholder" "hashed:u-free" "$(sql_value "SELECT api_key FROM users WHERE id = 'u-free'")"
+check "a key stored as a legacy hash authenticates" 200 "$STATUS"
 call GET /v1/credits/balance key_free
-check "the same key authenticates by hash afterwards" 200 "$STATUS"
+check "the same key authenticates again" 200 "$STATUS"
+call GET /v1/credits/balance "$(key_hash key_free)"
+check "the stored hash is never a credential" 401 "$STATUS"
 call GET /v1/credits/balance hashed:u-free
-check "a placeholder is never a credential" 401 "$STATUS"
+check "a placeholder left over from before migration 028 is never a credential" 401 "$STATUS"
 call GET /v1/credits/balance key_unknown
 check "an unknown key is rejected" 401 "$STATUS"
-check "the backfill candidate is still plaintext before the cron" key_backfill "$(sql_value "SELECT api_key FROM users WHERE id = 'u-backfill'")"
 curl -s -o /dev/null "$BASE/__scheduled?cron=*/30+*+*+*+*"
-check "the scheduled backfill stored the hash" "$(printf key_backfill | shasum -a 256 | cut -d' ' -f1)" "$(sql_value "SELECT api_key_hash FROM users WHERE id = 'u-backfill'")"
-check "the scheduled backfill replaced the plaintext" "hashed:u-backfill" "$(sql_value "SELECT api_key FROM users WHERE id = 'u-backfill'")"
-check "no plaintext key is left after the backfill" 0 "$(sql_value "SELECT COUNT(*) FROM users WHERE api_key_hash IS NULL AND api_key NOT LIKE 'hashed:%'")"
-call GET /v1/credits/balance key_backfill "" pixie
-check "a backfilled key authenticates by hash" 200 "$STATUS"
 check "the scheduled prune deleted the key never used and created long ago" 0 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = 'prune-never-used-old'")"
 check "the scheduled prune deleted the key last used long ago" 0 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = 'prune-last-used-old'")"
 check "the scheduled prune kept the old key used recently" 1 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = 'prune-created-old-used-now'")"
@@ -222,7 +218,7 @@ STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymo
 check "anonymous registration succeeds" 200 "$STATUS"
 NEW_KEY="$(json_get api_key)"
 NEW_ID="$(json_get user_id)"
-check "a new user stores the placeholder, not the key" "hashed:$NEW_ID" "$(sql_value "SELECT api_key FROM users WHERE id = '$NEW_ID'")"
+check "the users table has no plaintext key column" 0 "$(sql_value "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'api_key'")"
 check "a new user stores the key hash" "$(printf %s "$NEW_KEY" | shasum -a 256 | cut -d' ' -f1)" "$(sql_value "SELECT api_key_hash FROM users WHERE id = '$NEW_ID'")"
 call GET /v1/credits/balance "$NEW_KEY"
 check "a new user's key authenticates" 200 "$STATUS"

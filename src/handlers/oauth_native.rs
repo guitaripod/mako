@@ -114,13 +114,13 @@ pub async fn google_token_auth(mut req: Request, ctx: RouteContext<()>) -> Resul
     } else {
         // Create new user
         let new_user_id = Uuid::new_v4().to_string();
-        let creds = NewCredentials::generate(&new_user_id);
+        let creds = NewCredentials::generate();
         let now = Utc::now().to_rfc3339();
 
         console_log!("Creating new user: {}", new_user_id);
 
         db
-            .prepare("INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key, api_key_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")
+            .prepare("INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
             .bind(&[
                 new_user_id.clone().into(),
                 app_id.clone().into(),
@@ -128,7 +128,6 @@ pub async fn google_token_auth(mut req: Request, ctx: RouteContext<()>) -> Resul
                 "google".into(),
                 token_info.sub.into(),
                 token_info.name.unwrap_or_else(|| "Google User".to_string()).into(),
-                creds.placeholder.clone().into(),
                 creds.api_key_hash.clone().into(),
                 now.clone().into(),
                 now.into(),
@@ -336,7 +335,7 @@ pub async fn apple_token_auth(mut req: Request, ctx: RouteContext<()>) -> Result
         (id, key, admin)
     } else {
         let new_user_id = Uuid::new_v4().to_string();
-        let creds = NewCredentials::generate(&new_user_id);
+        let creds = NewCredentials::generate();
         let now = Utc::now().to_rfc3339();
 
         console_log!("Creating new Apple user: {}", new_user_id);
@@ -345,7 +344,7 @@ pub async fn apple_token_auth(mut req: Request, ctx: RouteContext<()>) -> Result
             .unwrap_or_else(|| format!("{}@privaterelay.appleid.com", claims.sub.chars().take(8).collect::<String>()));
 
         db
-            .prepare("INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key, api_key_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")
+            .prepare("INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
             .bind(&[
                 new_user_id.clone().into(),
                 app_id.clone().into(),
@@ -353,7 +352,6 @@ pub async fn apple_token_auth(mut req: Request, ctx: RouteContext<()>) -> Result
                 "apple".into(),
                 claims.sub.into(),
                 "Apple User".into(),
-                creds.placeholder.clone().into(),
                 creds.api_key_hash.clone().into(),
                 now.clone().into(),
                 now.into(),
