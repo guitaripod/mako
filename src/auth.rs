@@ -238,3 +238,18 @@ pub async fn prune_unused_api_keys(db: &D1Database) -> Result<u32, AppError> {
         .map_err(AppError::from)?;
     Ok(result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_token;
+
+    #[test]
+    fn a_midgar_token_is_told_from_an_api_key_by_its_shape() {
+        assert!(looks_like_token("eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln"));
+        assert!(!looks_like_token("pixie_0194f3a27b1c4d2e9a603c5e8f1b2d47"));
+        assert!(!looks_like_token("eyJonly.onedot"));
+        assert!(!looks_like_token("eyJa.b.c.d"));
+        assert!(!looks_like_token("a.b.c"));
+        assert!(!looks_like_token(""));
+    }
+}

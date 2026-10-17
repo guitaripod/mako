@@ -203,11 +203,12 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / generation_req.n as u32;
         let description = format!("Generated {} image(s) using {}", images_stored, generation_req.model);
         
-        if let Err(e) = Ledgers::new(&env, &db).deduct_credits(
+        if let Err(e) = Ledgers::new(&env, &db).deduct_credits_keyed(
             &auth.account,
             actual_credits_to_charge,
             &description,
             &r2_keys.join(","),
+            &format!("spend:image:{}", Uuid::new_v4()),
         ).await {
             log_error!("Failed to deduct credits", json!({
                 "error": e.to_string(),
@@ -478,11 +479,12 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / edit_req.n as u32;
         let description = format!("Edited {} image(s) using {}", images_stored, edit_req.model);
         
-        if let Err(e) = Ledgers::new(&env, &db).deduct_credits(
+        if let Err(e) = Ledgers::new(&env, &db).deduct_credits_keyed(
             &auth.account,
             actual_credits_to_charge,
             &description,
             &r2_keys.join(","),
+            &format!("spend:image:{}", Uuid::new_v4()),
         ).await {
             log_error!("Failed to deduct credits", json!({
                 "error": e.to_string(),

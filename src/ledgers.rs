@@ -54,6 +54,16 @@ pub fn spend_key(reference: &str) -> String {
     format!("spend:{reference}")
 }
 
+/// The wallet key of a flat-capability charge. A reference the caller named is its idempotency key, so a retry of
+/// the same charge is free. Without one every call is a new charge, so the key carries a nonce and can never be
+/// shared with another call, which would otherwise be answered as a repeat and go unpaid.
+pub fn capability_key(named_reference: Option<&str>, capability: &str, nonce: &str) -> String {
+    match named_reference.filter(|r| !r.is_empty()) {
+        Some(named) => spend_key(named),
+        None => format!("spend:{capability}:{nonce}"),
+    }
+}
+
 /// Every credit read and write a handler makes, addressed by `Account`. A local account runs the D1 code in
 /// `credits` unchanged. A wallet account goes to the Durable Object of its Midgar ID, with an idempotency key per
 /// change, and fails closed with 503 `wallet_unavailable` when the object cannot answer: there is no D1 fallback.
@@ -129,6 +139,9 @@ impl<'a> Ledgers<'a> {
     /// Debits `amount`. A wallet account is charged under `spend:<reference_id>`, so a repeat of the same reference
     /// charges once.
     pub async fn deduct_credits(&self, account: &Account, amount: u32, description: &str, reference_id: &str) -> Result<i32> {
+        if reference_id.is_empty() && matches!(account, Account::Wallet { .. }) {
+            return Err(AppError::InternalError("a wallet charge needs a reference to key it by".to_string()).into());
+        }
         self.deduct_credits_keyed(account, amount, description, reference_id, &spend_key(reference_id)).await
     }
 
@@ -355,6 +368,23 @@ mod tests {
     #[test]
     fn a_spend_key_carries_the_reference() {
         assert_eq!(spend_key("chat:abc"), "spend:chat:abc");
+    }
+
+    #[test]
+    fn a_named_capability_reference_is_the_idempotency_key() {
+        assert_eq!(capability_key(Some("invoice-7"), "peppol.send", "n1"), capability_key(Some("invoice-7"), "peppol.send", "n2"));
+        assert_eq!(capability_key(Some("invoice-7"), "peppol.send", "n1"), "spend:invoice-7");
+    }
+
+    #[test]
+    fn an_unnamed_capability_charge_never_shares_a_key() {
+        for named in [None, Some("")] {
+            let first = capability_key(named, "peppol.send", "n1");
+            let second = capability_key(named, "peppol.send", "n2");
+            assert_ne!(first, second);
+            assert_ne!(first, spend_key("peppol.send"));
+            assert_ne!(first, "spend:");
+        }
     }
 
     #[test]
