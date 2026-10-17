@@ -7,6 +7,8 @@ use crate::purchases::constant_time_eq;
 pub const PLACEHOLDER_PREFIX: &str = "hashed:";
 pub const BACKFILL_BATCH: u32 = 500;
 pub const LAST_USED_REFRESH_HOURS: i64 = 1;
+pub const PRUNE_AFTER_DAYS: i64 = 180;
+pub const PRUNE_BATCH: u32 = 500;
 
 /// SQL `LIKE` pattern that matches every placeholder, used to keep the
 /// backfill and the plaintext fallback away from rows that are already hashed.
@@ -110,6 +112,13 @@ pub fn should_refresh_last_used(last_used_at: Option<&str>, now: DateTime<Utc>) 
         Some(previous) => now.signed_duration_since(previous.with_timezone(&Utc)) >= Duration::hours(LAST_USED_REFRESH_HOURS),
         None => true,
     }
+}
+
+/// The oldest `last_used_at` (or `created_at`, for a key never used) a key may
+/// have and survive the scheduled prune, in the RFC 3339 form both columns are
+/// stored in, so it compares correctly as text.
+pub fn prune_cutoff(now: DateTime<Utc>) -> String {
+    (now - Duration::days(PRUNE_AFTER_DAYS)).to_rfc3339()
 }
 
 #[cfg(test)]
@@ -217,5 +226,36 @@ mod tests {
         assert!(!should_refresh_last_used(Some("2026-10-16T11:00:01Z"), now));
         assert!(!should_refresh_last_used(Some("2026-10-16T12:00:00Z"), now));
         assert!(!should_refresh_last_used(Some("2026-10-16T13:30:00+02:00"), now));
+    }
+
+    #[test]
+    fn the_prune_cutoff_is_180_days_before_now_in_the_stored_format() {
+        let now = DateTime::parse_from_rfc3339("2026-10-16T12:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(prune_cutoff(now), "2026-04-19T12:00:00+00:00");
+    }
+
+    #[test]
+    fn the_prune_cutoff_crosses_a_leap_day_and_a_year_boundary() {
+        let leap = DateTime::parse_from_rfc3339("2028-08-26T00:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(prune_cutoff(leap), "2028-02-28T00:00:00+00:00");
+        let new_year = DateTime::parse_from_rfc3339("2027-03-01T08:30:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(prune_cutoff(new_year), "2026-09-02T08:30:00+00:00");
+    }
+
+    #[test]
+    fn the_prune_cutoff_sorts_as_text_against_timestamps_written_by_the_worker() {
+        let now = DateTime::parse_from_rfc3339("2026-10-16T12:00:00Z").unwrap().with_timezone(&Utc);
+        let cutoff = prune_cutoff(now);
+        let stale = (now - Duration::days(181)).to_rfc3339();
+        let fresh = (now - Duration::days(179)).to_rfc3339();
+        assert!(stale < cutoff);
+        assert!(fresh > cutoff);
+        assert!(now.to_rfc3339() > cutoff);
+    }
+
+    #[test]
+    fn the_prune_batch_is_bounded() {
+        assert_eq!(PRUNE_BATCH, 500);
+        assert_eq!(PRUNE_AFTER_DAYS, 180);
     }
 }

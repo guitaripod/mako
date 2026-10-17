@@ -141,6 +141,11 @@ INSERT INTO users (id, provider, provider_id, name, api_key, created_at, updated
  ('u-scrub',    'anonymous', 'scrub',    'Scrub',    'key_scrub',    '$NOW', '$NOW', 'scrubme'),
  ('u-backfill', 'anonymous', 'backfill', 'Backfill', 'key_backfill', '$NOW', '$NOW', 'pixie');
 UPDATE users SET premium_cached = 1, premium_checked_at = '$NOW' WHERE id = 'u-premium';
+INSERT INTO api_keys (key_hash, user_id, app_id, created_at, last_used_at) VALUES
+ ('prune-never-used-old', 'u-pixie', 'pixie', '2025-01-01T00:00:00+00:00', NULL),
+ ('prune-last-used-old', 'u-pixie', 'pixie', '2025-01-01T00:00:00+00:00', '2025-06-01T00:00:00+00:00'),
+ ('prune-created-old-used-now', 'u-pixie', 'pixie', '2025-01-01T00:00:00+00:00', '$NOW'),
+ ('prune-created-now', 'u-pixie', 'pixie', '$NOW', NULL);
 INSERT INTO user_credits (app_id, user_id, balance, created_at, updated_at) VALUES
  ('dreameater', 'u-free', 5, '$NOW', '$NOW'),
  ('dreameater', 'u-premium', 0, '$NOW', '$NOW'),
@@ -208,6 +213,11 @@ check "the scheduled backfill replaced the plaintext" "hashed:u-backfill" "$(sql
 check "no plaintext key is left after the backfill" 0 "$(sql_value "SELECT COUNT(*) FROM users WHERE api_key_hash IS NULL AND api_key NOT LIKE 'hashed:%'")"
 call GET /v1/credits/balance key_backfill "" pixie
 check "a backfilled key authenticates by hash" 200 "$STATUS"
+check "the scheduled prune deleted the key never used and created long ago" 0 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = 'prune-never-used-old'")"
+check "the scheduled prune deleted the key last used long ago" 0 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = 'prune-last-used-old'")"
+check "the scheduled prune kept the old key used recently" 1 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = 'prune-created-old-used-now'")"
+check "the scheduled prune kept the key created recently" 1 "$(sql_value "SELECT COUNT(*) FROM api_keys WHERE key_hash = 'prune-created-now'")"
+check "the scheduled prune left the user and the balance alone" "u-pixie 100" "$(sql_value "SELECT u.id || ' ' || c.balance FROM users u JOIN user_credits c ON c.user_id = u.id WHERE u.id = 'u-pixie'")"
 STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymous" -H "X-App-ID: dreameater" -H "Content-Type: application/json" --data '{"unverified":true,"device_id":"local-device-1"}')
 check "anonymous registration succeeds" 200 "$STATUS"
 NEW_KEY="$(json_get api_key)"

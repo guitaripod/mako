@@ -221,3 +221,26 @@ pub async fn backfill_api_key_hashes(db: &D1Database) -> Result<u32, AppError> {
         .sum();
     Ok(changed)
 }
+
+/// Deletes up to `PRUNE_BATCH` keys whose last use, or creation when never
+/// used, is older than `PRUNE_AFTER_DAYS`, oldest first, in one bounded
+/// statement. Touches nothing but `api_keys`: a pruned device logs in again and
+/// finds the same user and balance. Returns how many rows it deleted; no key
+/// value is ever logged.
+pub async fn prune_unused_api_keys(db: &D1Database) -> Result<u32, AppError> {
+    let cutoff = api_keys::prune_cutoff(chrono::Utc::now());
+    let result = db
+        .prepare(
+            "DELETE FROM api_keys WHERE key_hash IN (
+                SELECT key_hash FROM api_keys
+                WHERE COALESCE(last_used_at, created_at) < ?1
+                ORDER BY COALESCE(last_used_at, created_at) LIMIT ?2
+            )",
+        )
+        .bind(&[cutoff.into(), api_keys::PRUNE_BATCH.into()])
+        .map_err(AppError::from)?
+        .run()
+        .await
+        .map_err(AppError::from)?;
+    Ok(result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u32)
+}
