@@ -166,7 +166,8 @@ async fn run(
     let charge = art_charge(unit, produced, request.n, premium, settled);
     if charge > 0 {
         let description = format!("Art ({}) x{}", request.style, produced);
-        if let Err(e) = Ledgers::new(env, db).deduct_credits(&auth.account, charge, &description, &reference).await {
+        let key = crate::chat_alias::charge_key(&reference, replays.is_some(), &Uuid::new_v4().to_string());
+        if let Err(e) = Ledgers::new(env, db).deduct_credits_keyed(&auth.account, charge, &description, &reference, &key).await {
             return AppError::from(e).to_response();
         }
     }

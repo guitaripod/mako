@@ -121,23 +121,17 @@ pub async fn record_pending(
         .ok_or_else(|| AppError::InternalError("purchase row vanished".to_string()))
 }
 
-/// Credits a purchase to a wallet account and then marks it `completed`. The order is the point: the grant is
-/// idempotent by its key, so a crash between the two leaves `pending`, which a retry or the cron finishes without a
-/// lost or a doubled credit. Returns true when this call flipped the status, false when it was already completed.
-pub async fn complete_in_wallet<W: WalletTransport>(
+/// Credits a purchase to a wallet account, once per its key. The caller decides whether the purchase may still be
+/// credited; this only performs the idempotent grant.
+pub async fn grant_purchase<W: WalletTransport>(
     db: &impl D1Exec,
     wallets: &W,
     account: &Account,
     purchase: &PurchaseRow,
-) -> Result<bool, AppError> {
+) -> Result<(), AppError> {
     let Account::Wallet { midgar_id, app_id, .. } = account else {
-        return Err(AppError::InternalError("complete_in_wallet needs a wallet account".to_string()));
+        return Err(AppError::InternalError("grant_purchase needs a wallet account".to_string()));
     };
-    match purchase.status.as_str() {
-        "completed" => return Ok(false),
-        "pending" => {}
-        _ => return Err(AppError::NotFound("Purchase not found".to_string())),
-    }
     let (source, description) = source_and_description(purchase);
     let grant = Grant {
         key: grant_key(purchase),
@@ -148,6 +142,27 @@ pub async fn complete_in_wallet<W: WalletTransport>(
         reference: Some(&purchase.id),
     };
     WalletOps { wallets, db }.grant(midgar_id, app_id, &grant).await?;
+    Ok(())
+}
+
+/// Credits a purchase to a wallet account and then marks it `completed`. The order is the point: the grant is
+/// idempotent by its key, so a crash between the two leaves `pending`, which a retry or the cron finishes without a
+/// lost or a doubled credit. The status is read again right before the grant, so a purchase that a concurrent caller
+/// completed through the local balance while the account was being resolved is not credited a second time. Returns
+/// true when this call flipped the status, false when it was already completed.
+pub async fn complete_in_wallet<W: WalletTransport>(
+    db: &impl D1Exec,
+    wallets: &W,
+    account: &Account,
+    purchase: &PurchaseRow,
+) -> Result<bool, AppError> {
+    let current = read(db, &purchase.id).await?.unwrap_or_else(|| purchase.clone());
+    match current.status.as_str() {
+        "completed" => return Ok(false),
+        "pending" => {}
+        _ => return Err(AppError::NotFound("Purchase not found".to_string())),
+    }
+    grant_purchase(db, wallets, account, &current).await?;
     let flipped = db
         .exec(
             "UPDATE credit_purchases SET status = 'completed', completed_at = ?2 WHERE id = ?1 AND status = 'pending'",
@@ -155,6 +170,14 @@ pub async fn complete_in_wallet<W: WalletTransport>(
         )
         .await?;
     Ok(flipped > 0)
+}
+
+/// Puts a purchase back to `pending` after this call claimed it and then could not credit it, so a retry or the cron
+/// finishes the credit instead of the purchase reading as paid out. Only a `completed` row is touched.
+pub async fn release_claim(db: &impl D1Exec, purchase_id: &str) -> Result<(), AppError> {
+    db.exec("UPDATE credit_purchases SET status = 'pending', completed_at = NULL WHERE id = ?1 AND status = 'completed'", &[purchase_id.into()])
+        .await?;
+    Ok(())
 }
 
 /// Ids of RevenueCat purchases that have been `pending` for more than five minutes: the request that recorded them

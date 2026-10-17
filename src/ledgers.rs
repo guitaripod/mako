@@ -54,12 +54,13 @@ pub fn spend_key(reference: &str) -> String {
     format!("spend:{reference}")
 }
 
-/// The wallet key of a flat-capability charge. A reference the caller named is its idempotency key, so a retry of
-/// the same charge is free. Without one every call is a new charge, so the key carries a nonce and can never be
-/// shared with another call, which would otherwise be answered as a repeat and go unpaid.
+/// The wallet key of a flat-capability charge. A reference the caller named is its idempotency key within that
+/// capability, so a retry of the same charge is free and the same reference on another capability is another charge.
+/// Without one every call is a new charge, so the key carries a nonce and can never be shared with another call,
+/// which would otherwise be answered as a repeat and go unpaid.
 pub fn capability_key(named_reference: Option<&str>, capability: &str, nonce: &str) -> String {
     match named_reference.filter(|r| !r.is_empty()) {
-        Some(named) => spend_key(named),
+        Some(named) => format!("spend:{capability}:{named}"),
         None => format!("spend:{capability}:{nonce}"),
     }
 }
@@ -100,16 +101,18 @@ impl<'a> Ledgers<'a> {
     }
 
     /// The wallet account a local user turned into while a request was in flight, if it did: the link lookup a 402
-    /// triggers once, finishing a `moving` link first.
-    async fn relinked(&self, app_id: &str, user_id: &str) -> Option<Account> {
+    /// triggers once, finishing a `moving` link first. A wallet that cannot answer is an error the caller reports as
+    /// 503, not a missing link; any other failure is logged and read as no link.
+    async fn relinked(&self, app_id: &str, user_id: &str) -> Result<Option<Account>> {
         if !self.linking {
-            return None;
+            return Ok(None);
         }
-        match self.linker().ok()?.relink(app_id, user_id).await {
-            Ok(account) => account,
+        match self.linker()?.relink(app_id, user_id).await {
+            Ok(account) => Ok(account),
+            Err(AppError::WalletUnavailable) => Err(AppError::WalletUnavailable.into()),
             Err(e) => {
                 crate::wallet::log::error(&format!("wallet relink failed: {e:?}"));
-                None
+                Ok(None)
             }
         }
     }
@@ -125,7 +128,7 @@ impl<'a> Ledgers<'a> {
         match account {
             Account::Local { app_id, user_id } => {
                 match credits::check_and_reserve_credits(app_id, user_id, required_credits, self.db).await {
-                    Err(e) if is_payment_required(&e) => match self.relinked(app_id, user_id).await {
+                    Err(e) if is_payment_required(&e) => match self.relinked(app_id, user_id).await? {
                         Some(wallet) => Box::pin(self.check_and_reserve_credits(&wallet, required_credits)).await,
                         None => Err(e),
                     },
@@ -151,7 +154,7 @@ impl<'a> Ledgers<'a> {
         match account {
             Account::Local { app_id, user_id } => {
                 match credits::deduct_credits(app_id, user_id, amount, description, reference_id, self.db).await {
-                    Err(e) if is_payment_required(&e) => match self.relinked(app_id, user_id).await {
+                    Err(e) if is_payment_required(&e) => match self.relinked(app_id, user_id).await? {
                         Some(wallet) => Box::pin(self.deduct_credits_keyed(&wallet, amount, description, reference_id, key)).await,
                         None => Err(e),
                     },
@@ -200,7 +203,7 @@ impl<'a> Ledgers<'a> {
     pub async fn reverse(&self, account: &Account, reversal: &Reversal<'_>, transaction_type: &str) -> Result<(i32, u32)> {
         match account {
             Account::Local { app_id, user_id } => {
-                credits::deduct_credits_clamped_with_reference(
+                let (balance, taken) = credits::deduct_credits_clamped_with_reference(
                     app_id,
                     user_id,
                     reversal.amount,
@@ -209,7 +212,14 @@ impl<'a> Ledgers<'a> {
                     reversal.reference,
                     self.db,
                 )
-                .await
+                .await?;
+                if taken >= reversal.amount {
+                    return Ok((balance, taken));
+                }
+                let Some(wallet) = self.relinked(app_id, user_id).await? else { return Ok((balance, taken)) };
+                let rest = Reversal { key: format!("{}:late", reversal.key), amount: reversal.amount - taken, ..reversal.clone() };
+                let (after, also_taken) = Box::pin(self.reverse(&wallet, &rest, transaction_type)).await?;
+                Ok((after, taken + also_taken))
             }
             Account::Wallet { midgar_id, app_id, .. } => Ok(self.ops()?.reverse(midgar_id, app_id, reversal).await?),
         }
@@ -233,7 +243,10 @@ impl<'a> Ledgers<'a> {
     /// The account a stored user has right now, without running the saga: the wallet when a link row exists, local
     /// otherwise. Off, always local.
     pub async fn account_for_user(&self, app_id: &str, user_id: &str) -> Result<Account> {
-        Ok(resolve::account_for_user(self.linking, self.db, app_id, user_id).await?)
+        if !self.linking {
+            return Ok(Account::local(app_id, user_id));
+        }
+        Ok(resolve::account_for_user(true, &self.linker()?, app_id, user_id).await?)
     }
 
     /// Records a RevenueCat purchase as `pending` once per store transaction and returns its id.
@@ -249,9 +262,11 @@ impl<'a> Ledgers<'a> {
         Ok(purchase::record_pending(self.db, app_id, user_id, pack_id, credits, amount_usd_cents, payment_id).await?)
     }
 
-    /// Completes a purchase into whichever account its user has now. A local account keeps the flip-then-grant order
-    /// of `credits::complete_purchase`; a wallet account grants first under the purchase's key and flips after, so a
-    /// crash in between leaves `pending` for a retry to finish.
+    /// Completes a purchase into whichever account its user has now. A wallet account grants first under the
+    /// purchase's key and flips after, so a crash in between leaves `pending` for a retry to finish. A local account
+    /// keeps the flip-then-credit order of `credits::complete_purchase`, but looks at the link again once the flip is
+    /// won: a user who linked while the purchase was being processed is credited in the wallet under the same key a
+    /// concurrent wallet caller uses, so the purchase can never be credited in both places.
     pub async fn complete_purchase(&self, purchase_id: &str) -> Result<()> {
         if !self.linking {
             return credits::complete_purchase(purchase_id, self.db).await;
@@ -260,14 +275,38 @@ impl<'a> Ledgers<'a> {
             return credits::complete_purchase(purchase_id, self.db).await;
         };
         let account = self.account_for_user(&row.app_id, &row.user_id).await?;
-        if matches!(account, Account::Local { .. }) {
-            return credits::complete_purchase(purchase_id, self.db).await;
-        }
         let wallets = self.wallets.as_ref().ok_or(AppError::WalletUnavailable)?;
-        if purchase::complete_in_wallet(self.db, wallets, &account, &row).await? {
-            credits::tag_purchase_attribution(self.db, &row.app_id, &row.user_id, &row.id, &row.pack_id, row.amount_usd_cents).await;
+        if matches!(account, Account::Wallet { .. }) {
+            if purchase::complete_in_wallet(self.db, wallets, &account, &row).await? {
+                credits::tag_purchase_attribution(self.db, &row.app_id, &row.user_id, &row.id, &row.pack_id, row.amount_usd_cents).await;
+            }
+            return Ok(());
         }
-        Ok(())
+        let Some(claimed) = credits::claim_purchase(purchase_id, self.db).await? else {
+            return credits::complete_purchase_already_claimed(purchase_id, self.db).await;
+        };
+        match self.account_for_user(&row.app_id, &row.user_id).await {
+            Ok(Account::Local { .. }) => credits::credit_claimed_purchase(&claimed, purchase_id, self.db).await,
+            Ok(wallet) => {
+                if let Err(e) = purchase::grant_purchase(self.db, wallets, &wallet, &row).await {
+                    self.release_claim(purchase_id).await;
+                    return Err(e.into());
+                }
+                credits::tag_purchase_attribution(self.db, &row.app_id, &row.user_id, &row.id, &row.pack_id, row.amount_usd_cents).await;
+                Ok(())
+            }
+            Err(e) => {
+                self.release_claim(purchase_id).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Puts a claimed purchase back to `pending` after this call could not credit it, so a retry or the cron does.
+    async fn release_claim(&self, purchase_id: &str) {
+        if let Err(e) = purchase::release_claim(self.db, purchase_id).await {
+            crate::wallet::log::error(&format!("purchase {purchase_id} stays completed without a credit: {e:?}"));
+        }
     }
 
     /// Cron: finishes RevenueCat purchases that stayed `pending` for more than five minutes. Returns how many it
@@ -373,7 +412,8 @@ mod tests {
     #[test]
     fn a_named_capability_reference_is_the_idempotency_key() {
         assert_eq!(capability_key(Some("invoice-7"), "peppol.send", "n1"), capability_key(Some("invoice-7"), "peppol.send", "n2"));
-        assert_eq!(capability_key(Some("invoice-7"), "peppol.send", "n1"), "spend:invoice-7");
+        assert_eq!(capability_key(Some("invoice-7"), "peppol.send", "n1"), "spend:peppol.send:invoice-7");
+        assert_ne!(capability_key(Some("invoice-7"), "peppol.send", "n1"), capability_key(Some("invoice-7"), "other.send", "n1"));
     }
 
     #[test]

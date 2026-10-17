@@ -1,6 +1,6 @@
+use super::client::WalletTransport;
 use super::d1::D1Exec;
-use super::link::account_of;
-use super::links;
+use super::link::Linker;
 use super::target::{self, IdentityLookup};
 use crate::error::AppError;
 use crate::ledgers::Account;
@@ -10,16 +10,19 @@ pub fn flag_is_on(value: Option<&str>) -> bool {
     value == Some("on")
 }
 
-/// The account a stored user has right now, without running the saga: the wallet when a link row exists, local
-/// otherwise. With linking off the answer is local and the database is not read.
-pub async fn account_for_user(linking: bool, db: &impl D1Exec, app_id: &str, user_id: &str) -> Result<Account, AppError> {
+/// The account a stored user has right now: the wallet when a link row exists, local otherwise. A link still
+/// `moving` is finished first, so the caller never reaches a wallet that does not hold the migrated balance yet. With
+/// linking off the answer is local and nothing is read.
+pub async fn account_for_user<D: D1Exec, W: WalletTransport>(
+    linking: bool,
+    linker: &Linker<'_, D, W>,
+    app_id: &str,
+    user_id: &str,
+) -> Result<Account, AppError> {
     if !linking {
         return Ok(Account::local(app_id, user_id));
     }
-    Ok(match links::read(db, app_id, user_id).await? {
-        Some(row) => account_of(&row),
-        None => Account::local(app_id, user_id),
-    })
+    Ok(linker.relink(app_id, user_id).await?.unwrap_or_else(|| Account::local(app_id, user_id)))
 }
 
 /// Where a grant addressed to `id` goes. With linking off every id is a local user and nothing is read or asked.

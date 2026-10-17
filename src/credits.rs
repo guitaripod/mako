@@ -582,23 +582,28 @@ pub async fn complete_purchase(
     purchase_id: &str,
     db: &D1Database,
 ) -> Result<()> {
+    match claim_purchase(purchase_id, db).await? {
+        Some(purchase) => credit_claimed_purchase(&purchase, purchase_id, db).await,
+        None => complete_purchase_already_claimed(purchase_id, db).await,
+    }
+}
+
+/// The guarded `pending` to `completed` flip of `complete_purchase`: the purchase row when this call won it, `None`
+/// when the purchase was not pending.
+pub(crate) async fn claim_purchase(purchase_id: &str, db: &D1Database) -> Result<Option<serde_json::Value>> {
     let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "UPDATE credit_purchases SET status = 'completed', completed_at = ?
+         WHERE id = ? AND status = 'pending'
+         RETURNING app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider",
+    )
+    .bind(&[now.into(), purchase_id.into()])?
+    .first::<serde_json::Value>(None)
+    .await
+}
 
-    let claimed = db
-        .prepare(
-            "UPDATE credit_purchases SET status = 'completed', completed_at = ?
-             WHERE id = ? AND status = 'pending'
-             RETURNING app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider",
-        )
-        .bind(&[now.into(), purchase_id.into()])?
-        .first::<serde_json::Value>(None)
-        .await?;
-
-    let purchase = match claimed {
-        Some(p) => p,
-        None => return complete_purchase_already_claimed(purchase_id, db).await,
-    };
-
+/// Adds the credits of a purchase this call just claimed to the D1 balance and tags its ad attribution.
+pub(crate) async fn credit_claimed_purchase(purchase: &serde_json::Value, purchase_id: &str, db: &D1Database) -> Result<()> {
     let app_id = purchase.get("app_id").and_then(|v| v.as_str()).unwrap_or("pixie");
     let user_id = purchase.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
     let pack_id = purchase.get("pack_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -622,7 +627,7 @@ pub async fn complete_purchase(
 /// The status flip in `complete_purchase` matched no row: either the purchase
 /// was already completed by a concurrent caller (idempotent no-op) or it
 /// never existed / is in a terminal non-pending state (a real error).
-async fn complete_purchase_already_claimed(purchase_id: &str, db: &D1Database) -> Result<()> {
+pub(crate) async fn complete_purchase_already_claimed(purchase_id: &str, db: &D1Database) -> Result<()> {
     let status = db
         .prepare("SELECT status FROM credit_purchases WHERE id = ?")
         .bind(&[purchase_id.into()])?

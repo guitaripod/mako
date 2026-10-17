@@ -67,8 +67,9 @@ async fn run(
     let reference = ledger_reference(&request.idempotency_key);
     let mut charge_reference = None;
     if plan.credits > 0 {
+        let key = crate::chat_alias::charge_key(&reference, settlement.key_seen, &uuid::Uuid::new_v4().to_string());
         Ledgers::new(env, db)
-            .deduct_credits(&auth.account, plan.credits, &format!("chat.completion:{}", cfg.alias), &reference)
+            .deduct_credits_keyed(&auth.account, plan.credits, &format!("chat.completion:{}", cfg.alias), &reference, &key)
             .await
             .map_err(AppError::from)?;
         charge_reference = Some(reference.clone());
@@ -176,6 +177,7 @@ async fn load_settlement(
 ) -> Result<Settlement, AppError> {
     let replays = replays_of_key(db, app_id, user_id, &ledger_reference(&request.idempotency_key)).await?;
     let mut settlement = Settlement {
+        key_seen: replays.is_some(),
         key_already_settled: key_replay_is_free(replays),
         ..Settlement::default()
     };

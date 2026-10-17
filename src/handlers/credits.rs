@@ -1653,8 +1653,8 @@ async fn credit_pack_from_event(
     Ok(())
 }
 
-/// Credits a pack to a wallet account. An early return only for a purchase that is `completed`: one left `pending`
-/// by a crash is finished here, and the wallet grant is idempotent by the store transaction id.
+/// Credits a pack to a wallet account. A purchase already settled, whatever its final status, is not credited again;
+/// one left `pending` by a crash is finished here, and the wallet grant is idempotent by the store transaction id.
 async fn credit_pack_to_wallet(
     ledgers: &crate::ledgers::Ledgers<'_>,
     db: &worker::D1Database,
@@ -1664,9 +1664,11 @@ async fn credit_pack_to_wallet(
     pack: &crate::credits::CreditPack,
     pack_id: &str,
 ) -> Result<()> {
-    if crate::wallet::purchase::revenuecat_status(db, app_id, &event.transaction_id).await?.as_deref() == Some("completed") {
-        worker::console_log!("Transaction {} already processed", event.transaction_id);
-        return Ok(());
+    if let Some(status) = crate::wallet::purchase::revenuecat_status(db, app_id, &event.transaction_id).await? {
+        if status != "pending" {
+            worker::console_log!("Transaction {} already processed ({})", event.transaction_id, status);
+            return Ok(());
+        }
     }
     let credits = (pack.credits + pack.bonus_credits) as u32;
     let purchase_id = ledgers

@@ -52,7 +52,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 /// synchronous `X-App-ID` resolution can accept both `dreameater` and `dream-eater`.
 async fn warm_app_aliases_for(req: &Request, env: &Env) {
     let headers = req.headers();
-    let names_tenant = headers.has("X-App-ID").unwrap_or(false) || headers.has(midgar_token::TOKEN_HEADER).unwrap_or(false);
+    let native_bearer = wallet::link::enabled(env)
+        && headers.get("Authorization").ok().flatten().is_some_and(|value| value.starts_with("Bearer eyJ"));
+    let names_tenant = headers.has("X-App-ID").unwrap_or(false) || headers.has(midgar_token::TOKEN_HEADER).unwrap_or(false) || native_bearer;
     if !names_tenant {
         return;
     }

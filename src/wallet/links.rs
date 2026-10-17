@@ -215,6 +215,12 @@ pub async fn midgar_user(db: &impl D1Exec, app_id: &str, midgar_id: &str, now: &
         .ok_or_else(|| AppError::InternalError("midgar user lookup failed".to_string()))
 }
 
+/// Whether a tenant is configured. A Midgar-ID-native request names its tenant only in a header, so nothing else
+/// stops it from creating users and welcome bonuses under a tenant that is not one.
+pub async fn tenant_exists(db: &impl D1Exec, app_id: &str) -> Result<bool, AppError> {
+    Ok(!db.rows("SELECT 1 AS found FROM apps WHERE app_id = ?1", &[app_id.into()]).await?.is_empty())
+}
+
 /// Whether the user exists in the tenant.
 pub async fn user_exists(db: &impl D1Exec, app_id: &str, user_id: &str) -> Result<bool, AppError> {
     Ok(!db.rows("SELECT 1 AS found FROM users WHERE app_id = ?1 AND id = ?2", &[app_id.into(), user_id.into()]).await?.is_empty())

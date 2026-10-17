@@ -3,7 +3,7 @@ use crate::error::AppError;
 use crate::auth::{resolve_app_id, authenticate, authenticate_account, issue_api_key, validate_api_key};
 use crate::api_keys::NewCredentials;
 use crate::credits::{initialize_user_credits, get_user_balance};
-use crate::ledgers::Ledgers;
+use crate::ledgers::{Account, Ledgers};
 use crate::wallet::ops::Grant;
 use crate::wallet::Kind;
 use crate::handlers::oauth_native::validate_apple_identity_token;
@@ -429,14 +429,19 @@ async fn link_inner(
             let ledgers = Ledgers::new(&ctx.env, &db);
             let target = ledgers.account_for_user(&app_id, &existing_id).await?;
             let merged = Grant {
-                key: format!("merge:{}", anon.user_id),
+                key: format!("merge:{}:{}", anon.user_id, Uuid::new_v4()),
                 kind: Kind::Adjust,
                 source: "apple",
                 amount: anon_balance,
                 description: "merge from anonymous",
                 reference: Some(&anon.user_id),
             };
-            ledgers.grant(&target, &merged).await?;
+            if let Err(e) = ledgers.grant(&target, &merged).await {
+                if let Account::Wallet { .. } = &target {
+                    give_back_drained(&ledgers, &app_id, &anon.user_id, anon_balance).await;
+                }
+                return Err(e.into());
+            }
         }
 
         crate::attribution::carry_attribution_across_merge(&db, &app_id, &anon.user_id, &existing_id).await?;
@@ -459,6 +464,15 @@ async fn link_inner(
         user_id: anon.user_id,
     })
     .map_err(AppError::from)
+}
+
+/// Puts credits that were drained from the anonymous user back on its row when the wallet they were headed for could
+/// not take them, so a retry of the merge still finds them. Logged when even that fails.
+async fn give_back_drained(ledgers: &Ledgers<'_>, app_id: &str, anon_user_id: &str, amount: u32) {
+    let source = Account::local(app_id, anon_user_id);
+    if let Err(e) = ledgers.add_credits(&source, amount, "admin_adjustment", "merge undone", Some(anon_user_id)).await {
+        console_log!("merge: could not give {} credits back to {}: {:?}", amount, anon_user_id, e);
+    }
 }
 
 async fn relink_anonymous_to_apple(

@@ -244,9 +244,22 @@ pub fn key_replay_is_free(replays_so_far: Option<u32>) -> bool {
     replays_so_far.map(|r| r < MAX_FREE_REPLAYS).unwrap_or(false)
 }
 
+/// The key a wallet charge is stored under. The first charge of a client key is `spend:<reference>`, so a network
+/// retry that reaches the wallet twice is answered as a repeat. A key whose free repeats are used up and which is
+/// charged again is a new charge, so it gets a nonce; without it the wallet would answer the new charge as a repeat
+/// and the key would read for free forever, which the D1 ledger never allowed.
+pub fn charge_key(reference: &str, key_seen_before: bool, nonce: &str) -> String {
+    if key_seen_before {
+        format!("spend:{reference}:{nonce}")
+    } else {
+        format!("spend:{reference}")
+    }
+}
+
 /// What the ledger and the weekly counter already know about this request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Settlement {
+    pub key_seen: bool,
     pub key_already_settled: bool,
     pub retry_of_settled: bool,
     pub retry_already_used: bool,
@@ -836,6 +849,14 @@ mod tests {
         assert_eq!(parse_openai_reply(&refusal).unwrap_err(), ReplyError::Blocked);
         let anthropic = json!({ "stop_reason": "refusal", "content": [] });
         assert_eq!(parse_anthropic_reply(&anthropic).unwrap_err(), ReplyError::Blocked);
+    }
+
+    #[test]
+    fn a_first_charge_is_keyed_by_its_reference_and_a_recharge_of_a_used_up_key_is_not() {
+        assert_eq!(charge_key("chat:k1", false, "n1"), "spend:chat:k1");
+        assert_eq!(charge_key("chat:k1", false, "n1"), charge_key("chat:k1", false, "n2"));
+        assert_ne!(charge_key("chat:k1", true, "n1"), charge_key("chat:k1", true, "n2"));
+        assert_ne!(charge_key("chat:k1", true, "n1"), charge_key("chat:k1", false, "n1"));
     }
 
     #[test]

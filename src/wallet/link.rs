@@ -133,6 +133,9 @@ impl<D: D1Exec, W: WalletTransport> Linker<'_, D, W> {
     /// the tenant; a Midgar ID with none gets a `provider = 'midgar'` user and a `linked` row. The welcome bonus is
     /// granted once per Midgar ID and tenant, and only to an attested device.
     pub async fn native_account(&self, app_id: &str, caller: &MidgarCaller) -> Result<Account, AppError> {
+        if !links::tenant_exists(self.db, app_id).await? {
+            return Err(AppError::Unauthorized("Invalid API key".to_string()));
+        }
         if let Some(link) = links::oldest_for_midgar(self.db, app_id, &caller.midgar_id).await? {
             return self.settle(link, Some(caller)).await;
         }

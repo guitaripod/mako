@@ -251,6 +251,16 @@ fn a_native_request_creates_a_midgar_user_and_a_linked_row_with_the_welcome_for_
 }
 
 #[test]
+fn a_native_request_for_a_tenant_that_does_not_exist_creates_nothing() {
+    let world = World::new();
+    let result = block_on(world.linker().native_account("dream-eater", &attested()));
+    assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    assert_eq!(world.d1.int("SELECT COUNT(*) FROM users WHERE provider = 'midgar'", &[]), 0);
+    assert_eq!(world.d1.int("SELECT COUNT(*) FROM wallet_links", &[]), 0);
+    assert_eq!(world.wallets.calls.borrow().len(), 0, "no welcome bonus either");
+}
+
+#[test]
 fn only_an_attested_device_gets_the_welcome_bonus() {
     for tier in [Tier::Development, Tier::Unverified] {
         let world = World::new();

@@ -4,6 +4,7 @@ use futures::executor::block_on;
 
 use super::client::WalletTransport;
 use super::d1::D1Exec;
+use super::link::Linker;
 use super::links;
 use super::purchase::{self, PurchaseRow};
 use super::resolve;
@@ -49,6 +50,14 @@ impl D1Exec for NoDb {
     }
     async fn batch(&self, _: &[super::d1::Stmt]) -> Result<(), AppError> {
         panic!("linking off must not write D1")
+    }
+}
+
+struct NoWallet;
+
+impl WalletTransport for NoWallet {
+    async fn send(&self, _: &str, _: &str, _: &str, _: Option<&serde_json::Value>) -> Result<(u16, serde_json::Value), AppError> {
+        panic!("linking off must not reach a wallet")
     }
 }
 
@@ -157,7 +166,8 @@ fn with_linking_off_every_grant_target_is_local_and_nothing_is_read() {
         assert_eq!(block_on(resolve::credit_target(false, &NoDb, &identity, APP, id)).unwrap(), Account::local(APP, id));
     }
     assert_eq!(identity.asked.get(), 0);
-    assert_eq!(block_on(resolve::account_for_user(false, &NoDb, APP, "u1")).unwrap(), Account::local(APP, "u1"));
+    let linker = Linker { db: &NoDb, wallets: &NoWallet };
+    assert_eq!(block_on(resolve::account_for_user(false, &linker, APP, "u1")).unwrap(), Account::local(APP, "u1"));
 }
 
 #[test]
@@ -165,9 +175,24 @@ fn with_linking_off_a_user_with_a_link_row_is_still_local() {
     let d1 = LocalD1::migrated();
     d1.user(APP, "u1", 0);
     link(&d1, "u1", MIDGAR, "linked");
-    assert_eq!(block_on(resolve::account_for_user(false, &d1, APP, "u1")).unwrap(), Account::local(APP, "u1"));
-    assert_eq!(block_on(resolve::account_for_user(true, &d1, APP, "u1")).unwrap(), wallet(MIDGAR, "u1"));
-    assert_eq!(block_on(resolve::account_for_user(true, &d1, APP, "stranger")).unwrap(), Account::local(APP, "stranger"));
+    let wallets = FakeWallets::new();
+    let linker = Linker { db: &d1, wallets: &wallets };
+    assert_eq!(block_on(resolve::account_for_user(false, &linker, APP, "u1")).unwrap(), Account::local(APP, "u1"));
+    assert_eq!(block_on(resolve::account_for_user(true, &linker, APP, "u1")).unwrap(), wallet(MIDGAR, "u1"));
+    assert_eq!(block_on(resolve::account_for_user(true, &linker, APP, "stranger")).unwrap(), Account::local(APP, "stranger"));
+}
+
+#[test]
+fn a_link_that_is_still_moving_is_finished_before_anything_is_addressed_to_it() {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    d1.user(APP, "u1", 25);
+    link(&d1, "u1", MIDGAR, "moving");
+    let linker = Linker { db: &d1, wallets: &wallets };
+    assert_eq!(block_on(resolve::account_for_user(true, &linker, APP, "u1")).unwrap(), wallet(MIDGAR, "u1"));
+    assert_eq!(wallets.balance(MIDGAR, APP), 25, "the balance is in the wallet before a refund or an adjustment reaches it");
+    assert_eq!(d1.d1_balance(APP, "u1"), 0);
+    assert_eq!(d1.int("SELECT COUNT(*) FROM wallet_links WHERE user_id = 'u1' AND state = 'linked'", &[]), 1);
 }
 
 #[test]
@@ -225,6 +250,39 @@ fn the_fast_track_and_the_webhook_share_one_grant() {
     assert!(complete(&d1, &wallets, &first, &account).unwrap());
     assert!(!complete(&d1, &wallets, &second, &account).unwrap(), "already completed: nothing flipped");
     assert_eq!(wallets.balance(MIDGAR, APP), 100);
+}
+
+#[test]
+fn a_purchase_completed_meanwhile_through_the_local_balance_is_not_granted_again() {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    d1.user(APP, "u1", 0);
+    link(&d1, "u1", MIDGAR, "linked");
+    pending(&d1, "p-1", "u1", "revenuecat", "tx-1", 100);
+    let stale = row(&d1, "p-1");
+    d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'p-1'", &[]);
+    let account = wallet(MIDGAR, "u1");
+    let flipped = block_on(purchase::complete_in_wallet(&d1, &wallets, &account, &stale)).unwrap();
+    assert!(!flipped);
+    assert_eq!(wallets.balance(MIDGAR, APP), 0);
+}
+
+#[test]
+fn a_claimed_purchase_can_be_released_for_a_retry_and_then_credits_once() {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    d1.user(APP, "u1", 0);
+    link(&d1, "u1", MIDGAR, "linked");
+    pending(&d1, "p-1", "u1", "revenuecat", "tx-1", 100);
+    d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'p-1'", &[]);
+    block_on(purchase::release_claim(&d1, "p-1")).unwrap();
+    assert_eq!(row(&d1, "p-1").status, "pending");
+    complete(&d1, &wallets, "p-1", &wallet(MIDGAR, "u1")).unwrap();
+    complete(&d1, &wallets, "p-1", &wallet(MIDGAR, "u1")).unwrap();
+    assert_eq!(wallets.balance(MIDGAR, APP), 100);
+    d1.run("UPDATE credit_purchases SET status = 'refunded' WHERE id = 'p-1'", &[]);
+    block_on(purchase::release_claim(&d1, "p-1")).unwrap();
+    assert_eq!(row(&d1, "p-1").status, "refunded", "only a completed row is released");
 }
 
 #[test]
