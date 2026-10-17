@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::books::Books;
-use super::types::{Balance, Entry, StoredEntry, WalletError};
+use super::types::{Balance, Entry, Kind, StoredEntry, WalletError};
 
 /// The wallet books held in memory, for tests that need no SQLite.
 #[derive(Debug, Default)]
@@ -41,6 +41,10 @@ impl Books for MemoryBooks {
     fn entries(&self, tenant: &str, before: Option<i64>, limit: usize) -> Result<Vec<StoredEntry>, WalletError> {
         let upper = before.unwrap_or(i64::MAX);
         Ok(self.rows.iter().rev().filter(|r| r.tenant == tenant && r.seq < upper).take(limit).cloned().collect())
+    }
+
+    fn count(&self, tenant: &str) -> Result<usize, WalletError> {
+        Ok(self.rows.iter().filter(|r| r.tenant == tenant && r.kind != Kind::Marker).count())
     }
 
     fn chronological(&self, tenant: &str) -> Result<Vec<StoredEntry>, WalletError> {

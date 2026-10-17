@@ -82,7 +82,7 @@ pub async fn share(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 
 async fn share_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Result<Response, AppError> {
     let db = ctx.env.d1("DB")?;
-    let auth = auth::authenticate(&req, &db).await?;
+    let auth = auth::authenticate_account(&req, &ctx.env, &db).await?;
     if !SHARING_APPS.contains(&auth.app_id.as_str()) {
         return Err(AppError::Forbidden("Sharing is not available for this app".to_string()));
     }

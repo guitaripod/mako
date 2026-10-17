@@ -199,6 +199,22 @@ fn id_prefix(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Verifies a token a request presents as its only credential. `None` when it is not acceptable, logged like an
+/// ignored header token.
+pub async fn caller_from_token(env: &Env, token: &str, app_id: &str) -> Option<MidgarCaller> {
+    let slug = crate::tenant::registry_slug(app_id);
+    match verify(env, token, &slug).await {
+        Ok(caller) => {
+            console_log!("midgar_token recognised app={} tier={} id={} native", app_id, caller.tier.as_str(), id_prefix(&caller.midgar_id));
+            Some(caller)
+        }
+        Err(rejection) => {
+            console_log!("midgar_token refused app={} reason={} native", app_id, rejection.as_str());
+            None
+        }
+    }
+}
+
 /// Reads `X-Midgar-Token` from a request that already authenticated with its API key. Returns the verified
 /// caller, or `None` when there is no token or it is not acceptable; a bad token is logged and ignored so a
 /// clock or JWKS problem never breaks an app that worked yesterday.

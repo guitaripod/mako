@@ -15,6 +15,9 @@ pub trait Books {
     /// A tenant's entries, newest first, strictly older than `before` when given.
     fn entries(&self, tenant: &str, before: Option<i64>, limit: usize) -> Result<Vec<StoredEntry>, WalletError>;
 
+    /// How many entries a tenant holds that move or record credits, claim markers not counted.
+    fn count(&self, tenant: &str) -> Result<usize, WalletError>;
+
     /// A tenant's entries in the order they were written.
     fn chronological(&self, tenant: &str) -> Result<Vec<StoredEntry>, WalletError>;
 

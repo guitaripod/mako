@@ -4,9 +4,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use chrono::{Utc, Duration};
 use crate::error::AppError;
-use crate::auth::{authenticate, authenticate_with_token};
-use crate::credits::{get_user_balance, get_flat_capability_cost, deduct_credits, add_credits};
-use crate::ledgers::Ledgers;
+use crate::auth::{authenticate_account, authenticate_with_token};
+use crate::credits::get_flat_capability_cost;
+use crate::ledgers::{Account, Ledgers};
+use crate::wallet::ops::Grant;
+use crate::wallet::Kind;
 
 const CAPABILITY: &str = "realtime.translate";
 const DEFAULT_RATE_CREDITS: u32 = 1; // 1 credit per minute
@@ -76,7 +78,7 @@ pub async fn settle(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Result<Response, AppError> {
     let db = ctx.env.d1("DB")?;
     let auth = authenticate_with_token(&req, &ctx.env, &db).await?;
-    let ledgers = Ledgers::new(&db);
+    let ledgers = Ledgers::new(&ctx.env, &db);
     crate::rate_limit::enforce_write_rate_limit(&ctx.env, &auth.app_id, &auth.user_id, "realtime.start").await?;
 
     let body: StartRequest = req
@@ -116,10 +118,15 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
         Ok(m) => m,
         Err(e) => {
             // No session was opened — give the reservation back.
-            if let Err(refund_err) = ledgers
-                .add_credits(&auth.account, reserved_credits, "refund", "realtime.translate mint failed", Some(&session_id))
-                .await
-            {
+            let refund = Grant {
+                key: format!("refund:{session_id}"),
+                kind: Kind::Refund,
+                source: "usage",
+                amount: reserved_credits,
+                description: "realtime.translate mint failed",
+                reference: Some(&session_id),
+            };
+            if let Err(refund_err) = ledgers.grant(&auth.account, &refund).await {
                 console_log!(
                     "realtime start: mint failed AND refund of {} credits failed for {}/{}: {:?}",
                     reserved_credits, auth.app_id, auth.user_id, refund_err
@@ -162,7 +169,8 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
 
 async fn settle_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Result<Response, AppError> {
     let db = ctx.env.d1("DB")?;
-    let auth = authenticate(&req, &db).await?;
+    let auth = authenticate_account(&req, &ctx.env, &db).await?;
+    let ledgers = Ledgers::new(&ctx.env, &db);
     let body: SettleRequest = req
         .json()
         .await
@@ -187,7 +195,7 @@ async fn settle_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::R
     let rate = row.get("rate_credits").and_then(|v| v.as_i64()).unwrap_or(1).max(1) as i32;
 
     if already_settled {
-        return settled_noop(&auth.app_id, &auth.user_id, &db).await;
+        return settled_noop(&ledgers, &auth.account).await;
     }
 
     let actual = body.minutes_used.max(0);
@@ -209,10 +217,10 @@ async fn settle_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::R
         .await?;
     let won = claim.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0;
     if !won {
-        return settled_noop(&auth.app_id, &auth.user_id, &db).await;
+        return settled_noop(&ledgers, &auth.account).await;
     }
 
-    match bill_settlement(&auth.app_id, &auth.user_id, actual, rate, reserved_credits, &body.session_id, &db).await {
+    match bill_settlement(&ledgers, &auth.account, actual, rate, reserved_credits, &body.session_id).await {
         Ok((balance, refund)) => {
             console_log!(
                 "realtime settle app={} minutes={} refund={} balance={}",
@@ -243,12 +251,8 @@ async fn settle_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::R
     }
 }
 
-async fn settled_noop(
-    app_id: &str,
-    user_id: &str,
-    db: &worker::D1Database,
-) -> std::result::Result<Response, AppError> {
-    let balance = get_user_balance(app_id, user_id, db).await?;
+async fn settled_noop(ledgers: &Ledgers<'_>, account: &Account) -> std::result::Result<Response, AppError> {
+    let balance = ledgers.get_user_balance(account).await?;
     Response::from_json(&SettleResponse {
         settled: true,
         minutes_charged: 0,
@@ -263,30 +267,36 @@ async fn settled_noop(
 /// session ran over, or refunds the unused guard when it ran under. Returns the
 /// resulting balance and the refunded amount.
 async fn bill_settlement(
-    app_id: &str,
-    user_id: &str,
+    ledgers: &Ledgers<'_>,
+    account: &Account,
     actual: i32,
     rate: i32,
     reserved_credits: i32,
     session_id: &str,
-    db: &worker::D1Database,
 ) -> std::result::Result<(i32, i32), AppError> {
     let charged = actual * rate;
-    let mut balance = get_user_balance(app_id, user_id, db).await?;
+    let mut balance = ledgers.get_user_balance(account).await?;
     let mut refund: i32 = 0;
     if charged > reserved_credits {
         let extra = (charged - reserved_credits).min(balance.max(0)) as u32;
         if extra > 0 {
-            balance = deduct_credits(app_id, user_id, extra, "realtime.translate", session_id, db)
+            balance = ledgers
+                .deduct_credits_keyed(account, extra, "realtime.translate", session_id, &format!("settle:{session_id}"))
                 .await
                 .map_err(AppError::from)?;
         }
     } else {
         refund = (reserved_credits - charged).max(0);
         if refund > 0 {
-            balance = add_credits(app_id, user_id, refund as u32, "refund", "realtime.translate unused", Some(session_id), db)
-                .await
-                .map_err(AppError::from)?;
+            let unused = Grant {
+                key: format!("settle:{session_id}"),
+                kind: Kind::Refund,
+                source: "usage",
+                amount: refund as u32,
+                description: "realtime.translate unused",
+                reference: Some(session_id),
+            };
+            balance = ledgers.grant(account, &unused).await.map_err(AppError::from)?.balance;
         }
     }
     Ok((balance, refund))
@@ -304,6 +314,7 @@ async fn bill_settlement(
 /// over-eager sweep is forgoing a charge, never overcharging a user.
 pub async fn sweep_orphaned_reservations(env: &Env) -> std::result::Result<u32, AppError> {
     let db = env.d1("DB")?;
+    let ledgers = Ledgers::new(env, &db);
     let cutoff = (Utc::now() - Duration::hours(2)).to_rfc3339();
     let rows = db
         .prepare(
@@ -340,8 +351,20 @@ pub async fn sweep_orphaned_reservations(env: &Env) -> std::result::Result<u32, 
         }
 
         if reserved > 0 {
-            match add_credits(&app_id, &user_id, reserved as u32, "refund", "realtime.translate orphaned reservation", Some(&id), &db).await {
-                Ok(_) => {
+            let orphan = Grant {
+                key: format!("sweep:{id}"),
+                kind: Kind::Refund,
+                source: "usage",
+                amount: reserved as u32,
+                description: "realtime.translate orphaned reservation",
+                reference: Some(&id),
+            };
+            let granted = match ledgers.account_for_user(&app_id, &user_id).await {
+                Ok(target) => ledgers.grant(&target, &orphan).await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            match granted {
+                Ok(()) => {
                     let _ = db
                         .prepare("UPDATE realtime_sessions SET refunded_credits = ?1 WHERE id = ?2")
                         .bind(&[reserved.into(), id.clone().into()])?

@@ -37,6 +37,12 @@ API_BASE_URL = "https://openai-image-proxy.guitaripod.workers.dev"
 # Environment
 ENVIRONMENT = "production"
 
+# P3.07 wallets. "on" links users who present a Midgar token to their Midgar ID wallet, resolves Midgar-ID-native
+# requests and routes every credit change through the wallet when the user has a link. Anything else leaves every
+# account on its D1 balance and runs none of that code. Needs the IDENTITY_LOOKUP_SECRET secret for grants addressed
+# to a Midgar ID no user is linked to yet; see docs/p3.07-wallet-design.md.
+WALLET_LINKING = "off"
+
 # Rate-limit enforcement switch. "false" = shadow (log would-be-limits, never
 # block); "true" = enforce. Kept off until shadow logs confirm no legit traffic
 # trips the generous per-user thresholds.

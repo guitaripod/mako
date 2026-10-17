@@ -1,8 +1,11 @@
 use worker::{Request, Response, RouteContext, Result, console_log, D1Database, Fetch, Method, Headers, RequestInit, RateLimiter};
 use crate::error::AppError;
-use crate::auth::{resolve_app_id, authenticate, issue_api_key, validate_api_key};
+use crate::auth::{resolve_app_id, authenticate, authenticate_account, issue_api_key, validate_api_key};
 use crate::api_keys::NewCredentials;
-use crate::credits::{initialize_user_credits, add_credits, get_user_balance};
+use crate::credits::{initialize_user_credits, get_user_balance};
+use crate::ledgers::Ledgers;
+use crate::wallet::ops::Grant;
+use crate::wallet::Kind;
 use crate::handlers::oauth_native::validate_apple_identity_token;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -423,16 +426,17 @@ async fn link_inner(
 
         let anon_balance = drain_wallet(&db, &app_id, &anon.user_id).await?;
         if anon_balance > 0 {
-            add_credits(
-                &app_id,
-                &existing_id,
-                anon_balance,
-                "admin_adjustment",
-                "merge from anonymous",
-                Some(&anon.user_id),
-                &db,
-            )
-            .await?;
+            let ledgers = Ledgers::new(&ctx.env, &db);
+            let target = ledgers.account_for_user(&app_id, &existing_id).await?;
+            let merged = Grant {
+                key: format!("merge:{}", anon.user_id),
+                kind: Kind::Adjust,
+                source: "apple",
+                amount: anon_balance,
+                description: "merge from anonymous",
+                reference: Some(&anon.user_id),
+            };
+            ledgers.grant(&target, &merged).await?;
         }
 
         crate::attribution::carry_attribution_across_merge(&db, &app_id, &anon.user_id, &existing_id).await?;
@@ -531,10 +535,13 @@ const USER_DATA_TABLES: &[&str] = &[
 /// caller can only ever delete their own account.
 pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
-    let auth = match authenticate(&req, &db).await {
+    let auth = match authenticate_account(&req, &ctx.env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
+    if let Err(e) = Ledgers::new(&ctx.env, &db).erase_partition(&auth.account).await {
+        return AppError::from(e).to_response();
+    }
     let uid = auth.user_id;
 
     purge_user_images(&ctx.env, &db, &uid).await?;
@@ -593,7 +600,7 @@ async fn purge_user_images(env: &worker::Env, db: &D1Database, uid: &str) -> std
 /// without sharing mako's database.
 pub async fn identity_me(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
-    let auth = match authenticate(&req, &db).await {
+    let auth = match authenticate_account(&req, &ctx.env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -624,8 +631,9 @@ pub async fn charge_capability(mut req: Request, ctx: RouteContext<()>) -> Resul
         return AppError::BadRequest(format!("Unknown or free capability: {}", capability)).to_response();
     }
     let reference = body.get("reference").and_then(|v| v.as_str()).unwrap_or(capability);
-    match crate::ledgers::Ledgers::new(&db).deduct_credits(&auth.account, cost, capability, reference).await {
+    match crate::ledgers::Ledgers::new(&ctx.env, &db).deduct_credits(&auth.account, cost, capability, reference).await {
         Ok(balance) => Response::from_json(&json!({ "charged": cost, "balance": balance })),
+        Err(e) if crate::error::is_wallet_unavailable(&e) => AppError::WalletUnavailable.to_response(),
         Err(_) => AppError::PaymentRequired(format!("Insufficient credits for {}", capability)).to_response(),
     }
 }

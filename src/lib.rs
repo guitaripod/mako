@@ -43,6 +43,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         },
         Err(e) => console_error!("api key prune could not open the database: {:?}", e),
     }
+    if let Ok(db) = env.d1("DB") {
+        ledgers::Ledgers::new(&env, &db).run_wallet_cron().await;
+    }
 }
 
 /// Loads the tenant spellings table before a request that names a tenant or carries a Midgar token, so the

@@ -1,6 +1,9 @@
 use worker::{Response, Result};
 use crate::models::{ErrorResponse, ErrorDetail};
 
+/// Seconds a client is told to wait after a 503 `wallet_unavailable`.
+const WALLET_RETRY_AFTER_SECONDS: &str = "5";
+
 #[derive(Debug)]
 pub enum AppError {
     BadRequest(String),
@@ -13,6 +16,7 @@ pub enum AppError {
     RateLimitExceeded,
     Truncated,
     ContentBlocked,
+    WalletUnavailable,
 }
 
 impl AppError {
@@ -28,6 +32,7 @@ impl AppError {
             AppError::RateLimitExceeded => (429, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.".to_string(), "rate_limit_exceeded"),
             AppError::Truncated => (422, "generation_error", "The reply was cut off before it finished. Nothing was charged. Try again.".to_string(), "truncated"),
             AppError::ContentBlocked => (422, "generation_error", "The provider declined to process this text. Nothing was charged.".to_string(), "content_blocked"),
+            AppError::WalletUnavailable => (503, "service_unavailable", "Your credit balance is temporarily unavailable. Please try again in a moment.".to_string(), "wallet_unavailable"),
         };
 
         let error_response = ErrorResponse {
@@ -43,8 +48,25 @@ impl AppError {
         if let AppError::RateLimitExceeded = self {
             resp.headers_mut().set("Retry-After", "60")?;
         }
+        if let AppError::WalletUnavailable = self {
+            resp.headers_mut().set("Retry-After", WALLET_RETRY_AFTER_SECONDS)?;
+        }
         Ok(resp)
     }
+}
+
+/// True when a worker error carries `AppError::WalletUnavailable`, which every wallet failure is mapped to.
+pub fn is_wallet_unavailable(error: &worker::Error) -> bool {
+    error.to_string().starts_with("AppError::WalletUnavailable::")
+}
+
+/// Answers a wallet outage with its 503, and hands any other error back untouched, for handlers that let a ledger
+/// failure propagate as they always did.
+pub fn wallet_outage_response(error: worker::Error) -> Result<Response> {
+    if is_wallet_unavailable(&error) {
+        return AppError::WalletUnavailable.to_response();
+    }
+    Err(error)
 }
 
 impl From<worker::Error> for AppError {
@@ -78,6 +100,9 @@ impl From<worker::Error> for AppError {
         if error_str.starts_with("AppError::ContentBlocked::") {
             return AppError::ContentBlocked;
         }
+        if error_str.starts_with("AppError::WalletUnavailable::") {
+            return AppError::WalletUnavailable;
+        }
         if let Some(msg) = error_str.strip_prefix("AppError::InternalError::") {
             return AppError::InternalError(msg.to_string());
         }
@@ -99,6 +124,7 @@ impl From<AppError> for worker::Error {
             AppError::RateLimitExceeded => "AppError::RateLimitExceeded::".to_string(),
             AppError::Truncated => "AppError::Truncated::".to_string(),
             AppError::ContentBlocked => "AppError::ContentBlocked::".to_string(),
+            AppError::WalletUnavailable => "AppError::WalletUnavailable::".to_string(),
         };
         worker::Error::RustError(encoded)
     }

@@ -85,9 +85,9 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         cost_estimate.credits = flat;
     }
 
-    if let Err(e) = Ledgers::new(&db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
+    if let Err(e) = Ledgers::new(&env, &db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
         let _ = release_lock(&app_id, &user_id, &db).await;
-        return credit_check_failure_response(e, &db, &auth.account, "image.generate").await;
+        return credit_check_failure_response(e, &env, &db, &auth.account, "image.generate").await;
     }
 
     log_debug!("Sending request to provider", json!({
@@ -203,7 +203,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / generation_req.n as u32;
         let description = format!("Generated {} image(s) using {}", images_stored, generation_req.model);
         
-        if let Err(e) = Ledgers::new(&db).deduct_credits(
+        if let Err(e) = Ledgers::new(&env, &db).deduct_credits(
             &auth.account,
             actual_credits_to_charge,
             &description,
@@ -362,9 +362,9 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
 
     let cost_estimate = provider.estimate_edit_cost(&unified_request);
 
-    if let Err(e) = Ledgers::new(&db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
+    if let Err(e) = Ledgers::new(&env, &db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
         let _ = release_lock(&app_id, &user_id, &db).await;
-        return credit_check_failure_response(e, &db, &auth.account, "image.edit").await;
+        return credit_check_failure_response(e, &env, &db, &auth.account, "image.edit").await;
     }
 
     log_debug!("Sending edit request to provider", json!({
@@ -478,7 +478,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / edit_req.n as u32;
         let description = format!("Edited {} image(s) using {}", images_stored, edit_req.model);
         
-        if let Err(e) = Ledgers::new(&db).deduct_credits(
+        if let Err(e) = Ledgers::new(&env, &db).deduct_credits(
             &auth.account,
             actual_credits_to_charge,
             &description,
@@ -589,13 +589,14 @@ fn returned_image(bytes: &[u8], revised_prompts: &[Option<String>], index: usize
 /// funnel shows who ran out, not just who paid. Any other failure answers as before.
 pub(crate) async fn credit_check_failure_response(
     error: worker::Error,
+    env: &worker::Env,
     db: &D1Database,
     account: &Account,
     capability: &str,
 ) -> Result<Response> {
     let app_error = AppError::from(error);
     if matches!(app_error, AppError::PaymentRequired(_)) {
-        let ledgers = Ledgers::new(db);
+        let ledgers = Ledgers::new(env, db);
         let balance = ledgers.get_user_balance(account).await.unwrap_or(0);
         ledgers.record_paywall_event(account, capability, balance).await;
     }

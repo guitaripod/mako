@@ -2,6 +2,7 @@ use worker::{console_error, D1Database, Env, Request};
 use crate::api_keys::{self, LookupStep};
 use crate::error::AppError;
 use crate::ledgers::Account;
+use crate::wallet::link;
 use crate::midgar_token::{self, MidgarCaller};
 
 pub fn validate_api_key(req: &Request) -> Result<String, AppError> {
@@ -40,9 +41,8 @@ pub struct AuthedUser {
     pub app_id: String,
     pub is_admin: bool,
     pub account: Account,
-    /// The Midgar identity behind a valid `X-Midgar-Token`, when the request carried one. Nothing routes on it
-    /// yet: every account stays `Account::Local` until linking lands.
-    #[allow(dead_code)]
+    /// The Midgar identity behind a valid `X-Midgar-Token`, or behind the bearer of a Midgar-ID-native request.
+    /// Only read when `WALLET_LINKING` is on.
     pub midgar: Option<MidgarCaller>,
     #[allow(dead_code)]
     pub preferred_model: Option<String>,
@@ -139,10 +139,65 @@ pub async fn authenticate(req: &Request, db: &D1Database) -> Result<AuthedUser, 
 
 /// Authenticates by API key like `authenticate`, then looks at `X-Midgar-Token`. A valid token is recorded on
 /// the user; a bad or expired one is logged and ignored, so the request proceeds on its API key alone. A request
-/// with a token and no valid API key is rejected exactly as before.
+/// with a token and no valid API key is rejected exactly as before. With `WALLET_LINKING` on, the account is then
+/// resolved through the wallet link (see `authenticate_linked`).
 pub async fn authenticate_with_token(req: &Request, env: &Env, db: &D1Database) -> Result<AuthedUser, AppError> {
+    if link::enabled(env) {
+        return authenticate_linked(req, env, db).await;
+    }
     let mut user = authenticate(req, db).await?;
     user.midgar = midgar_token::caller_from_request(req, env, &user.app_id).await;
+    Ok(user)
+}
+
+/// The authentication every credit-aware handler uses. With `WALLET_LINKING` off it is `authenticate` and nothing
+/// else runs, so the request is exactly what it was before wallets; on, it is `authenticate_linked`.
+pub async fn authenticate_account(req: &Request, env: &Env, db: &D1Database) -> Result<AuthedUser, AppError> {
+    if link::enabled(env) {
+        return authenticate_linked(req, env, db).await;
+    }
+    authenticate(req, db).await
+}
+
+/// True for the shape of an access token: `eyJ` (a base64url `{"`) and exactly two dots. No API key looks like it.
+fn looks_like_token(bearer: &str) -> bool {
+    bearer.starts_with("eyJ") && bearer.matches('.').count() == 2
+}
+
+/// Authentication with wallets on. A bearer that is a Midgar access token is a Midgar-ID-native request. Anything
+/// else authenticates by API key; its `X-Midgar-Token`, when valid, links the user to that Midgar ID on the first
+/// request, and a user who already has a link is on the wallet whether or not the request carries a token.
+async fn authenticate_linked(req: &Request, env: &Env, db: &D1Database) -> Result<AuthedUser, AppError> {
+    let bearer = validate_api_key(req)?;
+    if looks_like_token(&bearer) {
+        return authenticate_native(req, env, db, &bearer).await;
+    }
+    let mut user = authenticate(req, db).await?;
+    user.midgar = midgar_token::caller_from_request(req, env, &user.app_id).await;
+    let live = link::Live::open(env, db)?;
+    user.account = live.linker().account_for_request(&user.app_id, &user.user_id, user.midgar.as_ref()).await?;
+    Ok(user)
+}
+
+/// A request with only a Midgar token in the bearer slot: the token is the credential, so a bad one is a 401.
+async fn authenticate_native(req: &Request, env: &Env, db: &D1Database, token: &str) -> Result<AuthedUser, AppError> {
+    let app_id = resolve_app_id(req);
+    let caller = midgar_token::caller_from_token(env, token, &app_id)
+        .await
+        .ok_or_else(|| AppError::Unauthorized("Invalid API key".to_string()))?;
+    let live = link::Live::open(env, db)?;
+    let account = live.linker().native_account(&app_id, &caller).await?;
+    let row = db
+        .prepare("SELECT id, is_admin, preferred_model FROM users WHERE app_id = ? AND id = ?")
+        .bind(&[app_id.clone().into(), account.user_id().into()])
+        .map_err(AppError::from)?
+        .first::<serde_json::Value>(None)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::Unauthorized("Invalid API key".to_string()))?;
+    let mut user = authed_user_from(&row, app_id);
+    user.account = account;
+    user.midgar = Some(caller);
     Ok(user)
 }
 

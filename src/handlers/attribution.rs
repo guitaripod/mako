@@ -39,7 +39,7 @@ pub async fn submit(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     let env = ctx.env;
     let db = env.d1("DB")?;
 
-    let auth = match auth::authenticate(&req, &db).await {
+    let auth = match auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -131,7 +131,7 @@ pub async fn keywords(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
     let db = env.d1("DB")?;
 
-    let auth = match auth::authenticate(&req, &db).await {
+    let auth = match auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };

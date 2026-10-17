@@ -2,8 +2,8 @@ use worker::{Request, Response, RouteContext, Result, Env, Fetch, Method, Header
 use crate::error::AppError;
 use crate::auth;
 use crate::credits::{
-    get_user_balance, get_user_transactions, get_credit_packs, get_credit_packs_for_app,
-    record_purchase, complete_purchase, record_and_complete_purchase, add_credits, estimate_image_cost
+    get_user_transactions, get_credit_packs, get_credit_packs_for_app,
+    record_purchase, record_and_complete_purchase, estimate_image_cost
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -80,7 +80,10 @@ pub async fn get_balance(req: Request, ctx: RouteContext<()>) -> Result<Response
         return e.to_response();
     }
 
-    let balance = crate::ledgers::Ledgers::new(&db).get_user_balance(&auth.account).await?;
+    let balance = match crate::ledgers::Ledgers::new(&env, &db).get_user_balance(&auth.account).await {
+        Ok(balance) => balance,
+        Err(e) => return crate::error::wallet_outage_response(e),
+    };
 
     let weekly = crate::handlers::chat_alias::weekly_balances(&db, &auth.app_id, &auth.user_id).await;
 
@@ -114,7 +117,7 @@ pub async fn list_transactions(req: Request, ctx: RouteContext<()>) -> Result<Re
     let offset = (page - 1) * per_page;
 
     let db = env.d1("DB")?;
-    let auth = match auth::authenticate(&req, &db).await {
+    let auth = match auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -122,6 +125,21 @@ pub async fn list_transactions(req: Request, ctx: RouteContext<()>) -> Result<Re
     let app_id = auth.app_id.clone();
     if let Err(e) = crate::rate_limit::enforce_read_rate_limit(&env, &app_id, &user_id, "transactions").await {
         return e.to_response();
+    }
+
+    if let crate::ledgers::Account::Wallet { .. } = &auth.account {
+        let ledgers = crate::ledgers::Ledgers::new(&env, &db);
+        return match ledgers.wallet_transactions(&auth.account, offset, per_page).await {
+            Ok((transactions, total)) => Response::from_json(&json!({
+                "transactions": transactions,
+                "total": total,
+                "limit": per_page,
+                "offset": offset,
+                "page": page,
+                "per_page": per_page,
+            })),
+            Err(e) => crate::error::wallet_outage_response(e),
+        };
     }
 
     let count_stmt = db.prepare("SELECT COUNT(*) as total FROM credit_transactions WHERE app_id = ? AND user_id = ?");
@@ -194,7 +212,7 @@ pub async fn purchase_credits(mut req: Request, ctx: RouteContext<()>) -> Result
 
     let auth = {
         let db = env.d1("DB")?;
-        match auth::authenticate(&req, &db).await {
+        match auth::authenticate_account(&req, &env, &db).await {
             Ok(a) => a,
             Err(e) => return e.to_response(),
         }
@@ -292,7 +310,7 @@ pub async fn admin_adjust_credits(mut req: Request, ctx: RouteContext<()>) -> Re
 
     let auth = {
         let db = env.d1("DB")?;
-        match auth::authenticate(&req, &db).await {
+        match auth::authenticate_account(&req, &env, &db).await {
             Ok(a) => a,
             Err(e) => return e.to_response(),
         }
@@ -321,26 +339,14 @@ pub async fn admin_adjust_credits(mut req: Request, ctx: RouteContext<()>) -> Re
 
     let description = format!("Admin adjustment by {}: {}", admin_user_id, adjust_req.reason);
     
-    let new_balance = if adjust_req.amount > 0 {
-        add_credits(
-            &app_id,
-            &adjust_req.user_id,
-            adjust_req.amount as u32,
-            "admin_adjustment",
-            &description,
-            None,
-            &db,
-        ).await?
-    } else {
-        let (new_balance, _actual_deduction) = crate::credits::deduct_credits_clamped(
-            &app_id,
-            &adjust_req.user_id,
-            adjust_req.amount.unsigned_abs(),
-            "admin_adjustment",
-            &description,
-            &db,
-        ).await?;
-        new_balance
+    let ledgers = crate::ledgers::Ledgers::new(&env, &db);
+    let adjusted = match ledgers.account_for_user(&app_id, &adjust_req.user_id).await {
+        Ok(target) => admin_adjust(&ledgers, &target, adjust_req.amount, &description).await,
+        Err(e) => Err(e),
+    };
+    let new_balance = match adjusted {
+        Ok(balance) => balance,
+        Err(e) => return crate::error::wallet_outage_response(e),
     };
     
     Response::from_json(&json!({
@@ -351,12 +357,25 @@ pub async fn admin_adjust_credits(mut req: Request, ctx: RouteContext<()>) -> Re
     }))
 }
 
+/// Applies an admin adjustment to an account: a credit once under a fresh `admin:<uuid>` key, or a debit clamped to
+/// what the account holds. Returns the balance after.
+async fn admin_adjust(ledgers: &crate::ledgers::Ledgers<'_>, target: &crate::ledgers::Account, amount: i32, description: &str) -> Result<i32> {
+    use crate::wallet::ops::{Grant, Reversal};
+    let key = format!("admin:{}", uuid::Uuid::new_v4());
+    if amount > 0 {
+        let grant = Grant { key, kind: crate::wallet::Kind::Adjust, source: "admin", amount: amount as u32, description, reference: None };
+        return Ok(ledgers.grant(target, &grant).await?.balance);
+    }
+    let reversal = Reversal { key, kind: crate::wallet::Kind::Adjust, source: "admin", amount: amount.unsigned_abs(), description, reference: None };
+    Ok(ledgers.reverse(target, &reversal, "admin_adjustment").await?.0)
+}
+
 pub async fn admin_search_users(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
 
     let app_id = {
         let db = env.d1("DB")?;
-        let auth = match auth::authenticate(&req, &db).await {
+        let auth = match auth::authenticate_account(&req, &env, &db).await {
             Ok(a) => a,
             Err(e) => return e.to_response(),
         };
@@ -445,14 +464,57 @@ pub async fn admin_search_users(req: Request, ctx: RouteContext<()>) -> Result<R
         })
         .collect();
     
+    let users = add_wallet_balances(&env, &db, &app_id, users).await;
     Response::from_json(&users)
+}
+
+/// The wallet balances, purchases and spends of a tenant from the advisory `wallet_summary` mirror, all zero while
+/// linking is off so the admin numbers stay what they were.
+async fn wallet_summary_totals(env: &Env, db: &worker::D1Database, app_id: &str) -> Result<(i64, i64, i64)> {
+    if !crate::wallet::link::enabled(env) {
+        return Ok((0, 0, 0));
+    }
+    let row = db
+        .prepare("SELECT COALESCE(SUM(balance), 0) AS balance, COALESCE(SUM(purchased), 0) AS purchased, COALESCE(SUM(spent), 0) AS spent FROM wallet_summary WHERE app_id = ?")
+        .bind(&[app_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    let read = |column: &str| row.as_ref().and_then(|r| r.get(column)).and_then(|v| v.as_i64()).unwrap_or(0);
+    Ok((read("balance"), read("purchased"), read("spent")))
+}
+
+/// Adds each listed user's wallet balance, from the mirror, to the credits the D1 row shows. Linking off leaves the
+/// list untouched.
+async fn add_wallet_balances(env: &Env, db: &worker::D1Database, app_id: &str, mut users: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    if !crate::wallet::link::enabled(env) {
+        return users;
+    }
+    for user in users.iter_mut() {
+        let id = user.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let statement = db
+            .prepare(
+                "SELECT s.balance AS balance FROM wallet_links l
+                 JOIN wallet_summary s ON s.app_id = l.app_id AND s.midgar_id = l.midgar_id
+                 WHERE l.app_id = ?1 AND l.user_id = ?2",
+            )
+            .bind(&[app_id.into(), id.into()]);
+        let row = match statement {
+            Ok(statement) => statement.first::<serde_json::Value>(None).await.ok().flatten(),
+            Err(_) => None,
+        };
+        if let Some(balance) = row.and_then(|r| r.get("balance").and_then(|v| v.as_i64())) {
+            let credits = user.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
+            user["credits"] = json!(credits + balance);
+        }
+    }
+    users
 }
 
 pub async fn admin_system_stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
 
     let db = env.d1("DB")?;
-    let auth = match auth::authenticate(&req, &db).await {
+    let auth = match auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -493,6 +555,11 @@ pub async fn admin_system_stats(req: Request, ctx: RouteContext<()>) -> Result<R
         .await?
         .and_then(|v| v.get("total").and_then(|c| c.as_i64()))
         .unwrap_or(0);
+
+    let (wallet_balance, wallet_purchased, wallet_spent) = wallet_summary_totals(&env, &db, &app_id).await?;
+    let total_credits_balance = total_credits_balance + wallet_balance;
+    let total_purchased = total_purchased + wallet_purchased;
+    let total_spent = total_spent + wallet_spent;
 
     let total_revenue = db
         .prepare("SELECT SUM(amount_usd_cents) as total FROM credit_purchases WHERE app_id = ? AND status = 'completed'")
@@ -563,7 +630,7 @@ pub async fn crypto_payment_webhook(mut req: Request, ctx: RouteContext<()>) -> 
         let db = env.d1("DB")?;
         
         // Complete the purchase using the order_id (which is our purchase_id)
-        complete_purchase(&webhook.order_id, &db).await?;
+        crate::ledgers::Ledgers::new(&env, &db).complete_purchase(&webhook.order_id).await?;
     }
     
     Response::ok("OK")
@@ -604,7 +671,7 @@ pub async fn get_purchase_status(_req: Request, ctx: RouteContext<()>) -> Result
                 Ok(crypto_status) => {
                     // If payment is finished, complete the purchase
                     if crypto_status == "finished" || crypto_status == "confirmed" {
-                        complete_purchase(&purchase_id, &db).await?;
+                        crate::ledgers::Ledgers::new(&env, &db).complete_purchase(&purchase_id).await?;
                         
                         Response::from_json(&json!({
                             "purchase_id": purchase_id,
@@ -644,7 +711,7 @@ pub async fn get_purchase_status(_req: Request, ctx: RouteContext<()>) -> Result
                 Ok(session) => {
                     // If payment is completed, complete the purchase
                     if session.payment_status == "paid" {
-                        complete_purchase(&purchase_id, &db).await?;
+                        crate::ledgers::Ledgers::new(&env, &db).complete_purchase(&purchase_id).await?;
                         
                         Response::from_json(&json!({
                             "purchase_id": purchase_id,
@@ -689,7 +756,7 @@ pub async fn create_stripe_checkout(mut req: Request, ctx: RouteContext<()>) -> 
 
     let user_id = {
         let db = env.d1("DB")?;
-        let auth = match auth::authenticate(&req, &db).await {
+        let auth = match auth::authenticate_account(&req, &env, &db).await {
             Ok(a) => a,
             Err(e) => return e.to_response(),
         };
@@ -813,7 +880,7 @@ pub async fn stripe_webhook(mut req: Request, ctx: RouteContext<()>) -> Result<R
                 // Extract purchase_id from metadata
                 if let Some(purchase_id) = session.metadata.get("purchase_id") {
                     let db = env.d1("DB")?;
-                    complete_purchase(purchase_id, &db).await?;
+                    crate::ledgers::Ledgers::new(&env, &db).complete_purchase(purchase_id).await?;
                     worker::console_log!("Completed purchase: {}", purchase_id);
                 }
             }
@@ -871,7 +938,7 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
 
     let auth = {
         let db = env.d1("DB")?;
-        match auth::authenticate(&req, &db).await {
+        match auth::authenticate_account(&req, &env, &db).await {
             Ok(a) => a,
             Err(e) => return e.to_response(),
         }
@@ -939,11 +1006,12 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
     // Verify with RevenueCat BEFORE granting anything. The authenticated webhook
     // (revenuecat_webhook) is the authoritative, idempotent source of truth; this
     // client path is a fast-track that must never grant on an unverified or failed check.
+    let revenuecat_customer = auth.account.midgar_id().unwrap_or(&user_id).to_string();
     let validation_result = validate_with_revenuecat(
         &env,
         &db,
         &app_id,
-        &user_id,
+        &revenuecat_customer,
         &validate_req.purchase_token,
         &validate_req.product_id,
         &validate_req.platform,
@@ -967,18 +1035,40 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
         }
     }
 
-    let purchase_id = record_and_complete_purchase(
-        &app_id,
-        &user_id,
-        &validate_req.pack_id,
-        total_credits as u32,
-        pack.price_usd_cents as u32,
-        "revenuecat",
-        &validate_req.purchase_token,
-        &db,
-    ).await?;
+    let ledgers = crate::ledgers::Ledgers::new(&env, &db);
+    let purchase_id = if let crate::ledgers::Account::Wallet { .. } = &auth.account {
+        let credited = async {
+            let id = ledgers
+                .record_pending_purchase(&app_id, &user_id, &validate_req.pack_id, total_credits as u32, pack.price_usd_cents as u32, &validate_req.purchase_token)
+                .await?;
+            ledgers.complete_purchase(&id).await?;
+            Ok::<String, worker::Error>(id)
+        }
+        .await;
+        match credited {
+            Ok(id) => id,
+            Err(e) => {
+                worker::console_log!("RevenueCat fast-track could not credit the wallet, deferring to webhook: {:?}", e);
+                return AppError::InternalError("Could not verify the purchase right now; it will be credited shortly.".to_string()).to_response();
+            }
+        }
+    } else {
+        record_and_complete_purchase(
+            &app_id,
+            &user_id,
+            &validate_req.pack_id,
+            total_credits as u32,
+            pack.price_usd_cents as u32,
+            "revenuecat",
+            &validate_req.purchase_token,
+            &db,
+        ).await?
+    };
 
-    let new_balance = get_user_balance(&app_id, &user_id, &db).await?;
+    let new_balance = match ledgers.get_user_balance(&auth.account).await {
+        Ok(balance) => balance,
+        Err(e) => return crate::error::wallet_outage_response(e),
+    };
 
     Response::from_json(&ValidateRevenueCatPurchaseResponse {
         success: true,
@@ -1471,7 +1561,7 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
                 worker::console_log!("Ignoring sandbox event {} in production", event.id);
                 return Response::ok("OK");
             }
-            credit_pack_from_event(&db, event, &app_id, &prefix).await?;
+            credit_pack_from_event(&env, &db, event, &app_id, &prefix).await?;
         },
         EventAction::TagRevenueOnly => {
             tag_revenuecat_revenue(&db, event).await;
@@ -1482,7 +1572,7 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
                     worker::console_log!("Ignoring sandbox event {} in production", event.id);
                     return Response::ok("OK");
                 }
-                reverse_pack_refund(&db, event, &app_id, &prefix).await?;
+                reverse_pack_refund(&env, &db, event, &app_id, &prefix).await?;
             }
         },
         EventAction::LogOnly => {
@@ -1504,6 +1594,7 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
 /// the client validate call records the same `(app, "revenuecat", transaction id)`
 /// row, so whichever path arrives first credits and the other finds it.
 async fn credit_pack_from_event(
+    env: &Env,
     db: &worker::D1Database,
     event: &RevenueCatEvent,
     app_id: &str,
@@ -1526,6 +1617,14 @@ async fn credit_pack_from_event(
     };
 
     let total_credits = pack.credits + pack.bonus_credits;
+
+    let ledgers = crate::ledgers::Ledgers::new(env, db);
+    if ledgers.linking() {
+        let target = ledgers.credit_target(app_id, &event.app_user_id).await?;
+        if let crate::ledgers::Account::Wallet { user_id, .. } = &target {
+            return credit_pack_to_wallet(&ledgers, db, event, app_id, user_id, pack, &pack_id).await;
+        }
+    }
 
     let existing = db.prepare(
         "SELECT id FROM credit_purchases WHERE app_id = ? AND payment_id = ? AND payment_provider = 'revenuecat'"
@@ -1554,6 +1653,30 @@ async fn credit_pack_from_event(
     Ok(())
 }
 
+/// Credits a pack to a wallet account. An early return only for a purchase that is `completed`: one left `pending`
+/// by a crash is finished here, and the wallet grant is idempotent by the store transaction id.
+async fn credit_pack_to_wallet(
+    ledgers: &crate::ledgers::Ledgers<'_>,
+    db: &worker::D1Database,
+    event: &RevenueCatEvent,
+    app_id: &str,
+    user_id: &str,
+    pack: &crate::credits::CreditPack,
+    pack_id: &str,
+) -> Result<()> {
+    if crate::wallet::purchase::revenuecat_status(db, app_id, &event.transaction_id).await?.as_deref() == Some("completed") {
+        worker::console_log!("Transaction {} already processed", event.transaction_id);
+        return Ok(());
+    }
+    let credits = (pack.credits + pack.bonus_credits) as u32;
+    let purchase_id = ledgers
+        .record_pending_purchase(app_id, user_id, pack_id, credits, pack.price_usd_cents as u32, &event.transaction_id)
+        .await?;
+    ledgers.complete_purchase(&purchase_id).await?;
+    worker::console_log!("Processed RevenueCat purchase {} for app {} wallet user {}", purchase_id, app_id, user_id);
+    Ok(())
+}
+
 /// Takes back the credits of a refunded credit-pack purchase, down to a zero
 /// balance, once per transaction. A product that is not a credit pack, or a
 /// transaction that never credited anything, is left alone, so subscriptions
@@ -1561,6 +1684,7 @@ async fn credit_pack_from_event(
 /// repeated delivery a no-op; it is released again if the reversal fails so
 /// RevenueCat's retry can finish the job.
 async fn reverse_pack_refund(
+    env: &Env,
     db: &worker::D1Database,
     event: &RevenueCatEvent,
     app_id: &str,
@@ -1610,16 +1734,20 @@ async fn reverse_pack_refund(
     }
 
     let reference = crate::purchases::refund_reference(&event.transaction_id);
-    let reversed = crate::credits::deduct_credits_clamped_with_reference(
-        app_id,
-        &user_id,
-        credits,
-        "admin_adjustment",
-        &format!("App Store refund reversed: {} pack", pack_id),
-        Some(&reference),
-        db,
-    )
-    .await;
+    let description = format!("App Store refund reversed: {} pack", pack_id);
+    let ledgers = crate::ledgers::Ledgers::new(env, db);
+    let reversal = crate::wallet::ops::Reversal {
+        key: format!("reverse:{}", event.transaction_id),
+        kind: crate::wallet::Kind::Reversal,
+        source: "revenuecat",
+        amount: credits,
+        description: &description,
+        reference: Some(&reference),
+    };
+    let reversed = match ledgers.account_for_user(app_id, &user_id).await {
+        Ok(account) => ledgers.reverse(&account, &reversal, "admin_adjustment").await,
+        Err(e) => Err(e),
+    };
     match reversed {
         Ok((_, taken)) => {
             db.prepare("UPDATE credit_purchases SET status = 'refunded' WHERE id = ?1")

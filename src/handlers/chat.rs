@@ -138,7 +138,7 @@ async fn chat_completion_inner(
 ) -> std::result::Result<Response, AppError> {
     let db = ctx.env.d1("DB")?;
     let auth = authenticate_with_token(&req, &ctx.env, &db).await?;
-    let ledgers = Ledgers::new(&db);
+    let ledgers = Ledgers::new(&ctx.env, &db);
     crate::rate_limit::enforce_write_rate_limit(&ctx.env, &auth.app_id, &auth.user_id, "chat.completion").await?;
 
     let raw = req

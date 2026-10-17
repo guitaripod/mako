@@ -48,7 +48,7 @@ async fn run(
         && crate::handlers::credits::is_premium_user(env, db, &auth.app_id, &auth.user_id).await;
     let mut plan = plan_charge(cfg, premium, used_before, settlement);
 
-    ensure_affordable(db, auth, &plan).await?;
+    ensure_affordable(env, db, auth, &plan).await?;
 
     let system = compose_system_prompt(&cfg.system_prompt, request.language.as_deref());
     let turns = compose_turns(&request.messages, &request.input);
@@ -60,14 +60,14 @@ async fn run(
             consumed_weekly = true;
         } else {
             plan = plan_after_lost_weekly_race(cfg);
-            ensure_affordable(db, auth, &plan).await?;
+            ensure_affordable(env, db, auth, &plan).await?;
         }
     }
 
     let reference = ledger_reference(&request.idempotency_key);
     let mut charge_reference = None;
     if plan.credits > 0 {
-        Ledgers::new(db)
+        Ledgers::new(env, db)
             .deduct_credits(&auth.account, plan.credits, &format!("chat.completion:{}", cfg.alias), &reference)
             .await
             .map_err(AppError::from)?;
@@ -79,11 +79,11 @@ async fn run(
     Ok(respond(cfg, &reply, &plan, charge_reference, free_remaining(cfg, used_before, consumed_weekly))?)
 }
 
-async fn ensure_affordable(db: &D1Database, auth: &AuthedUser, plan: &ChargePlan) -> Result<(), AppError> {
+async fn ensure_affordable(env: &Env, db: &D1Database, auth: &AuthedUser, plan: &ChargePlan) -> Result<(), AppError> {
     if plan.credits == 0 {
         return Ok(());
     }
-    let ledgers = Ledgers::new(db);
+    let ledgers = Ledgers::new(env, db);
     if let Err(e) = ledgers.check_and_reserve_credits(&auth.account, plan.credits).await {
         let error = AppError::from(e);
         if matches!(error, AppError::PaymentRequired(_)) {

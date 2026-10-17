@@ -4,8 +4,10 @@ use serde_json::json;
 use worker::{Request, Response, Result, RouteContext};
 
 use crate::auth;
-use crate::ledgers::Ledgers;
+use crate::ledgers::{Account, Ledgers};
 use crate::error::AppError;
+use crate::wallet::ops::Grant;
+use crate::wallet::Kind;
 use crate::rate_limit::enforce_write_rate_limit;
 
 /// Tenants whose clients may hand back a charge. Psywave charges before it
@@ -52,23 +54,8 @@ async fn refund_charge_inner(mut req: Request, ctx: RouteContext<()>) -> std::re
         return Err(AppError::BadRequest("Invalid charge reference".to_string()));
     }
 
-    let spend = db
-        .prepare(
-            "SELECT amount, created_at FROM credit_transactions
-             WHERE app_id = ? AND user_id = ? AND type = 'spend' AND reference_id = ?
-             LIMIT 1",
-        )
-        .bind(&[auth.app_id.clone().into(), auth.user_id.clone().into(), reference.clone().into()])?
-        .first::<serde_json::Value>(None)
-        .await?
-        .ok_or_else(|| AppError::NotFound("No such charge".to_string()))?;
-
-    let amount = spend.get("amount").and_then(|a| a.as_i64()).unwrap_or(0).abs();
-    let charged_at = spend
-        .get("created_at")
-        .and_then(|c| c.as_str())
-        .and_then(|c| DateTime::parse_from_rfc3339(c).ok())
-        .map(|c| c.with_timezone(&Utc));
+    let ledgers = Ledgers::new(&ctx.env, &db);
+    let (amount, charged_at) = find_spend(&ledgers, &db, &auth, &reference).await?;
     let now = Utc::now();
     if amount == 0 {
         return Err(AppError::Conflict("Nothing to refund".to_string()));
@@ -109,10 +96,15 @@ async fn refund_charge_inner(mut req: Request, ctx: RouteContext<()>) -> std::re
     }
 
     let refund_reference = format!("refund:{}", reference);
-    let balance = match Ledgers::new(&db)
-        .add_credits(&auth.account, amount as u32, "refund", "Refund: result unavailable", Some(&refund_reference))
-        .await
-    {
+    let refund = Grant {
+        key: refund_reference.clone(),
+        kind: Kind::Refund,
+        source: "usage",
+        amount: amount as u32,
+        description: "Refund: result unavailable",
+        reference: Some(&refund_reference),
+    };
+    let balance = match ledgers.grant(&auth.account, &refund).await.map(|granted| granted.balance) {
         Ok(balance) => balance,
         Err(e) => {
             release_claim(&reference, &db).await;
@@ -121,6 +113,40 @@ async fn refund_charge_inner(mut req: Request, ctx: RouteContext<()>) -> std::re
     };
 
     Ok(Response::from_json(&json!({ "refunded": amount, "balance": balance }))?)
+}
+
+/// The amount and time of the spend a reference names, from the wallet for a wallet account and from the D1 ledger
+/// for a local one.
+async fn find_spend(
+    ledgers: &Ledgers<'_>,
+    db: &worker::D1Database,
+    auth: &auth::AuthedUser,
+    reference: &str,
+) -> std::result::Result<(i64, Option<DateTime<Utc>>), AppError> {
+    if let Account::Wallet { .. } = &auth.account {
+        let entry = ledgers
+            .wallet_spend(&auth.account, reference)
+            .await?
+            .ok_or_else(|| AppError::NotFound("No such charge".to_string()))?;
+        return Ok((entry.amount.abs(), DateTime::from_timestamp(entry.at, 0)));
+    }
+    let spend = db
+        .prepare(
+            "SELECT amount, created_at FROM credit_transactions
+             WHERE app_id = ? AND user_id = ? AND type = 'spend' AND reference_id = ?
+             LIMIT 1",
+        )
+        .bind(&[auth.app_id.clone().into(), auth.user_id.clone().into(), reference.into()])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such charge".to_string()))?;
+    let amount = spend.get("amount").and_then(|a| a.as_i64()).unwrap_or(0).abs();
+    let charged_at = spend
+        .get("created_at")
+        .and_then(|c| c.as_str())
+        .and_then(|c| DateTime::parse_from_rfc3339(c).ok())
+        .map(|c| c.with_timezone(&Utc));
+    Ok((amount, charged_at))
 }
 
 /// Frees a claim whose credit never landed, so the charge stays refundable.

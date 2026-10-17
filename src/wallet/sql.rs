@@ -21,6 +21,12 @@ impl From<i64> for Val {
     }
 }
 
+impl From<String> for Val {
+    fn from(value: String) -> Self {
+        Val::Text(value)
+    }
+}
+
 impl From<&str> for Val {
     fn from(value: &str) -> Self {
         Val::Text(value.to_string())
@@ -157,6 +163,11 @@ impl<S: SqlExec> Books for SqlBooks<S> {
             &[tenant.into(), before.unwrap_or(MAX_SEQ).into(), (limit as i64).into()],
         )?;
         rows.iter().map(|row| stored(row)).collect()
+    }
+
+    fn count(&self, tenant: &str) -> Result<usize, WalletError> {
+        let rows = self.query("SELECT COUNT(*) FROM entries WHERE tenant = ? AND kind != 'marker'", &[tenant.into()])?;
+        rows.first().map(|row| int(row, 0).map(|n| n as usize)).transpose().map(|n| n.unwrap_or(0))
     }
 
     fn chronological(&self, tenant: &str) -> Result<Vec<StoredEntry>, WalletError> {

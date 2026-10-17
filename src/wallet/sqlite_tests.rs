@@ -1,43 +1,12 @@
-use rusqlite::types::ValueRef;
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::Connection;
 use serde_json::json;
 
 use super::books::Books;
 use super::ledger::apply;
 use super::sql::{self, SqlBooks, SqlExec, Val};
 use super::tests::{self as scenarios, call, entry, NOW};
+use super::testing::Rusqlite;
 use super::types::{Kind, WalletError};
-
-/// `SqlExec` over an in-memory `rusqlite` connection, running the object's real queries.
-struct Rusqlite(Connection);
-
-impl SqlExec for Rusqlite {
-    fn run(&self, sql: &str, params: &[Val]) -> Result<Vec<Vec<Val>>, WalletError> {
-        let storage = |e: rusqlite::Error| WalletError::Storage(e.to_string());
-        let mut statement = self.0.prepare(sql).map_err(storage)?;
-        let columns = statement.column_count();
-        let bound = params.iter().map(|v| match v {
-            Val::Null => rusqlite::types::Value::Null,
-            Val::Int(n) => rusqlite::types::Value::Integer(*n),
-            Val::Text(s) => rusqlite::types::Value::Text(s.clone()),
-        });
-        let mut rows = statement.query(params_from_iter(bound)).map_err(storage)?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(storage)? {
-            let mut values = Vec::new();
-            for i in 0..columns {
-                values.push(match row.get_ref(i).map_err(storage)? {
-                    ValueRef::Null => Val::Null,
-                    ValueRef::Integer(n) => Val::Int(n),
-                    ValueRef::Text(t) => Val::Text(String::from_utf8_lossy(t).into_owned()),
-                    other => return Err(WalletError::Storage(format!("unexpected {other:?}"))),
-                });
-            }
-            out.push(values);
-        }
-        Ok(out)
-    }
-}
 
 /// A fresh object database with the real schema.
 fn fresh() -> SqlBooks<Rusqlite> {

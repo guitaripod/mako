@@ -410,19 +410,8 @@ pub async fn add_credits(
 /// so a concurrent mutation (a refund, a purchase) on the same wallet is never
 /// clobbered, only retried against. Returns the resulting balance and the
 /// amount actually deducted.
-pub async fn deduct_credits_clamped(
-    app_id: &str,
-    user_id: &str,
-    amount: u32,
-    transaction_type: &str,
-    description: &str,
-    db: &D1Database,
-) -> Result<(i32, u32)> {
-    deduct_credits_clamped_with_reference(app_id, user_id, amount, transaction_type, description, None, db).await
-}
-
-/// `deduct_credits_clamped` that also stamps the ledger row with a reference,
-/// so a deduction such as a purchase refund can be found again by its id.
+/// The ledger row is stamped with `reference_id` when given, so a deduction such as a purchase refund can be
+/// found again by its id.
 pub async fn deduct_credits_clamped_with_reference(
     app_id: &str,
     user_id: &str,
@@ -653,7 +642,7 @@ async fn complete_purchase_already_claimed(purchase_id: &str, db: &D1Database) -
 /// Copies the buyer's Apple Ads campaign/keyword onto a completed credit-pack
 /// purchase. Best-effort by design: ad measurement must never be able to fail a
 /// purchase that has already been credited.
-async fn tag_purchase_attribution(
+pub(crate) async fn tag_purchase_attribution(
     db: &D1Database,
     app_id: &str,
     user_id: &str,
@@ -707,6 +696,16 @@ pub async fn get_user_transactions(
     }
     
     Ok(transactions)
+}
+
+/// How many ledger rows a user has in D1.
+pub async fn count_user_transactions(app_id: &str, user_id: &str, db: &D1Database) -> Result<i64> {
+    let row = db
+        .prepare("SELECT COUNT(*) as total FROM credit_transactions WHERE app_id = ? AND user_id = ?")
+        .bind(&[app_id.into(), user_id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    Ok(row.and_then(|v| v.get("total").and_then(|t| t.as_i64())).unwrap_or(0))
 }
 
 pub fn estimate_image_cost(

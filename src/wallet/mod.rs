@@ -1,13 +1,30 @@
 mod books;
+pub mod client;
+pub mod d1;
 mod ledger;
+pub mod link;
+pub mod links;
+pub mod log;
+pub mod ops;
+pub mod purchase;
+pub mod resolve;
 mod object;
 mod route;
 mod schema;
 mod sql;
+pub mod target;
 mod types;
 
 #[cfg(test)]
 mod memory;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod testing;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod link_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod ops_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod target_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]

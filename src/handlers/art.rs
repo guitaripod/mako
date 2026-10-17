@@ -131,8 +131,8 @@ async fn run(
 
     let hold = art_hold(unit, request.n, premium, settled);
     if hold > 0 {
-        if let Err(e) = Ledgers::new(db).check_and_reserve_credits(&auth.account, hold).await {
-            return credit_check_failure_response(e, db, &auth.account, "image.generate").await;
+        if let Err(e) = Ledgers::new(env, db).check_and_reserve_credits(&auth.account, hold).await {
+            return credit_check_failure_response(e, env, db, &auth.account, "image.generate").await;
         }
     }
 
@@ -166,7 +166,7 @@ async fn run(
     let charge = art_charge(unit, produced, request.n, premium, settled);
     if charge > 0 {
         let description = format!("Art ({}) x{}", request.style, produced);
-        if let Err(e) = Ledgers::new(db).deduct_credits(&auth.account, charge, &description, &reference).await {
+        if let Err(e) = Ledgers::new(env, db).deduct_credits(&auth.account, charge, &description, &reference).await {
             return AppError::from(e).to_response();
         }
     }

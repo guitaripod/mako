@@ -135,7 +135,7 @@ pub async fn list_user_images(req: Request, ctx: RouteContext<()>) -> Result<Res
 
     let db = env.d1("DB")?;
 
-    let is_owner = crate::auth::authenticate(&req, &db)
+    let is_owner = crate::auth::authenticate_account(&req, &env, &db)
         .await
         .map(|a| a.user_id == user_id)
         .unwrap_or(false);
@@ -209,7 +209,7 @@ pub async fn get_image(req: Request, ctx: RouteContext<()>) -> Result<Response> 
             let is_public = value.get("is_public").and_then(|v| v.as_i64()).map(|v| v != 0).unwrap_or(false);
             if !is_public {
                 let owner_id = value.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
-                let is_owner = crate::auth::authenticate(&req, &db)
+                let is_owner = crate::auth::authenticate_account(&req, &env, &db)
                     .await
                     .map(|a| a.user_id == owner_id)
                     .unwrap_or(false);
@@ -238,7 +238,7 @@ pub async fn report_image(mut req: Request, ctx: RouteContext<()>) -> Result<Res
 
     let env = ctx.env;
     let db = env.d1("DB")?;
-    let auth = match crate::auth::authenticate(&req, &db).await {
+    let auth = match crate::auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -290,7 +290,7 @@ pub async fn delete_image(req: Request, ctx: RouteContext<()>) -> Result<Respons
 
     let env = ctx.env;
     let db = env.d1("DB")?;
-    let auth = match crate::auth::authenticate(&req, &db).await {
+    let auth = match crate::auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -342,7 +342,7 @@ pub async fn set_image_visibility(mut req: Request, ctx: RouteContext<()>) -> Re
 
     let env = ctx.env;
     let db = env.d1("DB")?;
-    let auth = match crate::auth::authenticate(&req, &db).await {
+    let auth = match crate::auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
@@ -381,7 +381,7 @@ pub async fn set_image_visibility(mut req: Request, ctx: RouteContext<()>) -> Re
 pub async fn set_all_visibility(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
     let db = env.d1("DB")?;
-    let auth = match crate::auth::authenticate(&req, &db).await {
+    let auth = match crate::auth::authenticate_account(&req, &env, &db).await {
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
