@@ -32,6 +32,9 @@ web-sys = "=0.3.82"
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 jwt-simple = "0.12"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+
 [profile.release]
 lto = true
 strip = true

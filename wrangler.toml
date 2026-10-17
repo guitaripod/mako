@@ -107,6 +107,16 @@ name = "READ_LIMITER"
 namespace_id = "1003"
 simple = { limit = 240, period = 60 }
 
+# Wallet (P3.07): one SQLite-backed Durable Object per Midgar ID. Nothing in the
+# fetch handler routes to it yet; see src/wallet/ and docs/p3.07-wallet-design.md.
+[[durable_objects.bindings]]
+name = "WALLET"
+class_name = "Wallet"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Wallet"]
+
 # Development configuration
 [env.development]
 vars = { ENVIRONMENT = "development" }
