@@ -98,10 +98,10 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
     let affordable_minutes = balance / rate as i32;
     if affordable_minutes < 1 {
         ledgers.record_paywall_event(&auth.account, CAPABILITY, balance).await;
-        return Err(AppError::PaymentRequired(format!(
-            "Insufficient credits. Need {} per minute, have {}.",
-            rate, balance
-        )));
+        return Err(AppError::PaymentRequired(
+            format!("Insufficient credits. Need {} per minute, have {}.", rate, balance),
+            Some(balance),
+        ));
     }
     let reserved_minutes = RESERVE_GUARD_MINUTES.min(affordable_minutes);
     let reserved_credits = reserved_minutes as u32 * rate;

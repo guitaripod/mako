@@ -923,6 +923,10 @@ pub struct ValidateRevenueCatPurchaseRequest {
     pub purchase_token: String,
     pub product_id: String,
     pub platform: String, // "ios" or "android"
+    /// The StoreKit 2 signed transaction (JWS) of the purchase. When present, mako verifies it through the ledger
+    /// instead of asking RevenueCat.
+    #[serde(default)]
+    pub signed_transaction: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -988,6 +992,10 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
 
     let total_credits = pack.credits + pack.bonus_credits;
 
+    if validate_req.signed_transaction.as_deref().is_some_and(|signed| !signed.trim().is_empty()) {
+        return crate::handlers::storekit::validate_signed(&req, &env, &db, &auth, &validate_req, pack).await;
+    }
+
     // Check if this purchase token has already been used
     let existing_purchase = db.prepare(
         "SELECT id, status FROM credit_purchases WHERE app_id = ? AND payment_id = ? AND payment_provider = 'revenuecat'"
@@ -999,7 +1007,7 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
     if let Some(existing) = existing_purchase {
         let status = existing.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "completed" {
-            return AppError::BadRequest("Purchase has already been processed".to_string()).to_response();
+            return AppError::AlreadyProcessed("Purchase has already been processed".to_string()).to_response();
         }
     }
     
@@ -1020,18 +1028,18 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
     match validation_result {
         Ok(PurchaseVerification::Verified) => {}
         Ok(PurchaseVerification::Rejected) => {
-            return AppError::BadRequest("Purchase could not be verified with RevenueCat".to_string()).to_response();
+            return AppError::UnverifiablePurchase("Purchase could not be verified with RevenueCat".to_string()).to_response();
         }
         Ok(PurchaseVerification::Defer) => {
             // Not yet visible in RevenueCat. Do NOT grant here; the authenticated
             // webhook is the authoritative, idempotent fallback.
             worker::console_log!("RevenueCat purchase not yet visible, deferring to webhook");
-            return AppError::InternalError("Could not verify the purchase right now; it will be credited shortly.".to_string()).to_response();
+            return AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response();
         }
         Err(e) => {
             // RevenueCat unreachable: do NOT grant. The webhook will reconcile this purchase.
             worker::console_log!("RevenueCat validation unavailable, deferring to webhook: {}", e);
-            return AppError::InternalError("Could not verify the purchase right now; it will be credited shortly.".to_string()).to_response();
+            return AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response();
         }
     }
 
@@ -1049,7 +1057,7 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
             Ok(id) => id,
             Err(e) => {
                 worker::console_log!("RevenueCat fast-track could not credit the wallet, deferring to webhook: {:?}", e);
-                return AppError::InternalError("Could not verify the purchase right now; it will be credited shortly.".to_string()).to_response();
+                return AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response();
             }
         }
     } else {

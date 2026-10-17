@@ -58,7 +58,7 @@ stop_server() {
 }
 
 start_server() {
-  npx wrangler dev --local --test-scheduled --config "$CONFIG" --config "$IDENTITY_CONFIG" --persist-to "$STATE" --port "$PORT" >>"$LOG" 2>&1 &
+  npx wrangler dev --local --test-scheduled --config "$CONFIG" --config "$IDENTITY_CONFIG" --config "$LEDGER_CONFIG" --persist-to "$STATE" --port "$PORT" >>"$LOG" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 240); do
     if curl -s -o /dev/null "$BASE/docs"; then
@@ -276,6 +276,8 @@ call_native GET /v1/credits/balance "$(minted_token native)" "" pixie
 check "a token issued for another app is refused" 401 "$STATUS"
 call GET /v1/credits/balance key_unknown
 check "an unknown API key is still refused" 401 "$STATUS"
+
+verify_with_linking_on
 
 echo "== deleting an account erases its wallet partition"
 call_native DELETE /v1/identity "$(minted_token native)"

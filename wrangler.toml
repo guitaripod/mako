@@ -127,6 +127,13 @@ new_sqlite_classes = ["Wallet"]
 binding = "IDENTITY"
 service = "midgar-identity"
 
+# StoreKit 2 verification (P3.07 follow-up): mako hands a client's signed transaction to the ledger, which verifies
+# it against Apple Root CA - G3 and answers its decoded fields. Needs the LEDGER_VERIFY_SECRET secret, set to the same
+# value on midgar-ledger; without it a signed purchase answers 409 credit_pending and RevenueCat's webhook credits it.
+[[services]]
+binding = "LEDGER"
+service = "midgar-ledger"
+
 # Development configuration
 [env.development]
 vars = { ENVIRONMENT = "development" }

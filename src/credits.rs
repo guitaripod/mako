@@ -219,10 +219,10 @@ pub async fn check_and_reserve_credits(
     let balance = get_user_balance(app_id, user_id, db).await?;
     
     if balance < required_credits as i32 {
-        return Err(AppError::PaymentRequired(format!(
-            "Insufficient credits. Need {} credits, have {}. Purchase more at /credits",
-            required_credits, balance
-        )).into());
+        return Err(AppError::PaymentRequired(
+            format!("Insufficient credits. Need {} credits, have {}. Purchase more at /credits", required_credits, balance),
+            Some(balance),
+        ).into());
     }
     
     Ok(())
@@ -301,10 +301,10 @@ pub async fn deduct_credits(
         Some(v) => v.get("balance").and_then(|b| b.as_i64()).unwrap_or(0) as i32,
         None => {
             let current_balance = get_user_balance(app_id, user_id, db).await?;
-            return Err(AppError::PaymentRequired(format!(
-                "Insufficient credits. Need {} credits, have {}",
-                amount, current_balance
-            )).into());
+            return Err(AppError::PaymentRequired(
+                format!("Insufficient credits. Need {} credits, have {}", amount, current_balance),
+                Some(current_balance),
+            ).into());
         }
     };
 

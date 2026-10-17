@@ -78,10 +78,10 @@ fn an_overdraw_is_a_402_and_writes_nothing() {
     let ops = WalletOps { wallets: &wallets, db: &d1 };
     block_on(ops.grant(MIDGAR, APP, &purchase("tx:1", 5))).unwrap();
     let denied = block_on(ops.spend(MIDGAR, APP, &charge("chat:big", 6)));
-    assert!(matches!(denied, Err(AppError::PaymentRequired(m)) if m == "Insufficient credits. Need 6 credits, have 5"));
+    assert!(matches!(denied, Err(AppError::PaymentRequired(m, Some(5))) if m == "Insufficient credits. Need 6 credits, have 5"));
     assert_eq!(wallets.balance(MIDGAR, APP), 5);
     let check = block_on(ops.check(MIDGAR, APP, 6));
-    assert!(matches!(check, Err(AppError::PaymentRequired(_))));
+    assert!(matches!(check, Err(AppError::PaymentRequired(..))));
     assert!(block_on(ops.check(MIDGAR, APP, 5)).is_ok());
 }
 
@@ -156,7 +156,7 @@ fn tenants_never_see_each_others_credits() {
     let ops = WalletOps { wallets: &wallets, db: &d1 };
     block_on(ops.grant(MIDGAR, APP, &purchase("tx:1", 10))).unwrap();
     assert_eq!(block_on(ops.balance(MIDGAR, OTHER_APP)).unwrap(), 0);
-    assert!(matches!(block_on(ops.spend(MIDGAR, OTHER_APP, &charge("chat:a", 1))), Err(AppError::PaymentRequired(_))));
+    assert!(matches!(block_on(ops.spend(MIDGAR, OTHER_APP, &charge("chat:a", 1))), Err(AppError::PaymentRequired(..))));
     assert_eq!(block_on(ops.balance(MIDGAR, APP)).unwrap(), 10);
 }
 

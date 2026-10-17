@@ -4,6 +4,9 @@ use crate::models::{ErrorResponse, ErrorDetail};
 /// Seconds a client is told to wait after a 503 `wallet_unavailable`.
 const WALLET_RETRY_AFTER_SECONDS: &str = "5";
 
+/// Seconds a client is told to wait after a 409 `credit_pending`.
+const CREDIT_PENDING_RETRY_AFTER_SECONDS: &str = "5";
+
 #[derive(Debug)]
 pub enum AppError {
     BadRequest(String),
@@ -11,45 +14,79 @@ pub enum AppError {
     Forbidden(String),
     NotFound(String),
     Conflict(String),
-    PaymentRequired(String),
+    /// 402. The second field is the balance the caller holds, when the failing check knew it.
+    PaymentRequired(String, Option<i32>),
     InternalError(String),
     RateLimitExceeded,
     Truncated,
     ContentBlocked,
     WalletUnavailable,
+    /// 409 `credit_pending`: the purchase is accepted but not credited yet, and the same request (or the
+    /// RevenueCat webhook) will credit it. Replaces the masked 500 the fast-track used to answer.
+    CreditPending(String),
+    /// 400 `already_processed`: the store transaction was credited before. Clients treat it as success.
+    AlreadyProcessed(String),
+    /// 400 `unverifiable_purchase`: the purchase could not be verified as it stands. A client may retry it for a
+    /// while, because RevenueCat can lag the App Store.
+    UnverifiablePurchase(String),
+}
+
+/// What an error answers with, before it becomes a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorParts {
+    pub status: u16,
+    pub error_type: &'static str,
+    pub message: String,
+    pub code: &'static str,
+    pub balance: Option<i32>,
 }
 
 impl AppError {
-    pub fn to_response(&self) -> Result<Response> {
-        let (status, error_type, message, code) = match self {
-            AppError::BadRequest(msg) => (400, "invalid_request_error", msg.clone(), "bad_request"),
-            AppError::Unauthorized(msg) => (401, "authentication_error", msg.clone(), "unauthorized"),
-            AppError::Forbidden(msg) => (403, "permission_denied", msg.clone(), "forbidden"),
-            AppError::NotFound(msg) => (404, "not_found", msg.clone(), "not_found"),
-            AppError::Conflict(msg) => (409, "conflict", msg.clone(), "conflict"),
-            AppError::PaymentRequired(msg) => (402, "insufficient_credits", msg.clone(), "insufficient_credits"),
-            AppError::InternalError(_) => (500, "internal_error", "An internal error occurred. Please try again later.".to_string(), "internal_error"),
-            AppError::RateLimitExceeded => (429, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.".to_string(), "rate_limit_exceeded"),
-            AppError::Truncated => (422, "generation_error", "The reply was cut off before it finished. Nothing was charged. Try again.".to_string(), "truncated"),
-            AppError::ContentBlocked => (422, "generation_error", "The provider declined to process this text. Nothing was charged.".to_string(), "content_blocked"),
-            AppError::WalletUnavailable => (503, "service_unavailable", "Your credit balance is temporarily unavailable. Please try again in a moment.".to_string(), "wallet_unavailable"),
+    /// The status, type, message, stable code and, on a 402, the balance of this error.
+    pub fn parts(&self) -> ErrorParts {
+        let (status, error_type, message, code, balance) = match self {
+            AppError::BadRequest(msg) => (400, "invalid_request_error", msg.clone(), "bad_request", None),
+            AppError::Unauthorized(msg) => (401, "authentication_error", msg.clone(), "unauthorized", None),
+            AppError::Forbidden(msg) => (403, "permission_denied", msg.clone(), "forbidden", None),
+            AppError::NotFound(msg) => (404, "not_found", msg.clone(), "not_found", None),
+            AppError::Conflict(msg) => (409, "conflict", msg.clone(), "conflict", None),
+            AppError::PaymentRequired(msg, balance) => (402, "insufficient_credits", msg.clone(), "insufficient_credits", *balance),
+            AppError::InternalError(_) => (500, "internal_error", "An internal error occurred. Please try again later.".to_string(), "internal_error", None),
+            AppError::RateLimitExceeded => (429, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.".to_string(), "rate_limit_exceeded", None),
+            AppError::Truncated => (422, "generation_error", "The reply was cut off before it finished. Nothing was charged. Try again.".to_string(), "truncated", None),
+            AppError::ContentBlocked => (422, "generation_error", "The provider declined to process this text. Nothing was charged.".to_string(), "content_blocked", None),
+            AppError::WalletUnavailable => (503, "service_unavailable", "Your credit balance is temporarily unavailable. Please try again in a moment.".to_string(), "wallet_unavailable", None),
+            AppError::CreditPending(msg) => (409, "conflict", msg.clone(), "credit_pending", None),
+            AppError::AlreadyProcessed(msg) => (400, "invalid_request_error", msg.clone(), "already_processed", None),
+            AppError::UnverifiablePurchase(msg) => (400, "invalid_request_error", msg.clone(), "unverifiable_purchase", None),
         };
+        ErrorParts { status, error_type, message, code, balance }
+    }
 
-        let error_response = ErrorResponse {
+    /// The JSON envelope of this error: `{"error":{"message","type","param","code"}}` plus `balance` on a 402 that knows it.
+    pub fn body(&self) -> ErrorResponse {
+        let parts = self.parts();
+        ErrorResponse {
             error: ErrorDetail {
-                message,
-                error_type: error_type.to_string(),
+                message: parts.message,
+                error_type: parts.error_type.to_string(),
                 param: None,
-                code: Some(code.to_string()),
+                code: Some(parts.code.to_string()),
+                balance: parts.balance,
             },
-        };
+        }
+    }
 
-        let mut resp = Response::from_json(&error_response)?.with_status(status);
+    pub fn to_response(&self) -> Result<Response> {
+        let mut resp = Response::from_json(&self.body())?.with_status(self.parts().status);
         if let AppError::RateLimitExceeded = self {
             resp.headers_mut().set("Retry-After", "60")?;
         }
         if let AppError::WalletUnavailable = self {
             resp.headers_mut().set("Retry-After", WALLET_RETRY_AFTER_SECONDS)?;
+        }
+        if let AppError::CreditPending(_) = self {
+            resp.headers_mut().set("Retry-After", CREDIT_PENDING_RETRY_AFTER_SECONDS)?;
         }
         Ok(resp)
     }
@@ -74,7 +111,14 @@ impl From<worker::Error> for AppError {
         let error_str = err.to_string();
         
         if let Some(msg) = error_str.strip_prefix("AppError::PaymentRequired::") {
-            return AppError::PaymentRequired(msg.to_string());
+            return AppError::PaymentRequired(msg.to_string(), None);
+        }
+        if let Some(rest) = error_str.strip_prefix("AppError::PaymentRequired#") {
+            if let Some((balance, msg)) = rest.split_once("::") {
+                if let Ok(balance) = balance.parse::<i32>() {
+                    return AppError::PaymentRequired(msg.to_string(), Some(balance));
+                }
+            }
         }
         if let Some(msg) = error_str.strip_prefix("AppError::BadRequest::") {
             return AppError::BadRequest(msg.to_string());
@@ -103,6 +147,15 @@ impl From<worker::Error> for AppError {
         if error_str.starts_with("AppError::WalletUnavailable::") {
             return AppError::WalletUnavailable;
         }
+        if let Some(msg) = error_str.strip_prefix("AppError::CreditPending::") {
+            return AppError::CreditPending(msg.to_string());
+        }
+        if let Some(msg) = error_str.strip_prefix("AppError::AlreadyProcessed::") {
+            return AppError::AlreadyProcessed(msg.to_string());
+        }
+        if let Some(msg) = error_str.strip_prefix("AppError::UnverifiablePurchase::") {
+            return AppError::UnverifiablePurchase(msg.to_string());
+        }
         if let Some(msg) = error_str.strip_prefix("AppError::InternalError::") {
             return AppError::InternalError(msg.to_string());
         }
@@ -119,7 +172,11 @@ impl From<AppError> for worker::Error {
             AppError::Forbidden(msg) => format!("AppError::Forbidden::{}", msg),
             AppError::NotFound(msg) => format!("AppError::NotFound::{}", msg),
             AppError::Conflict(msg) => format!("AppError::Conflict::{}", msg),
-            AppError::PaymentRequired(msg) => format!("AppError::PaymentRequired::{}", msg),
+            AppError::PaymentRequired(msg, None) => format!("AppError::PaymentRequired::{}", msg),
+            AppError::PaymentRequired(msg, Some(balance)) => format!("AppError::PaymentRequired#{}::{}", balance, msg),
+            AppError::CreditPending(msg) => format!("AppError::CreditPending::{}", msg),
+            AppError::AlreadyProcessed(msg) => format!("AppError::AlreadyProcessed::{}", msg),
+            AppError::UnverifiablePurchase(msg) => format!("AppError::UnverifiablePurchase::{}", msg),
             AppError::InternalError(msg) => format!("AppError::InternalError::{}", msg),
             AppError::RateLimitExceeded => "AppError::RateLimitExceeded::".to_string(),
             AppError::Truncated => "AppError::Truncated::".to_string(),
@@ -127,5 +184,88 @@ impl From<AppError> for worker::Error {
             AppError::WalletUnavailable => "AppError::WalletUnavailable::".to_string(),
         };
         worker::Error::RustError(encoded)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn json_of(error: &AppError) -> Value {
+        serde_json::to_value(error.body()).unwrap()
+    }
+
+    fn round_trip(error: AppError) -> AppError {
+        AppError::from(worker::Error::from(error))
+    }
+
+    #[test]
+    fn the_credit_errors_have_stable_codes_and_statuses() {
+        let cases = [
+            (AppError::CreditPending("p".into()), 409, "credit_pending"),
+            (AppError::AlreadyProcessed("a".into()), 400, "already_processed"),
+            (AppError::UnverifiablePurchase("u".into()), 400, "unverifiable_purchase"),
+            (AppError::PaymentRequired("i".into(), Some(5)), 402, "insufficient_credits"),
+            (AppError::WalletUnavailable, 503, "wallet_unavailable"),
+        ];
+        for (error, status, code) in cases {
+            let parts = error.parts();
+            assert_eq!((parts.status, parts.code), (status, code));
+            assert_eq!(json_of(&error)["error"]["code"], code);
+        }
+    }
+
+    #[test]
+    fn the_messages_old_clients_match_are_kept() {
+        assert_eq!(AppError::AlreadyProcessed("Purchase has already been processed".into()).parts().message, "Purchase has already been processed");
+        assert_eq!(
+            AppError::UnverifiablePurchase("Purchase could not be verified with RevenueCat".into()).parts().message,
+            "Purchase could not be verified with RevenueCat"
+        );
+        assert_eq!(AppError::AlreadyProcessed("x".into()).parts().error_type, "invalid_request_error");
+        assert_eq!(AppError::UnverifiablePurchase("x".into()).parts().error_type, "invalid_request_error");
+        assert_eq!(AppError::PaymentRequired("x".into(), None).parts().error_type, "insufficient_credits");
+    }
+
+    #[test]
+    fn a_402_carries_the_balance_as_a_number_next_to_its_message() {
+        let body = json_of(&AppError::PaymentRequired("Insufficient credits. Need 6 credits, have 5".into(), Some(5)));
+        assert_eq!(body["error"]["balance"], json!(5));
+        assert!(body["error"]["balance"].is_i64());
+        assert_eq!(body["error"]["message"], "Insufficient credits. Need 6 credits, have 5");
+        assert_eq!(body["error"]["code"], "insufficient_credits");
+        assert_eq!(body["error"]["type"], "insufficient_credits");
+    }
+
+    #[test]
+    fn a_zero_balance_is_still_a_balance() {
+        assert_eq!(json_of(&AppError::PaymentRequired("x".into(), Some(0)))["error"]["balance"], json!(0));
+    }
+
+    #[test]
+    fn a_402_that_does_not_know_the_balance_and_every_other_error_omit_the_field() {
+        for error in [AppError::PaymentRequired("x".into(), None), AppError::CreditPending("x".into()), AppError::BadRequest("x".into()), AppError::WalletUnavailable] {
+            assert!(json_of(&error)["error"].get("balance").is_none(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn the_credit_errors_survive_the_trip_through_a_worker_error() {
+        assert!(matches!(round_trip(AppError::CreditPending("p".into())), AppError::CreditPending(m) if m == "p"));
+        assert!(matches!(round_trip(AppError::AlreadyProcessed("a".into())), AppError::AlreadyProcessed(m) if m == "a"));
+        assert!(matches!(round_trip(AppError::UnverifiablePurchase("u".into())), AppError::UnverifiablePurchase(m) if m == "u"));
+    }
+
+    #[test]
+    fn the_balance_survives_the_trip_through_a_worker_error() {
+        assert!(matches!(round_trip(AppError::PaymentRequired("no: still 4".into(), Some(4))), AppError::PaymentRequired(m, Some(4)) if m == "no: still 4"));
+        assert!(matches!(round_trip(AppError::PaymentRequired("no".into(), None)), AppError::PaymentRequired(m, None) if m == "no"));
+    }
+
+    #[test]
+    fn a_message_that_looks_like_a_balance_prefix_is_not_misread() {
+        let looks = AppError::PaymentRequired("#7::sneaky".into(), None);
+        assert!(matches!(round_trip(looks), AppError::PaymentRequired(m, None) if m == "#7::sneaky"));
     }
 }

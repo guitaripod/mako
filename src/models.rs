@@ -157,6 +157,9 @@ pub struct ErrorDetail {
     pub error_type: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    /// The balance the caller holds, on a 402 whose check knew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

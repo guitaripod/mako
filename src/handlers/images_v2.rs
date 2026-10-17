@@ -597,7 +597,7 @@ pub(crate) async fn credit_check_failure_response(
     capability: &str,
 ) -> Result<Response> {
     let app_error = AppError::from(error);
-    if matches!(app_error, AppError::PaymentRequired(_)) {
+    if matches!(app_error, AppError::PaymentRequired(..)) {
         let ledgers = Ledgers::new(env, db);
         let balance = ledgers.get_user_balance(account).await.unwrap_or(0);
         ledgers.record_paywall_event(account, capability, balance).await;
@@ -689,6 +689,7 @@ pub(crate) fn provider_failure_response(error_msg: &str, retry_subject: &str) ->
             error_type: error_type.to_string(),
             param: None,
             code: Some(code.to_string()),
+            balance: None,
         },
     })
     .map(|r| r.with_status(status))

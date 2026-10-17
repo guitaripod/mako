@@ -17,6 +17,7 @@ mod providers;
 mod privacy;
 mod chat_alias;
 mod purchases;
+mod storekit;
 mod art;
 mod mock;
 mod redact;

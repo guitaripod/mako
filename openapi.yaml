@@ -1518,6 +1518,15 @@ paths:
                   type: string
                   enum: [ios, android]
                   description: The platform where the purchase was made
+                signed_transaction:
+                  type: string
+                  description: |
+                    The StoreKit 2 signed transaction (JWS) of the purchase. When present, mako has the ledger verify it
+                    instead of asking RevenueCat, and credits the pack under the store transaction id (the key the
+                    RevenueCat webhook uses, so the two never credit one purchase twice). It must be a consumable of this
+                    app, for `product_id`, not revoked, bought by the Apple account, quantity 1, with `appAccountToken`
+                    equal to the caller's Midgar ID (`X-Midgar-Token` or a Midgar bearer). Without it the RevenueCat
+                    fast-track runs as before.
       responses:
         '200':
           description: Purchase validated successfully
@@ -1535,9 +1544,32 @@ paths:
                   new_balance:
                     type: integer
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: |
+            Not credited. `error.code` is `already_processed` (the transaction was credited before; treat it as success),
+            `unverifiable_purchase` (the purchase could not be verified; RevenueCat can lag the App Store, so a client may
+            retry for a while) or `bad_request` (verified but not a creditable pack purchase: wrong product, not a
+            consumable, revoked, family-shared, quantity other than 1, or a sandbox purchase where the tenant refuses them).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: A signed transaction made in another app or by another Midgar ID (`forbidden`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: |
+            `credit_pending`: the purchase is accepted but not credited yet (RevenueCat or the ledger could not be asked, or
+            the wallet could not take the grant). Send the same request again; the RevenueCat webhook credits it too. The
+            answer has `Retry-After: 5`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /v1/revenuecat/webhook:
     post:
@@ -2480,6 +2512,13 @@ components:
                 - insufficient_credits
                 - internal_error
                 - rate_limit_exceeded
+                - wallet_unavailable
+                - credit_pending
+                - already_processed
+                - unverifiable_purchase
+            balance:
+              type: integer
+              description: On a 402 `insufficient_credits`, the credits the caller holds right now (absent when the failing check did not know it).
 
   responses:
     BadRequest:

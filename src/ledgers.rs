@@ -46,7 +46,7 @@ impl Account {
 
 /// True when an error is the 402 a spend or a check answers with.
 fn is_payment_required(error: &worker::Error) -> bool {
-    matches!(AppError::from(worker::Error::RustError(error.to_string())), AppError::PaymentRequired(_))
+    matches!(AppError::from(worker::Error::RustError(error.to_string())), AppError::PaymentRequired(..))
 }
 
 /// The idempotency key of a spend: the reference each handler mints once per charge.
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_402_is_recognised_through_the_worker_error() {
-        let payment: worker::Error = AppError::PaymentRequired("no".into()).into();
+        let payment: worker::Error = AppError::PaymentRequired("no".into(), None).into();
         let other: worker::Error = AppError::InternalError("no".into()).into();
         assert!(is_payment_required(&payment));
         assert!(!is_payment_required(&other));

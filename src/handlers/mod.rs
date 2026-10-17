@@ -11,6 +11,7 @@ pub mod device_auth;
 pub mod identity;
 pub mod attribution;
 pub mod credits;
+pub mod storekit;
 pub mod chat;
 pub mod art;
 pub mod chat_alias;

@@ -110,10 +110,10 @@ impl<W: WalletTransport, D: D1Exec> WalletOps<'_, W, D> {
     pub async fn check(&self, midgar_id: &str, app_id: &str, required: u32) -> Result<(), AppError> {
         let balance = self.balance(midgar_id, app_id).await?;
         if balance < required as i32 {
-            return Err(AppError::PaymentRequired(format!(
-                "Insufficient credits. Need {} credits, have {}. Purchase more at /credits",
-                required, balance
-            )));
+            return Err(AppError::PaymentRequired(
+                format!("Insufficient credits. Need {} credits, have {}. Purchase more at /credits", required, balance),
+                Some(balance),
+            ));
         }
         Ok(())
     }
@@ -135,10 +135,10 @@ impl<W: WalletTransport, D: D1Exec> WalletOps<'_, W, D> {
         };
         match self.client().spend(midgar_id, &entry).await? {
             Spent::Done(moved) => Ok(credits(self.mirrored(midgar_id, app_id, moved).await.totals.balance)),
-            Spent::Insufficient { balance } => Err(AppError::PaymentRequired(format!(
-                "Insufficient credits. Need {} credits, have {}",
-                charge.amount, balance
-            ))),
+            Spent::Insufficient { balance } => Err(AppError::PaymentRequired(
+                format!("Insufficient credits. Need {} credits, have {}", charge.amount, balance),
+                Some(credits(balance)),
+            )),
         }
     }
 

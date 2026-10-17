@@ -650,7 +650,7 @@ pub async fn charge_capability(mut req: Request, ctx: RouteContext<()>) -> Resul
     match crate::ledgers::Ledgers::new(&ctx.env, &db).deduct_credits_keyed(&auth.account, cost, capability, reference, &wallet_key).await {
         Ok(balance) => Response::from_json(&json!({ "charged": cost, "balance": balance })),
         Err(e) if crate::error::is_wallet_unavailable(&e) => AppError::WalletUnavailable.to_response(),
-        Err(_) => AppError::PaymentRequired(format!("Insufficient credits for {}", capability)).to_response(),
+        Err(_) => AppError::PaymentRequired(format!("Insufficient credits for {}", capability), None).to_response(),
     }
 }
 

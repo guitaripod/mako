@@ -87,7 +87,7 @@ async fn ensure_affordable(env: &Env, db: &D1Database, auth: &AuthedUser, plan: 
     let ledgers = Ledgers::new(env, db);
     if let Err(e) = ledgers.check_and_reserve_credits(&auth.account, plan.credits).await {
         let error = AppError::from(e);
-        if matches!(error, AppError::PaymentRequired(_)) {
+        if matches!(error, AppError::PaymentRequired(..)) {
             let balance = ledgers.get_user_balance(&auth.account).await.unwrap_or(0);
             ledgers.record_paywall_event(&auth.account, "chat.completion", balance).await;
         }

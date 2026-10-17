@@ -16,9 +16,11 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/mako-local-log.XXXXXX")"
 BODY="$(mktemp -t mako-local-body.XXXXXX)"
 IDENTITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mako-local-identity.XXXXXX")"
 IDENTITY_CONFIG="$IDENTITY_DIR/wrangler.toml"
+LEDGER_CONFIG="$IDENTITY_DIR/wrangler-ledger.toml"
 MINTED="$IDENTITY_DIR/minted.json"
 WEBHOOK_SECRET="local-webhook-secret"
 LOOKUP_SECRET="local-lookup-secret"
+VERIFY_SECRET="local-verify-secret"
 SERVER_PID=""
 FAILURES=0
 STEPS=0
@@ -119,6 +121,7 @@ cat > "$DEV_VARS" <<EOF
 ENVIRONMENT=development
 MOCK_PROVIDERS=1
 REVENUECAT_WEBHOOK_AUTH=$WEBHOOK_SECRET
+LEDGER_VERIFY_SECRET=$VERIFY_SECRET
 EOF
 
 prepare_local_identity() {
@@ -134,6 +137,14 @@ compatibility_date = "2024-01-01"
 JWKS = '$jwks'
 LOOKUP_SECRET = "$LOOKUP_SECRET"
 KNOWN_IDS = "$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["ids"]["second"].lower())' "$MINTED")"
+TOML
+  cat > "$LEDGER_CONFIG" <<TOML
+name = "midgar-ledger"
+main = "$ROOT/scripts/local-ledger/worker.mjs"
+compatibility_date = "2024-01-01"
+
+[vars]
+VERIFY_SECRET = "$VERIFY_SECRET"
 TOML
 }
 
@@ -205,7 +216,7 @@ if ! prepare_local_identity; then
   echo "FAIL  could not mint the throwaway identity key and tokens"
   exit 1
 fi
-npx wrangler dev --local --test-scheduled --config "$CONFIG" --config "$IDENTITY_CONFIG" --persist-to "$STATE" --port "$PORT" >"$LOG" 2>&1 &
+npx wrangler dev --local --test-scheduled --config "$CONFIG" --config "$IDENTITY_CONFIG" --config "$LEDGER_CONFIG" --persist-to "$STATE" --port "$PORT" >"$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 240); do
   if curl -s -o /dev/null "$BASE/docs"; then
@@ -545,6 +556,9 @@ else
   echo "FAIL  scripts/smoke-dreameater.sh"
   FAILURES=$((FAILURES + 1))
 fi
+
+. "$ROOT/scripts/test-local-verify.sh"
+verify_with_linking_off
 
 . "$ROOT/scripts/test-local-wallet.sh"
 
