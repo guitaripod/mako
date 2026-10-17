@@ -1,5 +1,5 @@
 use worker::{console_error, Request, D1Database};
-use crate::api_keys::{self, LookupStep, PlaintextFallback};
+use crate::api_keys::{self, LookupStep};
 use crate::error::AppError;
 
 pub fn validate_api_key(req: &Request) -> Result<String, AppError> {
@@ -105,55 +105,15 @@ async fn find_by_legacy_hash(db: &D1Database, app_id: &str, api_key: &str) -> Re
     Ok(row.filter(|r| stored_hash_matches(r, "api_key_hash", api_key)))
 }
 
-/// Looks the presented key up in the legacy plaintext column and, on a match,
-/// writes its hash in the same request and replaces the plaintext with the
-/// placeholder. Placeholders never match.
-async fn find_by_plaintext_and_upgrade(db: &D1Database, app_id: &str, api_key: &str) -> Result<Option<serde_json::Value>, AppError> {
-    let row = db
-        .prepare(&format!(
-            "SELECT id, is_admin, preferred_model, api_key FROM users WHERE app_id = ? AND api_key = ? AND api_key NOT LIKE '{}'",
-            api_keys::PLACEHOLDER_LIKE
-        ))
-        .bind(&[app_id.into(), api_key.into()])
-        .map_err(AppError::from)?
-        .first::<serde_json::Value>(None)
-        .await
-        .map_err(AppError::from)?;
-    let Some(row) = row else { return Ok(None) };
-    let stored = row.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
-    let PlaintextFallback::Upgrade { api_key_hash } = api_keys::plaintext_fallback(api_key, stored) else {
-        return Ok(None);
-    };
-    let user_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if let Err(e) = store_hash_for_plaintext_row(db, user_id, stored, &api_key_hash).await {
-        console_error!("api key upgrade failed: {:?}", e);
-    }
-    Ok(Some(row))
-}
-
-/// Sets the hash and the placeholder for one legacy row. Guarded on the old
-/// plaintext and an empty hash, so a concurrent request or the backfill can
-/// win without either being undone.
-async fn store_hash_for_plaintext_row(db: &D1Database, user_id: &str, plaintext: &str, api_key_hash: &str) -> Result<(), AppError> {
-    db.prepare("UPDATE users SET api_key_hash = ?, api_key = ? WHERE id = ? AND api_key = ? AND api_key_hash IS NULL")
-        .bind(&[api_key_hash.into(), api_keys::placeholder_for(user_id).into(), user_id.into(), plaintext.into()])
-        .map_err(AppError::from)?
-        .run()
-        .await
-        .map_err(AppError::from)?;
-    Ok(())
-}
-
 pub async fn authenticate(req: &Request, db: &D1Database) -> Result<AuthedUser, AppError> {
     let api_key = validate_api_key(req)?;
     let app_id = resolve_app_id(req);
 
     let mut row = None;
-    for step in api_keys::lookup_steps(&api_key) {
+    for step in api_keys::lookup_steps() {
         row = match step {
             LookupStep::KeyTable => find_in_key_table(db, &app_id, &api_key).await?,
             LookupStep::LegacyHash => find_by_legacy_hash(db, &app_id, &api_key).await?,
-            LookupStep::LegacyPlaintext => find_by_plaintext_and_upgrade(db, &app_id, &api_key).await?,
         };
         if row.is_some() {
             break;
@@ -179,45 +139,25 @@ pub async fn issue_api_key(db: &D1Database, app_id: &str, user_id: &str) -> Resu
     Ok(api_key)
 }
 
-/// Hashes up to `BACKFILL_BATCH` legacy plaintext keys and swaps each for the
-/// placeholder in one UPDATE guarded on the old plaintext and an empty hash, so
-/// reruns and a concurrent upgrade-on-use cannot clash. Returns how many rows
-/// it changed; no key value is ever logged.
-pub async fn backfill_api_key_hashes(db: &D1Database) -> Result<u32, AppError> {
-    let rows = db
-        .prepare(&format!(
-            "SELECT id, api_key FROM users WHERE api_key_hash IS NULL AND api_key NOT LIKE '{}' LIMIT {}",
-            api_keys::PLACEHOLDER_LIKE,
-            api_keys::BACKFILL_BATCH
-        ))
-        .all()
-        .await
+/// Deletes up to `PRUNE_BATCH` keys whose last use, or creation when never
+/// used, is older than `PRUNE_AFTER_DAYS`, oldest first, in one bounded
+/// statement. Touches nothing but `api_keys`: a pruned device logs in again and
+/// finds the same user and balance. Returns how many rows it deleted; no key
+/// value is ever logged.
+pub async fn prune_unused_api_keys(db: &D1Database) -> Result<u32, AppError> {
+    let cutoff = api_keys::prune_cutoff(chrono::Utc::now());
+    let result = db
+        .prepare(
+            "DELETE FROM api_keys WHERE key_hash IN (
+                SELECT key_hash FROM api_keys
+                WHERE COALESCE(last_used_at, created_at) < ?1
+                ORDER BY COALESCE(last_used_at, created_at) LIMIT ?2
+            )",
+        )
+        .bind(&[cutoff.into(), api_keys::PRUNE_BATCH.into()])
         .map_err(AppError::from)?
-        .results::<serde_json::Value>()
+        .run()
+        .await
         .map_err(AppError::from)?;
-
-    let mut statements = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let user_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let plaintext = row.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
-        if api_keys::is_placeholder(plaintext) {
-            continue;
-        }
-        let api_key_hash = api_keys::hash_api_key(plaintext);
-        statements.push(
-            db.prepare("UPDATE users SET api_key_hash = ?, api_key = ? WHERE id = ? AND api_key = ? AND api_key_hash IS NULL")
-                .bind(&[api_key_hash.into(), api_keys::placeholder_for(user_id).into(), user_id.into(), plaintext.into()])
-                .map_err(AppError::from)?,
-        );
-    }
-    if statements.is_empty() {
-        return Ok(0);
-    }
-
-    let results = db.batch(statements).await.map_err(AppError::from)?;
-    let changed = results
-        .iter()
-        .map(|r| r.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u32)
-        .sum();
-    Ok(changed)
+    Ok(result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u32)
 }

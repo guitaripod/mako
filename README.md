@@ -36,6 +36,10 @@ CLOUDFLARE_API_TOKEN=$(cat ~/.cloudflare-api-token) \
 
 Set the tenant's RevenueCat secret if it has a premium tier: `wrangler secret put REVENUECAT_IOS_API_KEY_<APPID>`.
 
+## Removing `users.api_key` (migrations 027 to 029)
+
+Apply 027 and 028 first, then deploy the code release that no longer reads or writes `users.api_key`. **Migration 029 (`DROP COLUMN api_key`) is applied to production only after 028 and that release have soaked; it is irreversible, so export the database first.** Gate queries, the rehearsal script and the full order are in `docs/p3.07-wallet-design.md` section 7 and the mako runbook (`ops/runbooks/mako.md`).
+
 ## Develop / deploy
 
 ```sh

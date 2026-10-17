@@ -8,7 +8,6 @@ pub struct User {
     pub provider_id: String,
     pub email: Option<String>,
     pub name: Option<String>,
-    pub api_key: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

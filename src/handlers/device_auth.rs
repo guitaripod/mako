@@ -400,12 +400,12 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                 (existing_id, api_key)
             } else {
                 let new_user_id = Uuid::new_v4().to_string();
-                let creds = NewCredentials::generate(&new_user_id);
+                let creds = NewCredentials::generate();
                 let now = Utc::now().to_rfc3339();
 
                 let insert_stmt = db.prepare(
-                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, api_key_hash, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key_hash, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 );
 
                 insert_stmt
@@ -416,7 +416,6 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                         provider_id.into(),
                         github_user.email.clone().unwrap_or_default().into(),
                         github_user.name.clone().unwrap_or(github_user.login.clone()).into(),
-                        creds.placeholder.clone().into(),
                         creds.api_key_hash.clone().into(),
                         now.clone().into(),
                         now.into(),
@@ -509,12 +508,12 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                 (existing_id, api_key)
             } else {
                 let new_user_id = Uuid::new_v4().to_string();
-                let creds = NewCredentials::generate(&new_user_id);
+                let creds = NewCredentials::generate();
                 let now = Utc::now().to_rfc3339();
 
                 let insert_stmt = db.prepare(
-                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key, api_key_hash, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "INSERT INTO users (id, app_id, provider, provider_id, email, name, api_key_hash, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 );
 
                 insert_stmt
@@ -525,7 +524,6 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                         provider_id.into(),
                         google_user.email.into(),
                         google_user.name.unwrap_or_else(|| "Google User".to_string()).into(),
-                        creds.placeholder.clone().into(),
                         creds.api_key_hash.clone().into(),
                         now.clone().into(),
                         now.into(),

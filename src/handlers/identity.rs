@@ -332,13 +332,13 @@ async fn create_or_reuse_anonymous(
     device_key: &str,
 ) -> std::result::Result<(String, String), AppError> {
     let new_user_id = Uuid::new_v4().to_string();
-    let creds = NewCredentials::generate(&new_user_id);
+    let creds = NewCredentials::generate();
     let now = Utc::now().to_rfc3339();
 
     let result = db
         .prepare(
-            "INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key, api_key_hash, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO users (id, app_id, email, provider, provider_id, name, api_key_hash, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(app_id, provider, provider_id) DO NOTHING",
         )
         .bind(&[
@@ -348,7 +348,6 @@ async fn create_or_reuse_anonymous(
             ANON_PROVIDER.into(),
             device_key.into(),
             "Anonymous".into(),
-            creds.placeholder.clone().into(),
             creds.api_key_hash.clone().into(),
             now.clone().into(),
             now.into(),
@@ -764,6 +763,10 @@ mod tests {
                     }
                 } else if upper.contains(" ADD COLUMN ") {
                     columns.entry(table).or_default().insert(words[5].to_ascii_lowercase());
+                } else if upper.contains(" DROP COLUMN ") {
+                    if let Some(cols) = columns.get_mut(&table) {
+                        cols.remove(&words[5].to_ascii_lowercase());
+                    }
                 }
             }
         }
@@ -812,7 +815,8 @@ mod tests {
         let schema = replay_migrations();
         assert!(schema.columns["user_credits"].contains("user_id"));
         assert!(schema.columns["user_credits"].contains("app_id"));
-        assert!(schema.columns["users"].contains("api_key"));
+        assert!(schema.columns["users"].contains("api_key_hash"));
+        assert!(!schema.columns["users"].contains("api_key"));
         assert!(!schema.columns.contains_key("user_credits_new"));
         assert!(schema.columns["usage_records"].contains("capability"));
     }
