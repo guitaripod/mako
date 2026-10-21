@@ -462,9 +462,6 @@ pub fn build_anthropic_body(cfg: &AliasConfig, system: &str, turns: &[Turn]) -> 
         "system": system,
         "messages": messages,
     });
-    if let Some(t) = cfg.temperature {
-        body["temperature"] = json!(t);
-    }
     if let Some(schema) = &cfg.response_schema {
         body["tools"] = json!([{
             "name": ANTHROPIC_TOOL_NAME,
@@ -952,7 +949,7 @@ mod tests {
         assert_eq!(b["tools"][0]["name"], ANTHROPIC_TOOL_NAME);
         assert_eq!(b["tools"][0]["input_schema"]["properties"]["essence"]["type"], "string");
         assert_eq!(b["max_tokens"], 900);
-        assert_eq!(b["temperature"], 0.4);
+        assert!(b.get("temperature").is_none());
     }
 
     #[test]
