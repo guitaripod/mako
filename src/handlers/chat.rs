@@ -20,6 +20,7 @@ fn model_prices(model: &str) -> (f64, f64) {
         "gemini-3.1-flash-lite" => (0.25, 1.50),
         "gemini-3.5-flash" => (1.50, 9.00),
         "gemini-2.5-flash" => (0.30, 2.50),
+        "claude-haiku-5-5" => (0.10, 0.50),
         "claude-haiku-4-5" => (1.00, 5.00),
         "claude-sonnet-4-6" => (3.00, 15.00),
         "claude-opus-4-8" => (5.00, 25.00),
@@ -432,7 +433,7 @@ async fn openai_generate(
 }
 
 pub(crate) const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2026-10-21";
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
 /// Calls the Anthropic Messages API with the messages (joined into one user
