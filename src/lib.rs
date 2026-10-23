@@ -7,6 +7,7 @@ mod api_keys;
 mod auth;
 mod handlers;
 mod storage;
+mod retention;
 mod deployment;
 mod credits;
 mod crypto_payments;
@@ -46,6 +47,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     }
     if let Ok(db) = env.d1("DB") {
         ledgers::Ledgers::new(&env, &db).run_wallet_cron().await;
+        retention::run_scheduled(&env, &db).await;
     }
 }
 

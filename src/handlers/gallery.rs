@@ -1,6 +1,7 @@
 use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
 use crate::auth::resolve_app_id;
+use crate::storage::public_image_url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -17,11 +18,10 @@ pub struct ImageMetadata {
     pub is_public: bool,
 }
 
-fn build_image_metadata(value: &serde_json::Value) -> ImageMetadata {
+fn build_image_metadata(env: &worker::Env, value: &serde_json::Value) -> ImageMetadata {
     ImageMetadata {
         id: value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        url: format!("https://openai-image-proxy.guitaripod.workers.dev/r2/{}",
-            value.get("r2_key").and_then(|v| v.as_str()).unwrap_or("")),
+        url: public_image_url(env, value.get("r2_key").and_then(|v| v.as_str()).unwrap_or("")),
         prompt: value.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         created_at: value.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         user_id: value.get("user_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -91,7 +91,7 @@ pub async fn list_images(req: Request, ctx: RouteContext<()>) -> Result<Response
     if let Ok(results) = images_result.results() {
         for row in results {
             if let Ok(value) = serde_json::from_value::<serde_json::Value>(row) {
-                images.push(build_image_metadata(&value));
+                images.push(build_image_metadata(&env, &value));
             }
         }
     }
@@ -171,7 +171,7 @@ pub async fn list_user_images(req: Request, ctx: RouteContext<()>) -> Result<Res
     if let Ok(results) = images_result.results() {
         for row in results {
             if let Ok(value) = serde_json::from_value::<serde_json::Value>(row) {
-                images.push(build_image_metadata(&value));
+                images.push(build_image_metadata(&env, &value));
             }
         }
     }
@@ -217,7 +217,7 @@ pub async fn get_image(req: Request, ctx: RouteContext<()>) -> Result<Response> 
                     return AppError::NotFound(format!("Image {} not found", image_id)).to_response();
                 }
             }
-            let metadata = build_image_metadata(&value);
+            let metadata = build_image_metadata(&env, &value);
             Response::from_json(&metadata)
         }
         None => {

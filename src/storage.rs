@@ -5,6 +5,21 @@ use uuid::Uuid;
 use chrono::{Utc, Duration};
 use base64::{Engine as _, engine::general_purpose};
 
+pub const DEFAULT_PUBLIC_BASE_URL: &str = "https://api.midgarcorp.cc/v1/intelligence";
+
+/// The URL clients load a stored image from: the `PUBLIC_BASE_URL` variable, or the public gateway's
+/// intelligence mount when it is unset or blank, followed by `/r2/` and the object key.
+pub fn public_image_url(env: &Env, r2_key: &str) -> String {
+    let configured = env.var("PUBLIC_BASE_URL").ok().map(|v| v.to_string());
+    image_url(configured.as_deref(), r2_key)
+}
+
+/// Joins a configured base (or the default when `None` or blank) with `/r2/{r2_key}`, tolerating trailing slashes.
+pub fn image_url(base: Option<&str>, r2_key: &str) -> String {
+    let base = base.map(str::trim).filter(|b| !b.is_empty()).unwrap_or(DEFAULT_PUBLIC_BASE_URL);
+    format!("{}/r2/{}", base.trim_end_matches('/'), r2_key)
+}
+
 pub async fn store_image_in_r2(
     env: &Env,
     user_id: &str,
@@ -28,10 +43,7 @@ pub async fn store_image_in_r2(
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to store image in R2: {}", e)))?;
     
-    let service_url = env.var("SERVICE_URL")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://openai-image-proxy.guitaripod.workers.dev".to_string());
-    let url = format!("{}/r2/{}", service_url, r2_key);
+    let url = public_image_url(env, &r2_key);
     
     let now = Utc::now();
     let expires_at = now + Duration::days(7);
@@ -72,10 +84,7 @@ pub async fn store_image_from_bytes(
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to store image in R2: {}", e)))?;
     
-    let service_url = env.var("SERVICE_URL")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://openai-image-proxy.guitaripod.workers.dev".to_string());
-    let url = format!("{}/r2/{}", service_url, r2_key);
+    let url = public_image_url(env, &r2_key);
     
     let now = Utc::now();
     let expires_at = now + Duration::days(7);
@@ -94,4 +103,35 @@ pub async fn store_image_from_bytes(
     };
     
     Ok(stored_image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_base_is_the_public_gateway() {
+        assert_eq!(
+            image_url(None, "u1/i1.png"),
+            "https://api.midgarcorp.cc/v1/intelligence/r2/u1/i1.png"
+        );
+    }
+
+    #[test]
+    fn a_configured_base_replaces_the_default() {
+        assert_eq!(
+            image_url(Some("https://example.test/v1/intelligence"), "u1/i1.png"),
+            "https://example.test/v1/intelligence/r2/u1/i1.png"
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_and_blank_values_are_tolerated() {
+        assert_eq!(
+            image_url(Some("https://example.test/base//"), "u1/i1.png"),
+            "https://example.test/base/r2/u1/i1.png"
+        );
+        assert_eq!(image_url(Some("   "), "u1/i1.png"), image_url(None, "u1/i1.png"));
+        assert_eq!(image_url(Some(""), "u1/i1.png"), image_url(None, "u1/i1.png"));
+    }
 }

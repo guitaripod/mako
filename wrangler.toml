@@ -34,6 +34,10 @@ APPLE_KEY_ID = "V7GNRF2W6V"
 SERVICE_URL = "https://openai-image-proxy.guitaripod.workers.dev"
 API_BASE_URL = "https://openai-image-proxy.guitaripod.workers.dev"
 
+# Base of the image URLs mako returns: stored images load from {PUBLIC_BASE_URL}/r2/{user}/{image}.png through the
+# public gateway. The worker's own host keeps serving /r2/ for URLs handed out before this variable existed.
+PUBLIC_BASE_URL = "https://api.midgarcorp.cc/v1/intelligence"
+
 # Environment
 ENVIRONMENT = "production"
 

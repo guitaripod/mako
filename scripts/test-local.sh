@@ -199,7 +199,13 @@ INSERT INTO paywall_events (id, app_id, user_id, capability, balance, created_at
 INSERT INTO weekly_usage (app_id, user_id, alias, week_start, used) VALUES ('dreameater', 'u-throw', 'test.reading', '2026-01-05', 1);
 INSERT INTO chat_requests (app_id, user_id, reference, alias, kind, created_at) VALUES ('dreameater', 'u-throw', 'chat:old', 'test.reading', 'weekly', '$NOW');
 INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, model, size, created_at, expires_at) VALUES
- ('img-scrub', 'scrubme', 'u-scrub', 'u-scrub/img-scrub.png', 'a scrub dream', 'm', '1024x1024', '$NOW', '$NOW');
+ ('img-scrub', 'scrubme', 'u-scrub', 'u-scrub/img-scrub.png', 'a scrub dream', 'm', '1024x1024', '$NOW', '2099-01-01T00:00:00+00:00'),
+ ('img-expired', 'scrubme', 'u-scrub', 'u-scrub/img-expired.png', 'an expired dream', 'm', '1024x1024', '2026-01-01T00:00:00+00:00', '2026-01-08T00:00:00+00:00'),
+ ('img-fresh', 'scrubme', 'u-scrub', 'u-scrub/img-fresh.png', 'a fresh dream', 'm', '1024x1024', '$NOW', '2099-01-01T00:00:00+00:00'),
+ ('img-pixie-old', 'pixie', 'u-pixie', 'u-pixie/img-pixie-old.png', 'an old pixie edit', 'm', '1024x1024', '2026-01-01T00:00:00+00:00', '2026-01-08T00:00:00+00:00');
+INSERT INTO image_reports (id, app_id, image_id, reporter_user_id, created_at) VALUES
+ ('rep-expired', 'scrubme', 'img-expired', 'u-pixie', '$NOW'),
+ ('rep-fresh', 'scrubme', 'img-fresh', 'u-pixie', '$NOW');
 INSERT INTO usage_records (id, app_id, user_id, request_type, provider, model, prompt, image_size, image_quality, image_count, total_tokens, input_tokens, output_tokens, text_tokens, image_tokens, r2_keys, response_time_ms, error, created_at) VALUES
  ('ur-scrub', 'scrubme', 'u-scrub', 'generation', 'gemini', 'm', 'a scrub dream', '1024x1024', 'low', 1, 0, 0, 0, 0, 0, '["u-scrub/img-scrub.png"]', 1, 'Gemini API error: echoed a scrub dream', '$NOW');
 EOF
@@ -210,6 +216,11 @@ if ! sql_file "$SEED"; then
 fi
 rm -f "$SEED"
 echo "PASS  seeded tenants, users, the test aliases and rows to delete"
+
+for object in u-scrub/img-expired u-scrub/img-fresh u-pixie/img-pixie-old; do
+  printf 'png' > "$STATE/retention.png"
+  wrangler_local r2 object put "$BUCKET/$object.png" --file "$STATE/retention.png" --local --content-type image/png >/dev/null 2>>"$LOG"
+done
 
 echo "== starting wrangler dev --local with mock providers"
 if ! prepare_local_identity; then
@@ -235,6 +246,25 @@ if ! curl -s -o /dev/null "$BASE/docs"; then
   exit 1
 fi
 echo "PASS  server is up"
+
+echo "== image retention"
+image_status() {
+  curl -s -o /dev/null -w '%{http_code}' "$BASE/r2/$1"
+}
+check "the expired image is served before the purge" 200 "$(image_status u-scrub/img-expired.png)"
+HEADERS="$(curl -s -D - -o /dev/null "$BASE/r2/u-scrub/img-fresh.png" | tr -d '\r')"
+check "the image route answers with its content type" 1 "$(echo "$HEADERS" | grep -ic '^content-type: image/png')"
+check "the image route answers with its caching header" 1 "$(echo "$HEADERS" | grep -ic '^cache-control: public, max-age=86400')"
+curl -s -o /dev/null "$BASE/__scheduled?cron=*/30+*+*+*+*"
+check "the purge deleted the expired image row" 0 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-expired'")"
+check "the purge deleted the expired image's R2 object" 404 "$(image_status u-scrub/img-expired.png)"
+check "the purge deleted the reports filed against the expired image" 0 "$(sql_value "SELECT COUNT(*) FROM image_reports WHERE image_id = 'img-expired'")"
+check "the purge kept the image that has not expired" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-fresh'")"
+check "the purge kept the fresh image's R2 object" 200 "$(image_status u-scrub/img-fresh.png)"
+check "the purge kept the fresh image's reports" 1 "$(sql_value "SELECT COUNT(*) FROM image_reports WHERE image_id = 'img-fresh'")"
+check "the purge kept the expired image of a tenant that keeps its images" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-pixie-old'")"
+check "the purge kept that tenant's R2 object" 200 "$(image_status u-pixie/img-pixie-old.png)"
+check "the scrubbed tenant's other images are untouched by the purge" 2 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE app_id = 'scrubme'")"
 
 echo "== api key hashing"
 call GET /v1/credits/balance key_free
@@ -472,7 +502,10 @@ check "art wrote usage rows" 1 "$(sql_value "SELECT CASE WHEN COUNT(*) >= 2 THEN
 call POST /v1/images/generations key_pixie '{"prompt":"a cat on a roof","n":1}' pixie
 check "another tenant's image request 200" 200 "$STATUS"
 check "another tenant still gets a stored image url" yes "$(python3 -I -c 'import json;d=json.load(open("'"$BODY"'"));print("yes" if d["data"][0].get("url") else "no")')"
+check "a stored image url points at the public gateway" yes "$(python3 -I -c 'import json;d=json.load(open("'"$BODY"'"));print("yes" if d["data"][0]["url"].startswith("https://api.midgarcorp.cc/v1/intelligence/r2/u-pixie/") and d["data"][0]["url"].endswith(".png") else "no")')"
 check "another tenant's image row is stored with its prompt" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE app_id = 'pixie' AND prompt = 'a cat on a roof'")"
+call GET /v1/images/user/u-pixie key_pixie "" pixie
+check "the gallery lists the kept image under the public gateway url" "https://api.midgarcorp.cc/v1/intelligence/r2/u-pixie/img-pixie-old.png" "$(python3 -I -c 'import json;d=json.load(open("'"$BODY"'"));print(next((i["url"] for i in d["images"] if i["id"] == "img-pixie-old"), "MISSING"))')"
 call POST /v1/images/generations key_pixie '{"prompt":"a cat","style":"ink","n":1}' pixie
 check "a stray style field from a tenant without styles is ignored" 200 "$STATUS"
 
