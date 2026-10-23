@@ -203,6 +203,9 @@ INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, model, size, cre
  ('img-expired', 'scrubme', 'u-scrub', 'u-scrub/img-expired.png', 'an expired dream', 'm', '1024x1024', '2026-01-01T00:00:00+00:00', '2026-01-08T00:00:00+00:00'),
  ('img-fresh', 'scrubme', 'u-scrub', 'u-scrub/img-fresh.png', 'a fresh dream', 'm', '1024x1024', '$NOW', '2099-01-01T00:00:00+00:00'),
  ('img-pixie-old', 'pixie', 'u-pixie', 'u-pixie/img-pixie-old.png', 'an old pixie edit', 'm', '1024x1024', '2026-01-01T00:00:00+00:00', '2026-01-08T00:00:00+00:00');
+INSERT INTO apps (app_id, name, purge_expired_images) VALUES ('scrubme', 'Scrub Me', 1);
+INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, model, size, created_at, expires_at) VALUES
+ ('img-default-old', 'psywave', 'u-pixie', 'u-pixie/img-default-old.png', 'an old dream', 'm', '1024x1024', '2026-01-01T00:00:00+00:00', '2026-01-08T00:00:00+00:00');
 INSERT INTO image_reports (id, app_id, image_id, reporter_user_id, created_at) VALUES
  ('rep-expired', 'scrubme', 'img-expired', 'u-pixie', '$NOW'),
  ('rep-fresh', 'scrubme', 'img-fresh', 'u-pixie', '$NOW');
@@ -217,7 +220,7 @@ fi
 rm -f "$SEED"
 echo "PASS  seeded tenants, users, the test aliases and rows to delete"
 
-for object in u-scrub/img-expired u-scrub/img-fresh u-pixie/img-pixie-old; do
+for object in u-scrub/img-expired u-scrub/img-fresh u-pixie/img-pixie-old u-pixie/img-default-old; do
   printf 'png' > "$STATE/retention.png"
   wrangler_local r2 object put "$BUCKET/$object.png" --file "$STATE/retention.png" --local --content-type image/png >/dev/null 2>>"$LOG"
 done
@@ -262,8 +265,11 @@ check "the purge deleted the reports filed against the expired image" 0 "$(sql_v
 check "the purge kept the image that has not expired" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-fresh'")"
 check "the purge kept the fresh image's R2 object" 200 "$(image_status u-scrub/img-fresh.png)"
 check "the purge kept the fresh image's reports" 1 "$(sql_value "SELECT COUNT(*) FROM image_reports WHERE image_id = 'img-fresh'")"
-check "the purge kept the expired image of a tenant that keeps its images" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-pixie-old'")"
-check "the purge kept that tenant's R2 object" 200 "$(image_status u-pixie/img-pixie-old.png)"
+check "the purge kept the expired image of pixie, which has not opted in" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-pixie-old'")"
+check "the purge kept pixie's R2 object" 200 "$(image_status u-pixie/img-pixie-old.png)"
+check "only the tenant the test opted in has purge_expired_images set" 1 "$(sql_value "SELECT COUNT(*) FROM apps WHERE purge_expired_images = 1")"
+check "the purge kept the expired image of a tenant that has not opted in" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-default-old'")"
+check "the purge kept that tenant's R2 object" 200 "$(image_status u-pixie/img-default-old.png)"
 check "the scrubbed tenant's other images are untouched by the purge" 2 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE app_id = 'scrubme'")"
 
 echo "== api key hashing"

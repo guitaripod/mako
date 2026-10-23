@@ -9,11 +9,11 @@ pub const PURGE_BATCH: i64 = 200;
 
 const DELETE_CHUNK: usize = 50;
 
-/// The oldest expired images first, skipping every tenant flagged `apps.keep_images`. Timestamps are
-/// RFC 3339 in UTC, so comparing them as text orders them in time.
+/// The oldest expired images first, only for tenants that opted in with `apps.purge_expired_images = 1`.
+/// Timestamps are RFC 3339 in UTC, so comparing them as text orders them in time.
 pub const SELECT_EXPIRED_SQL: &str = "SELECT id, r2_key FROM stored_images
      WHERE expires_at <= ?1
-       AND app_id NOT IN (SELECT app_id FROM apps WHERE keep_images = 1)
+       AND app_id IN (SELECT app_id FROM apps WHERE purge_expired_images = 1)
      ORDER BY expires_at
      LIMIT ?2";
 
@@ -173,8 +173,14 @@ mod tests {
 
     fn database() -> LocalD1 {
         let db = LocalD1::migrated();
+        db.run("INSERT INTO apps (app_id, name) VALUES ('scrubme', 'Scrub Me')", &[]);
+        db.run("UPDATE apps SET purge_expired_images = 1 WHERE app_id = 'scrubme'", &[]);
         db.user("scrubme", "u", 0);
         db
+    }
+
+    fn selected(db: &LocalD1) -> usize {
+        block_on(db.rows(SELECT_EXPIRED_SQL, &[Val::from(NOW), Val::Int(10)])).unwrap().len()
     }
 
     #[test]
@@ -199,20 +205,56 @@ mod tests {
     }
 
     #[test]
-    fn a_tenant_that_keeps_its_images_is_never_selected() {
-        let db = database();
-        db.run("UPDATE apps SET keep_images = 0 WHERE app_id = 'pixie'", &[]);
-        add_image(&db, "pixie-old", "pixie", "2026-01-01T00:00:00+00:00");
-        assert_eq!(block_on(db.rows(SELECT_EXPIRED_SQL, &[Val::from(NOW), Val::Int(10)])).unwrap().len(), 1);
-        db.run("UPDATE apps SET keep_images = 1 WHERE app_id = 'pixie'", &[]);
-        assert_eq!(block_on(db.rows(SELECT_EXPIRED_SQL, &[Val::from(NOW), Val::Int(10)])).unwrap().len(), 0);
+    fn no_tenant_is_opted_in_by_the_migration() {
+        let db = LocalD1::migrated();
+        assert_eq!(db.int("SELECT COUNT(*) FROM apps WHERE purge_expired_images != 0", &[]), 0);
+        assert_eq!(db.int("SELECT purge_expired_images FROM apps WHERE app_id = 'pixie'", &[]), 0);
     }
 
     #[test]
-    fn the_migration_makes_pixie_keep_its_images_and_no_other_tenant() {
+    fn no_tenant_is_purged_by_default() {
         let db = LocalD1::migrated();
-        assert_eq!(db.int("SELECT keep_images FROM apps WHERE app_id = 'pixie'", &[]), 1);
-        assert_eq!(db.int("SELECT COUNT(*) FROM apps WHERE keep_images = 1 AND app_id != 'pixie'", &[]), 0);
+        db.user("pixie", "u", 0);
+        for app in ["pixie", "dreameater", "psywave"] {
+            add_image(&db, &format!("old-{app}"), app, "2026-01-01T00:00:00+00:00");
+        }
+        assert_eq!(selected(&db), 0);
+        let bucket = FakeBucket::new();
+        let report = block_on(purge_expired(&db, &bucket, NOW, PURGE_BATCH)).unwrap();
+        assert_eq!(report, PurgeReport::default());
+        assert!(bucket.deleted.borrow().is_empty());
+        assert_eq!(images(&db), 3);
+    }
+
+    #[test]
+    fn a_tenant_that_opted_in_is_purged_and_one_that_did_not_is_not() {
+        let db = database();
+        db.run("INSERT INTO apps (app_id, name) VALUES ('other', 'Other')", &[]);
+        add_image(&db, "opted-in", "scrubme", "2026-01-01T00:00:00+00:00");
+        add_image(&db, "not-opted-in", "other", "2026-01-01T00:00:00+00:00");
+        let rows = block_on(db.rows(SELECT_EXPIRED_SQL, &[Val::from(NOW), Val::Int(10)])).unwrap();
+        assert_eq!(parse_expired(&rows).into_iter().map(|i| i.id).collect::<Vec<_>>(), vec!["opted-in"]);
+        db.run("UPDATE apps SET purge_expired_images = 0 WHERE app_id = 'scrubme'", &[]);
+        assert_eq!(selected(&db), 0);
+    }
+
+    #[test]
+    fn a_tenant_without_an_apps_row_is_never_purged() {
+        let db = LocalD1::migrated();
+        db.user("ghost", "u", 0);
+        add_image(&db, "orphan", "ghost", "2026-01-01T00:00:00+00:00");
+        assert_eq!(selected(&db), 0);
+    }
+
+    #[test]
+    fn pixie_is_never_purged_while_it_is_not_opted_in() {
+        let db = database();
+        add_image(&db, "pixie-old", "pixie", "2026-01-01T00:00:00+00:00");
+        add_image(&db, "scrub-old", "scrubme", "2026-01-01T00:00:00+00:00");
+        let bucket = FakeBucket::new();
+        block_on(purge_expired(&db, &bucket, NOW, PURGE_BATCH)).unwrap();
+        assert_eq!(db.int("SELECT COUNT(*) FROM stored_images WHERE id = 'pixie-old'", &[]), 1);
+        assert_eq!(bucket.deleted.borrow().len(), 1);
     }
 
     #[test]
