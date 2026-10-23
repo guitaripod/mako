@@ -47,6 +47,21 @@ ENVIRONMENT = "production"
 # to a Midgar ID no user is linked to yet; see docs/p3.07-wallet-design.md.
 WALLET_LINKING = "off"
 
+# Identity tells mako when a Midgar ID is deleted (POST /internal/wallet/erase_all) or merged away (POST
+# /internal/wallet/merge). Both routes need the WALLET_LIFECYCLE_SECRET secret, the same value on midgar-identity, and
+# answer 404 without it. They work whether WALLET_LINKING is on or off, because the money stays in the wallet objects.
+
+# P3.07 step 7. Not set: every provider call goes straight to its provider. Set AI_GATEWAY_BASE to
+# "https://gateway.ai.cloudflare.com/v1/<account id>/<gateway id>" to send chat and Gemini calls through Cloudflare AI
+# Gateway (OpenAI images and the realtime mint always stay direct); it needs the CF_AIG_TOKEN secret, and unsetting the
+# variable and redeploying is the way back. See docs/p3.07-wallet-design.md, section 12.
+
+# P3.07 step 9. "on" opens POST /internal/wallet/grant, where midgar-ledger forwards a verified consumable credit-pack
+# transaction for a Midgar ID that is already linked, credited once under tx:<transactionId> (the key the RevenueCat
+# webhook and the validate call share). Anything else hides the route (404). Needs the WALLET_INTERNAL_SECRET secret,
+# the same value on midgar-ledger, and WALLET_LINKING = "on"; the ledger forwards only when its own LEDGER_GRANTS is on.
+LEDGER_GRANTS = "off"
+
 # Rate-limit enforcement switch. "false" = shadow (log would-be-limits, never
 # block); "true" = enforce. Kept off until shadow logs confirm no legit traffic
 # trips the generous per-user thresholds.

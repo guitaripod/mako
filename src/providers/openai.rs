@@ -6,11 +6,17 @@ use uuid;
 use crate::error::AppError;
 use crate::deployment::{DeploymentConfig, DeploymentMode};
 use crate::credits::estimate_image_cost;
+use super::route::Routing;
+use crate::handlers::chat::Provider;
 use super::{ImageProvider, UnifiedImageRequest, UnifiedEditRequest, ProviderResponse, ImageBytes, CostEstimate, ProviderFeatures};
 use crate::models::ImageResponse;
 
-const OPENAI_API_URL: &str = "https://api.openai.com/v1/images/generations";
-const OPENAI_EDIT_URL: &str = "https://api.openai.com/v1/images/edits";
+const OPENAI_GENERATIONS_TAIL: &str = "images/generations";
+const OPENAI_EDITS_TAIL: &str = "images/edits";
+
+fn openai_route(tail: &str) -> String {
+    Routing::direct().route(&Provider::OpenAI, tail).url
+}
 
 pub struct OpenAIProvider {
     api_key: String,
@@ -91,7 +97,7 @@ impl ImageProvider for OpenAIProvider {
             "user": request.user,
         });
 
-        let response = self.call_openai_api(OPENAI_API_URL, request_body, &api_key).await?;
+        let response = self.call_openai_api(&openai_route(OPENAI_GENERATIONS_TAIL), request_body, &api_key).await?;
 
         let mut images = Vec::new();
         let mut revised_prompts = Vec::new();
@@ -214,7 +220,7 @@ impl ImageProvider for OpenAIProvider {
             .with_headers(headers)
             .with_body(Some(worker::wasm_bindgen::JsValue::from(body)));
 
-        let worker_request = WorkerRequest::new_with_init(OPENAI_EDIT_URL, &init)?;
+        let worker_request = WorkerRequest::new_with_init(&openai_route(OPENAI_EDITS_TAIL), &init)?;
         let mut response = Fetch::Request(worker_request).send().await?;
 
         if response.status_code() >= 400 {

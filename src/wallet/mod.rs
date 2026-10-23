@@ -1,7 +1,10 @@
+mod absorb;
 mod books;
 pub mod client;
 pub mod d1;
 mod ledger;
+pub mod ledger_grant;
+pub mod lifecycle;
 pub mod link;
 pub mod links;
 pub mod log;
@@ -20,6 +23,10 @@ mod memory;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod testing;
 #[cfg(all(test, not(target_arch = "wasm32")))]
+mod ledger_grant_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lifecycle_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod link_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod ops_tests;
@@ -35,4 +42,4 @@ pub use ledger::{apply, migrate, migrate_amount, reverse, verify, welcome_key};
 pub use object::Wallet;
 pub use route::handle;
 pub use sql::{SqlBooks, SqlExec, Val};
-pub use types::{Balance, Entry, Kind, Migrated, Outcome, Reversed, StoredEntry, Verification, WalletError};
+pub use types::{AbsorbItem, Absorbed, Balance, Entry, Kind, Migrated, Outcome, Reversed, Sealed, State, StoredEntry, TenantTotals, Verification, WalletError};

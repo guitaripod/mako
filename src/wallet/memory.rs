@@ -9,6 +9,7 @@ pub struct MemoryBooks {
     rows: Vec<StoredEntry>,
     balances: BTreeMap<String, Balance>,
     next_seq: i64,
+    meta: BTreeMap<String, String>,
 }
 
 impl Books for MemoryBooks {
@@ -64,6 +65,24 @@ impl Books for MemoryBooks {
         self.rows.retain(|r| r.tenant != tenant);
         self.balances.remove(tenant);
         Ok(before - self.rows.len())
+    }
+
+    fn meta(&self, key: &str) -> Result<Option<String>, WalletError> {
+        Ok(self.meta.get(key).cloned())
+    }
+
+    fn set_meta(&mut self, key: &str, value: &str) -> Result<(), WalletError> {
+        self.meta.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn delete_meta(&mut self, key: &str) -> Result<(), WalletError> {
+        self.meta.remove(key);
+        Ok(())
+    }
+
+    fn meta_keys(&self, prefix: &str) -> Result<Vec<String>, WalletError> {
+        Ok(self.meta.keys().filter(|key| key.starts_with(prefix)).cloned().collect())
     }
 }
 

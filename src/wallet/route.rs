@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::absorb;
 use super::books::Books;
 use super::ledger::{self, validate_tenant};
-use super::types::{Entry, Kind, Outcome, WalletError};
+use super::types::{AbsorbItem, Entry, Kind, Outcome, WalletError};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -23,28 +24,65 @@ struct EraseRequest {
     tenant: String,
 }
 
+/// The paths that change a wallet's money; an erased wallet refuses them.
+const WRITES: [&str; 4] = ["/grant", "/spend", "/reverse", "/migrate"];
+
+/// The body of `POST /seal`.
+#[derive(Debug, Deserialize)]
+struct SealRequest {
+    into: String,
+}
+
+/// The body of `POST /absorb`.
+#[derive(Debug, Deserialize)]
+struct AbsorbRequest {
+    from: String,
+    items: Vec<AbsorbItem>,
+}
+
 /// A status code with the JSON body to send.
 pub type Reply = (u16, Value);
 
 /// Handles one request to a wallet object. Pure and synchronous over `Books`, so the object calls
 /// it with no `await` between the reads and writes and the tests call it on any storage.
 pub fn handle(books: &mut impl Books, method: &str, path: &str, query: &str, body: &[u8], now: i64) -> Reply {
+    if method == "POST" && WRITES.contains(&path) {
+        match absorb::closed(books) {
+            Ok(None) => {}
+            Ok(Some(refusal)) => return failure(&refusal),
+            Err(e) => return failure(&e),
+        }
+    }
     let result = match (method, path) {
         ("POST", "/grant") => grant(books, body, now),
         ("POST", "/spend") => spend(books, body, now),
         ("POST", "/reverse") => reverse(books, body, now),
         ("POST", "/migrate") => migrate(books, body, now),
         ("POST", "/erase") => erase(books, body),
+        ("POST", "/erase_all") => erase_all(books, now),
+        ("POST", "/seal") => seal(books, body),
+        ("POST", "/absorb") => absorb_credits(books, body, now),
+        ("GET", "/state") => absorb::state(books).and_then(to_reply),
         ("GET", "/balance") => balance(books, query),
         ("GET", "/entries") => entries(books, query),
         ("GET", "/entry") => entry(books, query),
         ("GET", "/verify") => ledger::verify(books).and_then(to_reply),
-        (_, "/grant" | "/spend" | "/reverse" | "/migrate" | "/erase" | "/balance" | "/entries" | "/entry" | "/verify") => {
+        (_, "/grant" | "/spend" | "/reverse" | "/migrate" | "/erase" | "/erase_all" | "/seal" | "/absorb" | "/state" | "/balance" | "/entries" | "/entry" | "/verify") => {
             return (405, json!({ "error": "method_not_allowed" }));
         }
         _ => return (404, json!({ "error": "not_found" })),
     };
-    result.unwrap_or_else(|e| (e.status(), json!({ "error": e.code(), "message": e.message() })))
+    result.unwrap_or_else(|e| failure(&e))
+}
+
+/// The status and body an error answers with. A sealed wallet names the Midgar ID it was merged into, so the caller can
+/// follow it.
+fn failure(error: &WalletError) -> Reply {
+    let mut body = json!({ "error": error.code(), "message": error.message() });
+    if let WalletError::Sealed(into) = error {
+        body["sealed_into"] = json!(into);
+    }
+    (error.status(), body)
 }
 
 /// Serialises a successful result with status 200.
@@ -139,6 +177,26 @@ fn erase(books: &mut impl Books, body: &[u8]) -> Result<Reply, WalletError> {
     validate_tenant(&req.tenant)?;
     let erased = books.erase(&req.tenant)?;
     Ok((200, json!({ "erased": erased })))
+}
+
+/// `POST /erase_all`: deletes the entries and balance of every tenant and marks the wallet erased. Safe to repeat: the
+/// second run finds nothing to delete.
+fn erase_all(books: &mut impl Books, now: i64) -> Result<Reply, WalletError> {
+    let (entries, tenants) = absorb::erase_all(books, now)?;
+    Ok((200, json!({ "erased": entries, "tenants": tenants })))
+}
+
+/// `POST /seal`: refuses every later write and remembers the survivor.
+fn seal(books: &mut impl Books, body: &[u8]) -> Result<Reply, WalletError> {
+    let req: SealRequest = parse(body)?;
+    to_reply(absorb::seal(books, &req.into)?)
+}
+
+/// `POST /absorb`: takes the credits of a merged-away wallet, all tenants or none. A wallet that is sealed or erased
+/// answers 409 with the reason, and the survivor's id when it was merged away itself.
+fn absorb_credits(books: &mut impl Books, body: &[u8], now: i64) -> Result<Reply, WalletError> {
+    let req: AbsorbRequest = parse(body)?;
+    to_reply(absorb::absorb(books, &req.from, &req.items, now)?)
 }
 
 /// `GET /balance?tenant=`.

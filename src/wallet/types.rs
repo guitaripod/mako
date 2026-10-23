@@ -114,6 +114,47 @@ pub struct Migrated {
     pub replayed: bool,
 }
 
+/// One tenant's totals in a wallet, as `GET /state` and `POST /absorb` report them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantTotals {
+    pub tenant: String,
+    pub balance: i64,
+    pub purchased: i64,
+    pub spent: i64,
+}
+
+/// What a wallet knows about itself, for the code that merges or erases Midgar IDs: where it was merged to, whether it
+/// was erased, the Midgar IDs whose credits it absorbed, and the stored totals of every tenant (real, also when sealed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct State {
+    pub sealed_into: Option<String>,
+    pub erased: bool,
+    pub sources: Vec<String>,
+    pub tenants: Vec<TenantTotals>,
+}
+
+/// One tenant's balance moving into the survivor of a merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsorbItem {
+    pub tenant: String,
+    pub amount: i64,
+}
+
+/// The result of absorbing a merged-away wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Absorbed {
+    pub replayed: bool,
+    pub totals: Vec<TenantTotals>,
+}
+
+/// The result of sealing a wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Sealed {
+    pub erased: bool,
+    pub sealed_into: Option<String>,
+    pub replayed: bool,
+}
+
 /// The outcome of recomputing every tenant from the entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Verification {
@@ -129,6 +170,10 @@ pub enum WalletError {
     BadRequest(String),
     Conflict(String),
     Storage(String),
+    /// The Midgar ID was deleted and its wallet erased; nothing may be written to it again.
+    Erased,
+    /// The Midgar ID was merged into another; its wallet is sealed and holds the id of the survivor.
+    Sealed(String),
 }
 
 impl WalletError {
@@ -136,7 +181,7 @@ impl WalletError {
     pub fn status(&self) -> u16 {
         match self {
             WalletError::BadRequest(_) => 400,
-            WalletError::Conflict(_) => 409,
+            WalletError::Conflict(_) | WalletError::Erased | WalletError::Sealed(_) => 409,
             WalletError::Storage(_) => 500,
         }
     }
@@ -147,6 +192,8 @@ impl WalletError {
             WalletError::BadRequest(_) => "bad_request",
             WalletError::Conflict(_) => "idempotency_conflict",
             WalletError::Storage(_) => "storage_error",
+            WalletError::Erased => "erased",
+            WalletError::Sealed(_) => "sealed",
         }
     }
 
@@ -154,6 +201,8 @@ impl WalletError {
     pub fn message(&self) -> &str {
         match self {
             WalletError::BadRequest(m) | WalletError::Conflict(m) | WalletError::Storage(m) => m,
+            WalletError::Erased => "this wallet was erased with its Midgar ID",
+            WalletError::Sealed(_) => "this wallet was merged into another Midgar ID",
         }
     }
 }

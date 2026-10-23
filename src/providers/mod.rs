@@ -6,6 +6,7 @@ use crate::error::AppError;
 
 pub mod openai;
 pub mod gemini;
+pub mod route;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedImageRequest {
@@ -84,12 +85,12 @@ pub trait ImageProvider {
     fn get_name(&self) -> &str;
 }
 
-pub fn get_provider(model: &str, env: &worker::Env) -> Result<Box<dyn ImageProvider>> {
+pub fn get_provider(model: &str, env: &worker::Env, policy: &crate::tenant::TenantPolicy) -> Result<Box<dyn ImageProvider>> {
     if crate::mock::enabled(env) {
         return Ok(Box::new(crate::mock::MockImageProvider));
     }
     if let Some(gemini_model) = gemini::GeminiImageModel::from_model_id(model) {
-        return Ok(Box::new(gemini::GeminiProvider::new(env, gemini_model)?));
+        return Ok(Box::new(gemini::GeminiProvider::new(env, gemini_model, route::Routing::for_policy(env, policy)?)?));
     }
     match model {
         "gpt-image-1" | "gpt-image-2" => Ok(Box::new(openai::OpenAIProvider::new(env)?)),

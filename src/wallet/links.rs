@@ -78,6 +78,12 @@ pub async fn oldest_for_midgar(db: &impl D1Exec, app_id: &str, midgar_id: &str) 
     db.rows(&sql, &[app_id.into(), midgar_id.into()]).await?.first().map(LinkRow::parse).transpose()
 }
 
+/// Every link that names a Midgar ID, in any state and any tenant.
+pub async fn of_midgar(db: &impl D1Exec, midgar_id: &str) -> Result<Vec<LinkRow>, AppError> {
+    let sql = format!("SELECT {COLUMNS} FROM wallet_links WHERE midgar_id = ?1 ORDER BY app_id, user_id");
+    db.rows(&sql, &[midgar_id.into()]).await?.iter().map(LinkRow::parse).collect()
+}
+
 /// Step 1 of the saga: records the intent to link. A user that already has a row keeps it.
 pub async fn insert_moving(db: &impl D1Exec, app_id: &str, user_id: &str, midgar_id: &str, now: &str) -> Result<(), AppError> {
     let sql = "INSERT OR IGNORE INTO wallet_links (app_id, user_id, midgar_id, state, linked_at) VALUES (?1, ?2, ?3, 'moving', ?4)";

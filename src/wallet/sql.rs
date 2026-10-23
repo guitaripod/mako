@@ -187,4 +187,27 @@ impl<S: SqlExec> Books for SqlBooks<S> {
         self.query("DELETE FROM balances WHERE tenant = ?", &[tenant.into()])?;
         Ok(removed as usize)
     }
+
+    fn meta(&self, key: &str) -> Result<Option<String>, WalletError> {
+        let rows = self.query("SELECT value FROM meta WHERE key = ?", &[key.into()])?;
+        rows.first().map(|row| text(row, 0)).transpose()
+    }
+
+    fn set_meta(&mut self, key: &str, value: &str) -> Result<(), WalletError> {
+        self.query(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            &[key.into(), value.into()],
+        )?;
+        Ok(())
+    }
+
+    fn delete_meta(&mut self, key: &str) -> Result<(), WalletError> {
+        self.query("DELETE FROM meta WHERE key = ?", &[key.into()])?;
+        Ok(())
+    }
+
+    fn meta_keys(&self, prefix: &str) -> Result<Vec<String>, WalletError> {
+        let rows = self.query("SELECT key FROM meta WHERE substr(key, 1, length(?)) = ? ORDER BY key", &[prefix.into(), prefix.into()])?;
+        rows.iter().map(|row| text(row, 0)).collect()
+    }
 }

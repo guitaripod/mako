@@ -40,6 +40,15 @@ purchase_event() {
   printf '{"api_version":"1.0","event":{"app_user_id":"%s","environment":"PRODUCTION","event_timestamp_ms":1,"id":"ev-%s","is_family_share":false,"product_id":"com.dreameater.credits.%s","purchased_at_ms":1,"store":"APP_STORE","transaction_id":"%s","type":"%s"}}' "$user" "$tx" "$product" "$tx" "$kind"
 }
 
+internal_call() {
+  local path="$1" secret="$2" body="$3"
+  local args=(-s -o "$BODY" -w '%{http_code}' -X POST "$BASE$path" -H "Content-Type: application/json" --data "$body")
+  if [ -n "$secret" ]; then
+    args+=(-H "X-Midgar-Internal: $secret")
+  fi
+  STATUS=$(curl "${args[@]}")
+}
+
 summary_of() {
   sql_value "SELECT $1 FROM wallet_summary WHERE app_id = 'dreameater' AND midgar_id = '$2'"
 }
@@ -117,9 +126,15 @@ call_native GET /v1/credits/balance "$(minted_token native)"
 check "the flag off refuses a token in the bearer slot" 401 "$STATUS"
 check "the flag off creates no Midgar user" 0 "$(sql_value "SELECT COUNT(*) FROM users WHERE provider = 'midgar'")"
 
+for route in grant erase_all; do
+  internal_call "/internal/wallet/$route" "$LIFECYCLE_SECRET" '{}'
+  check "the internal $route route does not exist while its secret is unset" 404 "$STATUS"
+done
+
 echo "== restarting with WALLET_LINKING on"
 stop_server
-printf 'WALLET_LINKING=on\nIDENTITY_LOOKUP_SECRET=%s\n' "$LOOKUP_SECRET" >> "$DEV_VARS"
+printf 'WALLET_LINKING=on\nIDENTITY_LOOKUP_SECRET=%s\nWALLET_LIFECYCLE_SECRET=%s\nWALLET_INTERNAL_SECRET=%s\nLEDGER_GRANTS=on\n' \
+  "$LOOKUP_SECRET" "$LIFECYCLE_SECRET" "$GRANT_SECRET" >> "$DEV_VARS"
 if ! start_server; then
   exit 1
 fi
@@ -278,6 +293,90 @@ call GET /v1/credits/balance key_unknown
 check "an unknown API key is still refused" 401 "$STATUS"
 
 verify_with_linking_on
+
+echo "== identity deleted a Midgar ID: its wallet is erased and stays erased"
+internal_call /internal/wallet/erase_all "" "{\"id\":\"$M_SECOND\"}"
+check "the erase route refuses a request without the secret" 401 "$STATUS"
+internal_call /internal/wallet/erase_all "$GRANT_SECRET" "{\"id\":\"$M_SECOND\"}"
+check "and one with the other route's secret" 401 "$STATUS"
+internal_call /internal/wallet/erase_all "$LIFECYCLE_SECRET" '{"id":"not-a-midgar-id"}'
+check "an id that cannot be a Midgar ID is ignored, not retried for ever" 200 "$STATUS"
+check "and says so" ignored "$(json_get status)"
+check "before the erasure the wallet holds the purchase" 5 "$(summary_of balance "$M_SECOND")"
+M1_BEFORE="$(summary_of balance "$M1")"
+internal_call /internal/wallet/erase_all "$LIFECYCLE_SECRET" "{\"id\":\"$(upper "$M_SECOND")\"}"
+check "the erasure is accepted for the ID in capitals" 200 "$STATUS"
+check "and reports an erased wallet" erased "$(json_get status)"
+check "its mirror row is gone" 0 "$(sql_value "SELECT COUNT(*) FROM wallet_summary WHERE midgar_id = '$M_SECOND'")"
+check "its link row is gone" 0 "$(sql_value "SELECT COUNT(*) FROM wallet_links WHERE midgar_id = '$M_SECOND'")"
+internal_call /internal/wallet/erase_all "$LIFECYCLE_SECRET" "{\"id\":\"$M_SECOND\"}"
+check "erasing again is a no-op" no_wallet "$(json_get status)"
+check "another Midgar ID's wallet is untouched" "$M1_BEFORE" "$(summary_of balance "$M1")"
+webhook "$(purchase_event "$M_SECOND" tx-after-erase)"
+check "a purchase addressed to the erased ID is refused so the sender retries" 500 "$STATUS"
+check "and credits nothing" 0 "$(sql_value "SELECT COALESCE(SUM(balance), 0) FROM wallet_summary WHERE midgar_id = '$M_SECOND'")"
+
+echo "== identity merged a Midgar ID away: its wallet moves into the survivor's"
+M_MERGED="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d4d"
+MNOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sql_json "INSERT INTO users (id, provider, provider_id, name, api_key_hash, created_at, updated_at, app_id) VALUES ('u-merge', 'anonymous', 'merge', 'Merge', '$(key_hash key_merge)', '$MNOW', '$MNOW', 'dreameater')" >/dev/null
+sql_json "INSERT INTO user_credits (app_id, user_id, balance, created_at, updated_at) VALUES ('dreameater', 'u-merge', 0, '$MNOW', '$MNOW')" >/dev/null
+sql_json "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, moved_credits, welcome_part, linked_at) VALUES ('dreameater', 'u-merge', '$M_MERGED', 'linked', 0, 0, '$MNOW')" >/dev/null
+webhook "$(purchase_event u-merge tx-merge-1)"
+check "a purchase reaches the wallet that is about to be merged away" 200 "$STATUS"
+check "which holds it" 5 "$(summary_of balance "$M_MERGED")"
+call GET /v1/credits/balance key_merge
+check "and the user reads it" 5 "$(json_get balance)"
+M1_BEFORE_MERGE="$(summary_of balance "$M1")"
+internal_call /internal/wallet/merge "" "{\"from\":\"$M_MERGED\",\"to\":\"$M1\"}"
+check "the merge route refuses a request without the secret" 401 "$STATUS"
+internal_call /internal/wallet/merge "$GRANT_SECRET" "{\"from\":\"$M_MERGED\",\"to\":\"$M1\"}"
+check "and one with the grant route's secret" 401 "$STATUS"
+internal_call /internal/wallet/merge "$LIFECYCLE_SECRET" '{"from":"nope","to":"nope"}'
+check "an ID that cannot be a Midgar ID is ignored, not retried for ever" ignored "$(json_get status)"
+internal_call /internal/wallet/merge "$LIFECYCLE_SECRET" "{\"from\":\"$(upper "$M_MERGED")\",\"to\":\"$(upper "$M1")\"}"
+check "the merge is accepted for IDs in capitals" 200 "$STATUS"
+check "and reports what it moved" "merged 1 5" "$(json_get status) $(json_get tenants) $(json_get credits)"
+check "the survivor's mirror holds the merged credits" $((M1_BEFORE_MERGE + 5)) "$(summary_of balance "$M1")"
+check "the merged-away mirror row is gone" 0 "$(sql_value "SELECT COUNT(*) FROM wallet_summary WHERE midgar_id = '$M_MERGED'")"
+check "the user's link names the survivor" "$M1" "$(sql_value "SELECT midgar_id FROM wallet_links WHERE user_id = 'u-merge'")"
+call GET /v1/credits/balance key_merge
+check "the merged user now reads the survivor's wallet" $((M1_BEFORE_MERGE + 5)) "$(json_get balance)"
+call GET /v1/credits/balance key_link
+check "and so does the survivor's own user" $((M1_BEFORE_MERGE + 5)) "$(json_get balance)"
+internal_call /internal/wallet/merge "$LIFECYCLE_SECRET" "{\"from\":\"$M_MERGED\",\"to\":\"$M1\"}"
+check "a repeated merge is a no-op" no_wallet "$(json_get status)"
+check "and changes no balance" $((M1_BEFORE_MERGE + 5)) "$(summary_of balance "$M1")"
+call POST /v1/run/chat.completion key_merge '{"messages":[{"role":"user","content":"after the merge"}],"response_json":true}'
+check "the merged user spends from the survivor's wallet" 200 "$STATUS"
+check "which paid for it" $((M1_BEFORE_MERGE + 4)) "$(balance_of key_link)"
+
+echo "== the ledger forwards a verified consumable: credited once, shared with the other paths"
+M1_BEFORE_GRANT="$(balance_of key_link)"
+grant_body() {
+  printf '{"transactionId":"%s","originalTransactionId":"%s","bundleId":"com.marcusziade.DreamEater","productId":"com.dreameater.credits.small","type":"Consumable","appAccountToken":"%s","environment":"Production","purchaseDate":1760000000000,"revocationDate":null,"inAppOwnershipType":"PURCHASED","quantity":1,"registrySlug":"dream-eater"}' "$1" "$1" "$2"
+}
+internal_call /internal/wallet/grant "" "$(grant_body tx-led-1 "$M1")"
+check "the grant route refuses a request without the secret" 401 "$STATUS"
+internal_call /internal/wallet/grant "$LIFECYCLE_SECRET" "$(grant_body tx-led-1 "$M1")"
+check "and one with the lifecycle secret" 401 "$STATUS"
+internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body tx-led-1 "$(upper "$M1")")"
+check "a verified consumable for a linked Midgar ID is accepted" 200 "$STATUS"
+check "and credited" credited "$(json_get status)"
+check "the wallet holds the pack" $((M1_BEFORE_GRANT + 5)) "$(balance_of key_link)"
+internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body tx-led-1 "$M1")"
+check "the same transaction again" duplicate "$(json_get status)"
+check "gives one wallet entry" $((M1_BEFORE_GRANT + 5)) "$(balance_of key_link)"
+check "and one purchase row" 1 "$(sql_value "SELECT COUNT(*) FROM credit_purchases WHERE payment_id = 'tx-led-1'")"
+webhook "$(purchase_event u-link tx-led-1)"
+check "the RevenueCat webhook for the same transaction credits nothing more" $((M1_BEFORE_GRANT + 5)) "$(balance_of key_link)"
+internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body tx-led-2 "$M_UNKNOWN")"
+check "a Midgar ID nobody is linked to is refused for good, not retried" "refused not_linked" "$(json_get status) $(json_get reason)"
+check "and credits nothing" 0 "$(sql_value "SELECT COUNT(*) FROM credit_purchases WHERE payment_id = 'tx-led-2'")"
+internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body tx-led-3 "$M1" | sed 's/"type":"Consumable"/"type":"Non-Consumable"/')"
+check "a non-consumable is refused" "refused not_consumable" "$(json_get status) $(json_get reason)"
+internal_call /internal/wallet/grant "$GRANT_SECRET" '{"nope":1}'
+check "a body that is no transaction is a 400 the ledger logs" 400 "$STATUS"
 
 echo "== deleting an account erases its wallet partition"
 call_native DELETE /v1/identity "$(minted_token native)"

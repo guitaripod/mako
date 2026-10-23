@@ -245,6 +245,131 @@ pub fn entries_page_and_erase(books: &mut impl Books) {
     assert!(matches!(again, Outcome::Applied { balance: 1, .. }));
 }
 
+/// `erase_all` empties every tenant, is safe to repeat, and leaves a wallet that refuses writes but verifies clean.
+pub fn erase_all_empties_the_wallet_for_good(books: &mut impl Books) {
+    apply(books, &entry("tx:1", "alpha", Kind::Purchase, 10), NOW).unwrap();
+    apply(books, &entry("tx:2", "beta", Kind::Purchase, 3), NOW).unwrap();
+    apply(books, &entry("spend:a", "beta", Kind::Spend, -1), NOW).unwrap();
+    let (status, body) = call(books, "POST", "/erase_all", json!({}));
+    assert_eq!((status, body), (200, json!({"erased": 3, "tenants": 2})));
+    let (status, body) = call(books, "POST", "/erase_all", json!({}));
+    assert_eq!((status, body), (200, json!({"erased": 0, "tenants": 0})));
+    assert_eq!(books.tenants().unwrap().len(), 0);
+    let grant = json!({"key":"tx:9","tenant":"alpha","kind":"purchase","amount":5,"source":"x","description":"Pack"});
+    let (status, body) = call(books, "POST", "/grant", grant);
+    assert_eq!((status, body["error"].as_str()), (409, Some("erased")));
+    let (status, body) = call(books, "GET", "/balance?tenant=alpha", json!({}));
+    assert_eq!((status, body), (200, json!({"balance":0,"purchased":0,"spent":0})));
+    assert!(verify(books).unwrap().ok);
+    assert_eq!(call(books, "GET", "/erase_all", json!({})).0, 405);
+}
+
+/// A sealed wallet refuses every write with the survivor's id, still reads its stored totals, and keeps its first target.
+pub fn a_sealed_wallet_refuses_writes_and_keeps_its_first_target(books: &mut impl Books) {
+    apply(books, &entry("tx:1", "app", Kind::Purchase, 10), NOW).unwrap();
+    let (status, body) = call(books, "POST", "/seal", json!({"into": "survivor"}));
+    assert_eq!((status, body["sealed_into"].as_str(), body["replayed"].as_bool()), (200, Some("survivor"), Some(false)));
+    let (_, again) = call(books, "POST", "/seal", json!({"into": "someone-else"}));
+    assert_eq!((again["sealed_into"].as_str(), again["replayed"].as_bool()), (Some("survivor"), Some(true)));
+    let grant = json!({"key":"tx:2","tenant":"app","kind":"purchase","amount":5,"source":"x","description":"Pack"});
+    let spend = json!({"key":"spend:a","tenant":"app","kind":"spend","amount":-1,"source":"usage","description":"Chat"});
+    let reverse = json!({"key":"reverse:a","tenant":"app","kind":"reversal","amount":-1,"source":"usage","description":"Refund"});
+    let migrate = json!({"tenant":"app","key":"migrate:app:u","moved":3,"welcome_part":0});
+    for (path, body) in [("/grant", grant), ("/spend", spend), ("/reverse", reverse), ("/migrate", migrate)] {
+        let (status, answer) = call(books, "POST", path, body);
+        assert_eq!((status, answer["error"].as_str(), answer["sealed_into"].as_str()), (409, Some("sealed"), Some("survivor")), "{path}");
+    }
+    let (_, balance) = call(books, "GET", "/balance?tenant=app", json!({}));
+    assert_eq!(balance["balance"], 10);
+    let (_, state) = call(books, "GET", "/state", json!({}));
+    assert_eq!((state["sealed_into"].as_str(), state["erased"].as_bool()), (Some("survivor"), Some(false)));
+    assert_eq!(state["tenants"], json!([{"tenant":"app","balance":10,"purchased":10,"spent":0}]));
+    assert!(verify(books).unwrap().ok);
+    assert_eq!(call(books, "POST", "/seal", json!({"into": ""})).0, 400);
+}
+
+/// An absorb takes every tenant or none, once per merged-away ID, and records where the credits came from.
+pub fn absorb_takes_all_tenants_once_and_records_the_source(books: &mut impl Books) {
+    apply(books, &entry("tx:own", "alpha", Kind::Purchase, 5), NOW).unwrap();
+    let items = json!({"from": "old", "items": [{"tenant": "alpha", "amount": 7}, {"tenant": "beta", "amount": 3}]});
+    let (status, body) = call(books, "POST", "/absorb", items.clone());
+    assert_eq!((status, body["replayed"].as_bool()), (200, Some(false)));
+    assert_eq!(
+        body["totals"],
+        json!([{"tenant":"alpha","balance":12,"purchased":5,"spent":0},{"tenant":"beta","balance":3,"purchased":0,"spent":0}])
+    );
+    let (status, body) = call(books, "POST", "/absorb", items);
+    assert_eq!((status, body["replayed"].as_bool()), (200, Some(true)));
+    assert_eq!(books.balance("alpha").unwrap().balance, 12);
+    assert_eq!(books.balance("beta").unwrap().balance, 3);
+    let stored = books.find("merge:old:alpha").unwrap().unwrap();
+    assert_eq!((stored.kind, stored.amount, stored.source.as_str(), stored.reference.as_deref()), (Kind::Adjust, 7, "merge", Some("old")));
+    assert_eq!(books.entries("alpha", None, 10).unwrap().len(), 2);
+    let (_, state) = call(books, "GET", "/state", json!({}));
+    assert_eq!(state["sources"], json!(["old"]));
+    let other = json!({"from": "older", "items": [{"tenant": "alpha", "amount": 1}]});
+    assert_eq!(call(books, "POST", "/absorb", other).1["totals"][0]["balance"], 13);
+    let (_, state) = call(books, "GET", "/state", json!({}));
+    assert_eq!(state["sources"], json!(["old", "older"]));
+    assert!(verify(books).unwrap().ok);
+}
+
+/// A malformed absorb writes nothing: not even the tenants that were fine.
+pub fn a_bad_absorb_writes_nothing(books: &mut impl Books) {
+    for items in [
+        json!([{"tenant": "alpha", "amount": 2}, {"tenant": "*", "amount": 1}]),
+        json!([{"tenant": "alpha", "amount": 2}, {"tenant": "beta", "amount": 0}]),
+        json!([{"tenant": "alpha", "amount": 2}, {"tenant": "beta", "amount": -1}]),
+        json!([{"tenant": "alpha", "amount": 2}, {"tenant": "alpha", "amount": 1}]),
+    ] {
+        let (status, _) = call(books, "POST", "/absorb", json!({"from": "old", "items": items}));
+        assert!(status == 400 || status == 409, "{status}");
+        assert_eq!(books.tenants().unwrap().len(), 0, "{items}");
+        assert!(books.meta("absorbed:old").unwrap().is_none());
+    }
+    assert_eq!(call(books, "POST", "/absorb", json!({"from": "", "items": []})).0, 400);
+}
+
+/// A wallet that was merged away itself still answers for what it took before, and points on for anything new.
+pub fn a_sealed_survivor_answers_for_what_it_took_and_points_on(books: &mut impl Books) {
+    let first = json!({"from": "old", "items": [{"tenant": "alpha", "amount": 4}]});
+    assert_eq!(call(books, "POST", "/absorb", first.clone()).0, 200);
+    call(books, "POST", "/seal", json!({"into": "newer"}));
+    let (status, body) = call(books, "POST", "/absorb", first);
+    assert_eq!((status, body["replayed"].as_bool()), (200, Some(true)));
+    let new = json!({"from": "another", "items": [{"tenant": "alpha", "amount": 1}]});
+    let (status, body) = call(books, "POST", "/absorb", new);
+    assert_eq!((status, body["error"].as_str(), body["sealed_into"].as_str()), (409, Some("sealed"), Some("newer")));
+    assert_eq!(books.balance("alpha").unwrap().balance, 4);
+}
+
+/// Erasing clears the seal and the record of absorbed IDs, and an erased wallet refuses an absorb.
+pub fn erase_all_clears_the_seal_and_the_sources(books: &mut impl Books) {
+    call(books, "POST", "/absorb", json!({"from": "old", "items": [{"tenant": "alpha", "amount": 4}]}));
+    call(books, "POST", "/seal", json!({"into": "newer"}));
+    assert_eq!(call(books, "POST", "/erase_all", json!({})).0, 200);
+    let (_, state) = call(books, "GET", "/state", json!({}));
+    assert_eq!((state["sealed_into"].is_null(), state["erased"].as_bool(), state["sources"].clone(), state["tenants"].clone()), (true, Some(true), json!([]), json!([])));
+    let (status, body) = call(books, "POST", "/absorb", json!({"from": "again", "items": [{"tenant": "alpha", "amount": 1}]}));
+    assert_eq!((status, body["error"].as_str()), (409, Some("erased")));
+    let (_, sealed) = call(books, "POST", "/seal", json!({"into": "x"}));
+    assert_eq!((sealed["erased"].as_bool(), sealed["sealed_into"].is_null()), (Some(true), true));
+}
+
+#[test]
+fn the_merge_objects_behave_in_memory() {
+    a_sealed_wallet_refuses_writes_and_keeps_its_first_target(&mut MemoryBooks::default());
+    absorb_takes_all_tenants_once_and_records_the_source(&mut MemoryBooks::default());
+    a_bad_absorb_writes_nothing(&mut MemoryBooks::default());
+    a_sealed_survivor_answers_for_what_it_took_and_points_on(&mut MemoryBooks::default());
+    erase_all_clears_the_seal_and_the_sources(&mut MemoryBooks::default());
+}
+
+#[test]
+fn erase_all_empties_the_wallet_for_good_in_memory() {
+    erase_all_empties_the_wallet_for_good(&mut MemoryBooks::default());
+}
+
 #[test]
 fn replay_returns_the_stored_result_in_memory() {
     replay_returns_the_stored_result(&mut MemoryBooks::default());

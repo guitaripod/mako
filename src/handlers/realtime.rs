@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use chrono::{Utc, Duration};
 use crate::error::AppError;
+use crate::handlers::chat::Provider;
 use crate::auth::{authenticate_account, authenticate_with_token};
 use crate::credits::get_flat_capability_cost;
 use crate::ledgers::{Account, Ledgers};
@@ -16,8 +17,8 @@ const DEFAULT_RATE_CREDITS: u32 = 1; // 1 credit per minute
 /// at once, so each session reserves only this tiny guard rather than the whole
 /// balance; the real cost is billed from the reported minutes at settle.
 const RESERVE_GUARD_MINUTES: i32 = 1;
-const OPENAI_MINT_URL: &str = "https://api.openai.com/v1/realtime/translations/client_secrets";
-const OPENAI_SDP_URL: &str = "https://api.openai.com/v1/realtime/translations/calls";
+const OPENAI_MINT_TAIL: &str = "realtime/translations/client_secrets";
+const OPENAI_SDP_TAIL: &str = "realtime/translations/calls";
 const DEFAULT_MODEL: &str = "gpt-realtime-translate";
 /// A translations session emits `input_transcript` deltas ONLY when an input
 /// transcription model is configured; with none, the client's "what was heard"
@@ -158,7 +159,7 @@ async fn start_inner(mut req: Request, ctx: RouteContext<()>) -> std::result::Re
         session_id,
         client_secret,
         expires_at,
-        sdp_url: OPENAI_SDP_URL.to_string(),
+        sdp_url: crate::providers::route::direct_url(&Provider::OpenAI, OPENAI_SDP_TAIL),
         model,
         reserved_minutes,
         rate_credits: rate,
@@ -414,7 +415,7 @@ async fn mint_ephemeral(
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body.to_string())));
-    let request = Request::new_with_init(OPENAI_MINT_URL, &init)?;
+    let request = Request::new_with_init(&crate::providers::route::Routing::direct().route(&Provider::OpenAI, OPENAI_MINT_TAIL).url, &init)?;
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {

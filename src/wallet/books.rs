@@ -26,4 +26,16 @@ pub trait Books {
 
     /// Deletes a tenant's entries and balance row, returning how many entries went.
     fn erase(&mut self, tenant: &str) -> Result<usize, WalletError>;
+
+    /// A value kept in the object's `meta` table.
+    fn meta(&self, key: &str) -> Result<Option<String>, WalletError>;
+
+    /// Stores a `meta` value, replacing the old one.
+    fn set_meta(&mut self, key: &str, value: &str) -> Result<(), WalletError>;
+
+    /// Removes a `meta` value.
+    fn delete_meta(&mut self, key: &str) -> Result<(), WalletError>;
+
+    /// The `meta` keys that start with `prefix`, in key order.
+    fn meta_keys(&self, prefix: &str) -> Result<Vec<String>, WalletError>;
 }

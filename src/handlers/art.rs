@@ -103,7 +103,7 @@ async fn run(
     let prompt = compose_prompt(&style.fragment, &style.suffix, &request.scene, request.mood.as_deref());
     let stored_prompt = policy.prompt_for_storage(&prompt);
 
-    let provider = match providers::get_provider(ART_MODEL, env) {
+    let provider = match providers::get_provider(ART_MODEL, env, policy) {
         Ok(p) => p,
         Err(e) => return AppError::from(e).to_response(),
     };

@@ -1446,21 +1446,7 @@ pub struct RevenueCatEvent {
 /// id against each app's `rc_product_prefix`. Longest matching prefix wins (most
 /// specific tenant). Returns (app_id, matched_prefix).
 async fn resolve_tenant_by_product(db: &worker::D1Database, product_id: &str) -> Option<(String, String)> {
-    let row = db
-        .prepare(
-            "SELECT app_id, rc_product_prefix FROM apps
-             WHERE rc_product_prefix IS NOT NULL AND rc_product_prefix != ''
-               AND instr(?1, rc_product_prefix) = 1
-             ORDER BY length(rc_product_prefix) DESC LIMIT 1",
-        )
-        .bind(&[product_id.into()])
-        .ok()?
-        .first::<serde_json::Value>(None)
-        .await
-        .ok()??;
-    let app_id = row.get("app_id")?.as_str()?.to_string();
-    let prefix = row.get("rc_product_prefix")?.as_str()?.to_string();
-    Some((app_id, prefix))
+    crate::storekit::tenant_of_product(db, product_id).await.ok().flatten()
 }
 
 /// Tags a paid RevenueCat event that the credits ledger does not itself record —

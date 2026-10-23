@@ -58,7 +58,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         return Ok(Response::error("Another request is already in progress", 429)?);
     }
 
-    let provider = match providers::get_provider(&generation_req.model, &env) {
+    let provider = match providers::get_provider(&generation_req.model, &env, &policy) {
         Ok(p) => p,
         Err(e) => {
             let _ = release_lock(&app_id, &user_id, &db).await;
@@ -332,7 +332,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         return Ok(Response::error("Another request is already in progress", 429)?);
     }
 
-    let provider = match providers::get_provider(&edit_req.model, &env) {
+    let provider = match providers::get_provider(&edit_req.model, &env, &policy) {
         Ok(p) => p,
         Err(e) => {
             let _ = release_lock(&app_id, &user_id, &db).await;

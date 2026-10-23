@@ -70,6 +70,20 @@ fn entries_page_and_erase_on_sqlite() {
 }
 
 #[test]
+fn the_merge_objects_behave_on_sqlite() {
+    scenarios::a_sealed_wallet_refuses_writes_and_keeps_its_first_target(&mut fresh());
+    scenarios::absorb_takes_all_tenants_once_and_records_the_source(&mut fresh());
+    scenarios::a_bad_absorb_writes_nothing(&mut fresh());
+    scenarios::a_sealed_survivor_answers_for_what_it_took_and_points_on(&mut fresh());
+    scenarios::erase_all_clears_the_seal_and_the_sources(&mut fresh());
+}
+
+#[test]
+fn erase_all_empties_the_wallet_for_good_on_sqlite() {
+    scenarios::erase_all_empties_the_wallet_for_good(&mut fresh());
+}
+
+#[test]
 fn verify_finds_a_tampered_balance_on_sqlite() {
     let mut books = fresh();
     apply(&mut books, &entry("tx:1", "app", Kind::Purchase, 10), NOW).unwrap();

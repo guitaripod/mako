@@ -10,7 +10,8 @@ use crate::chat_alias::{
 };
 use crate::ledgers::Ledgers;
 use crate::error::AppError;
-use crate::handlers::chat::{Provider, ANTHROPIC_MESSAGES_URL, ANTHROPIC_VERSION, GEMINI_BASE, OPENAI_CHAT_URL};
+use crate::handlers::chat::{Provider, ANTHROPIC_MESSAGES_TAIL, ANTHROPIC_VERSION, OPENAI_CHAT_TAIL};
+use crate::providers::route::{Route, Routing};
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 
 /// Serves a chat request that names a server-side alias. The caller has already
@@ -52,7 +53,7 @@ async fn run(
 
     let system = compose_system_prompt(&cfg.system_prompt, request.language.as_deref());
     let turns = compose_turns(&request.messages, &request.input);
-    let reply = call_provider(env, cfg, &system, &turns).await?;
+    let reply = call_provider(env, db, &auth.app_id, cfg, &system, &turns).await?;
 
     let mut consumed_weekly = false;
     if plan.consumes_weekly {
@@ -302,7 +303,14 @@ fn kind_label(kind: ChargeKind) -> &'static str {
     }
 }
 
-async fn call_provider(env: &Env, cfg: &AliasConfig, system: &str, turns: &[Turn]) -> Result<Reply, AppError> {
+async fn call_provider(
+    env: &Env,
+    db: &D1Database,
+    app_id: &str,
+    cfg: &AliasConfig,
+    system: &str,
+    turns: &[Turn],
+) -> Result<Reply, AppError> {
     if crate::mock::enabled(env) {
         return crate::mock::alias_reply(cfg, turns).map_err(reply_error);
     }
@@ -311,25 +319,27 @@ async fn call_provider(env: &Env, cfg: &AliasConfig, system: &str, turns: &[Turn
         .secret(provider.secret_name())
         .map_err(|_| AppError::InternalError(format!("{} not configured", provider.secret_name())))?
         .to_string();
+    let routing = Routing::for_tenant(env, db, app_id).await?;
 
     let headers = Headers::new();
     headers.set("Content-Type", "application/json")?;
-    let (url, body, label): (String, Value, &str) = match provider {
+    let (route, body, label): (Route, Value, &str) = match provider {
         Provider::Gemini => {
             headers.set("x-goog-api-key", &api_key)?;
-            (format!("{}/{}:generateContent", GEMINI_BASE, cfg.model), build_gemini_body(cfg, system, turns), "Gemini")
+            (routing.route(&provider, &format!("{}:generateContent", cfg.model)), build_gemini_body(cfg, system, turns), "Gemini")
         }
         Provider::OpenAI => {
             headers.set("Authorization", &format!("Bearer {}", api_key))?;
-            (OPENAI_CHAT_URL.to_string(), build_openai_body(cfg, system, turns), "OpenAI")
+            (routing.route(&provider, OPENAI_CHAT_TAIL), build_openai_body(cfg, system, turns), "OpenAI")
         }
         Provider::Anthropic => {
             headers.set("x-api-key", &api_key)?;
             headers.set("anthropic-version", ANTHROPIC_VERSION)?;
-            (ANTHROPIC_MESSAGES_URL.to_string(), build_anthropic_body(cfg, system, turns), "Anthropic")
+            (routing.route(&provider, ANTHROPIC_MESSAGES_TAIL), build_anthropic_body(cfg, system, turns), "Anthropic")
         }
     };
-    let value = post_json(&url, headers, &body, label, matches!(provider, Provider::Anthropic)).await?;
+    route.apply(&headers)?;
+    let value = post_json(&route.url, headers, &body, label, matches!(provider, Provider::Anthropic)).await?;
     let parsed = match provider {
         Provider::Gemini => parse_gemini_reply(&value),
         Provider::OpenAI => parse_openai_reply(&value),

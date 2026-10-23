@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use worker::wasm_bindgen::JsValue;
 use worker::{Delay, Headers, Method, ObjectNamespace, Request, RequestInit};
 
-use super::types::{Entry, StoredEntry};
+use super::types::{AbsorbItem, Entry, Sealed, State, StoredEntry, TenantTotals};
 use crate::error::AppError;
 
 /// How long a call to a wallet object may take before it counts as unavailable.
@@ -97,6 +97,24 @@ pub struct Migration {
     pub moved: Moved,
 }
 
+/// The answer to erasing a whole wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletErased {
+    pub entries: i64,
+    pub tenants: i64,
+}
+
+/// What absorbing a merged-away wallet came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Absorb {
+    /// The credits are in the wallet now, or were before. `totals` are the tenants' totals after.
+    Done { replayed: bool, totals: Vec<TenantTotals> },
+    /// The wallet was merged away itself; the credits belong in the Midgar ID it names.
+    Sealed(String),
+    /// The wallet's Midgar ID was deleted.
+    Erased,
+}
+
 /// A page of entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryPage {
@@ -131,6 +149,7 @@ fn moved(body: &Value) -> Result<Moved, AppError> {
 /// wallet being unavailable; a conflict is the caller reusing a key.
 fn failure(status: u16, body: &Value) -> AppError {
     match status {
+        409 if matches!(body.get("error").and_then(Value::as_str), Some("erased" | "sealed")) => AppError::WalletUnavailable,
         409 => AppError::Conflict(body.get("message").and_then(Value::as_str).unwrap_or("idempotency_conflict").to_string()),
         400 => AppError::InternalError(format!("wallet rejected a request: {}", body.get("message").and_then(Value::as_str).unwrap_or(""))),
         _ => AppError::WalletUnavailable,
@@ -221,5 +240,55 @@ impl<W: WalletTransport> Wallets<'_, W> {
             return Err(failure(status, &body));
         }
         Ok(field(&body, "erased").unwrap_or(0))
+    }
+
+    /// `POST /erase_all`: every tenant of the Midgar ID's wallet, which is then marked erased for good.
+    pub async fn erase_all(&self, midgar_id: &str) -> Result<WalletErased, AppError> {
+        let (status, body) = self.transport.send(midgar_id, "POST", "/erase_all", Some(&json!({}))).await?;
+        if status != 200 {
+            return Err(failure(status, &body));
+        }
+        Ok(WalletErased { entries: field(&body, "erased").unwrap_or(0), tenants: field(&body, "tenants").unwrap_or(0) })
+    }
+
+    /// `GET /state`: what the wallet knows about its merges, and the stored totals of its tenants.
+    pub async fn state(&self, midgar_id: &str) -> Result<State, AppError> {
+        let (status, body) = self.transport.send(midgar_id, "GET", "/state", None).await?;
+        if status != 200 {
+            return Err(failure(status, &body));
+        }
+        serde_json::from_value(body).map_err(|_| AppError::WalletUnavailable)
+    }
+
+    /// `POST /seal`: stops the wallet taking writes because its Midgar ID was merged into `into`. The answer names the
+    /// target the wallet really has, which is the first one it was sealed with.
+    pub async fn seal(&self, midgar_id: &str, into: &str) -> Result<Sealed, AppError> {
+        let (status, body) = self.transport.send(midgar_id, "POST", "/seal", Some(&json!({ "into": into }))).await?;
+        if status != 200 {
+            return Err(failure(status, &body));
+        }
+        Ok(Sealed {
+            erased: body.get("erased").and_then(Value::as_bool).unwrap_or(false),
+            sealed_into: body.get("sealed_into").and_then(Value::as_str).map(str::to_string),
+            replayed: body.get("replayed").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+
+    /// `POST /absorb` on the survivor: takes `from`'s credits, one entry per tenant, all or none.
+    pub async fn absorb(&self, midgar_id: &str, from: &str, items: &[AbsorbItem]) -> Result<Absorb, AppError> {
+        let request = json!({ "from": from, "items": items });
+        let (status, body) = self.transport.send(midgar_id, "POST", "/absorb", Some(&request)).await?;
+        match (status, body.get("error").and_then(Value::as_str)) {
+            (200, _) => {
+                let totals = serde_json::from_value(body.get("totals").cloned().unwrap_or(Value::Null)).map_err(|_| AppError::WalletUnavailable)?;
+                Ok(Absorb::Done { replayed: body.get("replayed").and_then(Value::as_bool).unwrap_or(false), totals })
+            }
+            (409, Some("sealed")) => match body.get("sealed_into").and_then(Value::as_str) {
+                Some(into) => Ok(Absorb::Sealed(into.to_string())),
+                None => Err(AppError::WalletUnavailable),
+            },
+            (409, Some("erased")) => Ok(Absorb::Erased),
+            _ => Err(failure(status, &body)),
+        }
     }
 }

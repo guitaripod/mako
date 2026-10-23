@@ -24,6 +24,7 @@ mod mock;
 mod redact;
 mod tenant;
 mod ledgers;
+mod internal;
 mod midgar_token;
 pub mod wallet;
 
@@ -170,6 +171,9 @@ Privacy Policy: /privacy-policy"#)
         .post_async("/v1/admin/credits/adjust", handlers::credits::admin_adjust_credits)
         .get_async("/v1/admin/credits/stats", handlers::credits::admin_system_stats)
         .get_async("/v1/admin/users", handlers::credits::admin_search_users)
+        .post_async("/internal/wallet/grant", handlers::wallet_internal::grant)
+        .post_async("/internal/wallet/erase_all", handlers::wallet_internal::erase_all)
+        .post_async("/internal/wallet/merge", handlers::wallet_internal::merge)
         .run(req, env)
         .await
 }

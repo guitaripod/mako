@@ -6,9 +6,10 @@ use crate::error::AppError;
 use crate::auth::authenticate_with_token;
 use crate::credits::get_flat_capability_cost;
 use crate::ledgers::Ledgers;
+use crate::providers::route::Routing;
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 
-pub(crate) const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+pub(crate) const OPENAI_CHAT_TAIL: &str = "chat/completions";
 const DEFAULT_CHAT_MODEL: &str = "gemini-3-flash-preview";
 const CREDIT_MULTIPLIER: f64 = 3.0;
 const MIN_BALANCE_GUARD: u32 = 2;
@@ -192,10 +193,13 @@ async fn chat_completion_inner(
     let result = if mocked {
         Ok(crate::mock::legacy_chat_reply())
     } else {
-        match provider {
-        Provider::Gemini => gemini_generate(&api_key, &model, &body).await,
-        Provider::OpenAI => openai_generate(&api_key, &model, &body).await,
-        Provider::Anthropic => anthropic_generate(&api_key, &model, &body).await,
+        match Routing::for_tenant(&ctx.env, &db, &auth.app_id).await {
+            Ok(routing) => match provider {
+                Provider::Gemini => gemini_generate(&routing, &api_key, &model, &body).await,
+                Provider::OpenAI => openai_generate(&routing, &api_key, &model, &body).await,
+                Provider::Anthropic => anthropic_generate(&routing, &api_key, &model, &body).await,
+            },
+            Err(e) => Err(e),
         }
     };
     let (content, prompt_tokens, output_tokens) = match result {
@@ -263,6 +267,7 @@ fn media_type_of(image: &str) -> &str {
 /// Calls Gemini generateContent with the messages (joined into one user turn)
 /// plus any images as inlineData parts. Returns (text, prompt_tokens, output_tokens).
 async fn gemini_generate(
+    routing: &Routing,
     api_key: &str,
     model: &str,
     body: &ChatRequest,
@@ -286,16 +291,17 @@ async fn gemini_generate(
         request_body["generationConfig"] = json!({ "responseMimeType": "application/json" });
     }
 
-    let url = format!("{}/{}:generateContent", GEMINI_BASE, model);
+    let route = routing.route(&Provider::Gemini, &format!("{}:generateContent", model));
     let headers = Headers::new();
     headers.set("x-goog-api-key", api_key)?;
     headers.set("Content-Type", "application/json")?;
+    route.apply(&headers)?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&request_body.to_string())));
-    let request = Request::new_with_init(&url, &init)?;
+    let request = Request::new_with_init(&route.url, &init)?;
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {
@@ -342,8 +348,6 @@ async fn gemini_generate(
     Ok((text, prompt_tokens, output_tokens))
 }
 
-pub(crate) const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
-
 /// True for OpenAI reasoning-class models, which take `reasoning_effort` and
 /// run faster when it's pinned to `minimal` for this latency-sensitive task.
 fn is_reasoning_model(model: &str) -> bool {
@@ -355,6 +359,7 @@ fn is_reasoning_model(model: &str) -> bool {
 /// plus any images as base64 image_url parts. Mirrors gemini_generate's return
 /// shape: (text, prompt_tokens, output_tokens).
 async fn openai_generate(
+    routing: &Routing,
     api_key: &str,
     model: &str,
     body: &ChatRequest,
@@ -385,15 +390,17 @@ async fn openai_generate(
         request_body["reasoning_effort"] = json!("minimal");
     }
 
+    let route = routing.route(&Provider::OpenAI, OPENAI_CHAT_TAIL);
     let headers = Headers::new();
     headers.set("Authorization", &format!("Bearer {}", api_key))?;
     headers.set("Content-Type", "application/json")?;
+    route.apply(&headers)?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&request_body.to_string())));
-    let request = Request::new_with_init(OPENAI_CHAT_URL, &init)?;
+    let request = Request::new_with_init(&route.url, &init)?;
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {
@@ -434,7 +441,7 @@ async fn openai_generate(
     Ok((text, prompt_tokens, output_tokens))
 }
 
-pub(crate) const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+pub(crate) const ANTHROPIC_MESSAGES_TAIL: &str = "messages";
 pub(crate) const ANTHROPIC_VERSION: &str = "2026-10-21";
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
@@ -444,6 +451,7 @@ const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 /// Anthropic has no native json-mode flag. Mirrors the other generators'
 /// return shape: (text, prompt_tokens, output_tokens).
 async fn anthropic_generate(
+    routing: &Routing,
     api_key: &str,
     model: &str,
     body: &ChatRequest,
@@ -477,16 +485,18 @@ async fn anthropic_generate(
             json!("Respond with only valid JSON. Do not include markdown fences or any prose.");
     }
 
+    let route = routing.route(&Provider::Anthropic, ANTHROPIC_MESSAGES_TAIL);
     let headers = Headers::new();
     headers.set("x-api-key", api_key)?;
     headers.set("anthropic-version", ANTHROPIC_VERSION)?;
     headers.set("Content-Type", "application/json")?;
+    route.apply(&headers)?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&request_body.to_string())));
-    let request = Request::new_with_init(ANTHROPIC_MESSAGES_URL, &init)?;
+    let request = Request::new_with_init(&route.url, &init)?;
     let mut resp = Fetch::Request(request).send().await?;
 
     if resp.status_code() >= 400 {

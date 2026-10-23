@@ -104,15 +104,13 @@ pub fn get_credit_packs() -> Vec<CreditPack> {
 /// Falls back to the hardcoded pixie packs if the tenant has no rows or the
 /// query fails, so pixie can never lose its catalog.
 pub async fn get_credit_packs_for_app(app_id: &str, db: &D1Database) -> Vec<CreditPack> {
-    let bound = match db
-        .prepare("SELECT pack_id, name, credits, bonus_credits, price_usd_cents, description FROM credit_packs WHERE app_id = ?1 ORDER BY sort_order")
-        .bind(&[app_id.into()])
-    {
-        Ok(b) => b,
-        Err(_) => return get_credit_packs(),
-    };
+    packs_for_app(db, app_id).await
+}
 
-    match bound.all().await.and_then(|r| r.results::<serde_json::Value>()) {
+/// `get_credit_packs_for_app` over any D1, so the wallet code that credits a pack can run on the host tests.
+pub async fn packs_for_app(db: &impl crate::wallet::d1::D1Exec, app_id: &str) -> Vec<CreditPack> {
+    let sql = "SELECT pack_id, name, credits, bonus_credits, price_usd_cents, description FROM credit_packs WHERE app_id = ?1 ORDER BY sort_order";
+    match db.rows(sql, &[app_id.into()]).await {
         Ok(rows) => {
             let packs: Vec<CreditPack> = rows.iter().filter_map(parse_pack_row).collect();
             if packs.is_empty() {

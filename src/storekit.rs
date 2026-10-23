@@ -4,6 +4,7 @@ use worker::{Env, Fetcher, Headers, Method, RequestInit};
 
 use crate::error::AppError;
 use crate::purchases::should_ignore_event;
+use crate::tenant::TenantPolicy;
 use crate::wallet::d1::{text, D1Exec};
 
 /// The secret that authorises the ledger's verify route, sent in `X-Midgar-Internal`.
@@ -202,10 +203,9 @@ pub async fn tenant_bundle(db: &impl D1Exec, app_id: &str) -> Result<Option<Stri
     Ok(rows.first().and_then(|row| text(row, "apple_app_bundle_id")).filter(|bundle| !bundle.is_empty()).map(str::to_string))
 }
 
-/// The pack id a product resolves to for a tenant: the product must start with the tenant's own `rc_product_prefix`
-/// and no other tenant's longer prefix may claim it (the longest prefix wins, as in the RevenueCat webhook). `None`
-/// when the product is no pack of this tenant.
-pub async fn pack_of_product(db: &impl D1Exec, app_id: &str, product_id: &str) -> Result<Option<String>, AppError> {
+/// The tenant a product belongs to and the `rc_product_prefix` that claims it: the longest prefix wins, as in the
+/// RevenueCat webhook. `None` when no tenant's prefix starts the product id.
+pub async fn tenant_of_product(db: &impl D1Exec, product_id: &str) -> Result<Option<(String, String)>, AppError> {
     let rows = db
         .rows(
             "SELECT app_id, rc_product_prefix FROM apps
@@ -216,11 +216,38 @@ pub async fn pack_of_product(db: &impl D1Exec, app_id: &str, product_id: &str) -
         )
         .await?;
     let Some(row) = rows.first() else { return Ok(None) };
-    let (Some(owner), Some(prefix)) = (text(row, "app_id"), text(row, "rc_product_prefix")) else { return Ok(None) };
+    Ok(text(row, "app_id").zip(text(row, "rc_product_prefix")).map(|(app_id, prefix)| (app_id.to_string(), prefix.to_string())))
+}
+
+/// The pack id a product resolves to for a tenant: the product must start with the tenant's own `rc_product_prefix`
+/// and no other tenant's longer prefix may claim it (the longest prefix wins, as in the RevenueCat webhook). `None`
+/// when the product is no pack of this tenant.
+pub async fn pack_of_product(db: &impl D1Exec, app_id: &str, product_id: &str) -> Result<Option<String>, AppError> {
+    let Some((owner, prefix)) = tenant_of_product(db, product_id).await? else { return Ok(None) };
     if owner != app_id {
         return Ok(None);
     }
-    Ok(product_id.strip_prefix(prefix).filter(|pack| !pack.is_empty()).map(str::to_string))
+    Ok(product_id.strip_prefix(prefix.as_str()).filter(|pack| !pack.is_empty()).map(str::to_string))
+}
+
+/// What the credit decision reads from a tenant's `apps` row: the registry slug and App Store bundle id its
+/// transactions are matched against, and whether it runs strict purchases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantFacts {
+    pub slug: String,
+    pub bundle: Option<String>,
+    pub strict: bool,
+}
+
+/// The facts of a configured tenant, `None` for an `app_id` that is no `apps` row. A tenant without a registry slug
+/// uses its `app_id`, as the Midgar access token does.
+pub async fn tenant_facts(db: &impl D1Exec, app_id: &str) -> Result<Option<TenantFacts>, AppError> {
+    let rows = db.rows("SELECT * FROM apps WHERE app_id = ?1", &[app_id.into()]).await?;
+    Ok(rows.first().map(|row| TenantFacts {
+        slug: text(row, "registry_slug").filter(|slug| !slug.is_empty()).unwrap_or(app_id).to_string(),
+        bundle: text(row, "apple_app_bundle_id").filter(|bundle| !bundle.is_empty()).map(str::to_string),
+        strict: TenantPolicy::from_row(row).strict_purchases,
+    }))
 }
 
 /// True when the RevenueCat-keyed purchase row of a transaction exists and is no longer `pending`: it was credited

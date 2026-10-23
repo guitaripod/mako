@@ -4,10 +4,11 @@ use worker::{Env, Result, Fetch, Request as WorkerRequest, Method, Headers};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crate::error::AppError;
 use crate::deployment::{DeploymentConfig, DeploymentMode};
+use super::route::Routing;
+use crate::handlers::chat::Provider;
 use super::{ImageProvider, UnifiedImageRequest, UnifiedEditRequest, ProviderResponse, ImageBytes, CostEstimate, ProviderFeatures};
 use crate::models::ImageUsage;
 
-const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_IMAGE_ATTEMPTS: usize = 3;
 
 /// The Gemini image tiers mako sells. Every legacy Nano Banana id a shipped client
@@ -119,10 +120,11 @@ struct PromptFeedback {
 pub struct GeminiProvider {
     api_key: String,
     model: GeminiImageModel,
+    routing: Routing,
 }
 
 impl GeminiProvider {
-    pub fn new(env: &Env, model: GeminiImageModel) -> Result<Self> {
+    pub fn new(env: &Env, model: GeminiImageModel, routing: Routing) -> Result<Self> {
         let deployment_config = DeploymentConfig::from_env(env)
             .map_err(|e| worker::Error::from(AppError::InternalError(format!("Deployment config error: {:?}", e))))?;
 
@@ -137,11 +139,11 @@ impl GeminiProvider {
             }
         };
 
-        Ok(Self { api_key, model })
+        Ok(Self { api_key, model, routing })
     }
 
     pub fn with_api_key(api_key: String) -> Self {
-        Self { api_key, model: GeminiImageModel::NanoBanana2 }
+        Self { api_key, model: GeminiImageModel::NanoBanana2, routing: Routing::direct() }
     }
 
     fn image_generation_config() -> Option<GenerationConfig> {
@@ -154,14 +156,15 @@ impl GeminiProvider {
         let headers = Headers::new();
         headers.set("x-goog-api-key", &self.api_key)?;
         headers.set("Content-Type", "application/json")?;
+        let route = self.routing.route(&Provider::Gemini, &format!("{}:generateContent", self.model.api_model()));
+        route.apply(&headers)?;
 
         let mut init = worker::RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
             .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&serde_json::to_string(request_body)?)));
 
-        let url = format!("{}/{}:generateContent", GEMINI_API_BASE, self.model.api_model());
-        let request = WorkerRequest::new_with_init(&url, &init)?;
+        let request = WorkerRequest::new_with_init(&route.url, &init)?;
         let mut response = Fetch::Request(request).send().await?;
 
         if response.status_code() >= 400 {

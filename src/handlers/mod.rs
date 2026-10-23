@@ -18,3 +18,4 @@ pub mod chat_alias;
 pub mod realtime;
 pub mod refunds;
 pub mod shared_playlists;
+pub mod wallet_internal;
