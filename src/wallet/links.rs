@@ -142,9 +142,14 @@ pub async fn mark_linked(db: &impl D1Exec, app_id: &str, user_id: &str) -> Resul
     Ok(())
 }
 
-/// Rows still `moving` that began before `cutoff`, oldest first.
+/// Rows still `moving` that began before `cutoff`, those no run has frozen yet first and each group oldest first. A
+/// row the wallet keeps refusing is frozen by its first attempt, so it falls behind the rows nobody has tried and
+/// cannot hold the whole batch while healthy links wait.
 pub async fn stale_moving(db: &impl D1Exec, cutoff: &str, limit: i64) -> Result<Vec<LinkRow>, AppError> {
-    let sql = format!("SELECT {COLUMNS} FROM wallet_links WHERE state = 'moving' AND linked_at < ?1 ORDER BY linked_at LIMIT ?2");
+    let sql = format!(
+        "SELECT {COLUMNS} FROM wallet_links WHERE state = 'moving' AND linked_at < ?1
+         ORDER BY moved_credits IS NOT NULL, linked_at, user_id LIMIT ?2"
+    );
     db.rows(&sql, &[cutoff.into(), limit.into()]).await?.iter().map(LinkRow::parse).collect()
 }
 

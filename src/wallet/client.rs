@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use worker::wasm_bindgen::JsValue;
 use worker::{Delay, Headers, Method, ObjectNamespace, Request, RequestInit};
 
+use super::log;
 use super::types::{AbsorbItem, Entry, Sealed, State, StoredEntry, TenantTotals};
 use crate::error::AppError;
 
@@ -39,12 +40,13 @@ impl DoWallets {
         Request::new_with_init(&format!("{WALLET_ORIGIN}{path}"), &init).ok()
     }
 
-    /// Fetches from the object and reads its JSON answer.
+    /// Fetches from the object and reads its JSON answer. Each way it can fail is logged with its cause, because
+    /// the caller only sees `WalletUnavailable`; the log never names the Midgar ID.
     async fn fetch(&self, midgar_id: &str, request: Request) -> Option<(u16, Value)> {
-        let stub = self.0.get_by_name(midgar_id).ok()?;
-        let mut response = stub.fetch_with_request(request).await.ok()?;
+        let stub = self.0.id_from_name(midgar_id).and_then(|id| id.get_stub()).map_err(|e| log::error(&format!("wallet stub unavailable: {e}"))).ok()?;
+        let mut response = stub.fetch_with_request(request).await.map_err(|e| log::error(&format!("wallet fetch failed: {e}"))).ok()?;
         let status = response.status_code();
-        let body = response.json::<Value>().await.ok()?;
+        let body = response.json::<Value>().await.map_err(|e| log::error(&format!("wallet answered {status} without json: {e}"))).ok()?;
         Some((status, body))
     }
 }
@@ -56,7 +58,11 @@ impl WalletTransport for DoWallets {
         let timeout = Box::pin(Delay::from(Duration::from_millis(CALL_TIMEOUT_MS)));
         match select(call, timeout).await {
             Either::Left((Some(answer), _)) => Ok(answer),
-            _ => Err(AppError::WalletUnavailable),
+            Either::Left((None, _)) => Err(AppError::WalletUnavailable),
+            Either::Right(_) => {
+                log::error(&format!("wallet call timed out after {CALL_TIMEOUT_MS} ms"));
+                Err(AppError::WalletUnavailable)
+            }
         }
     }
 }

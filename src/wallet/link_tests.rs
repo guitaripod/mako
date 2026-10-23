@@ -448,3 +448,61 @@ fn a_wallet_that_is_down_fails_the_link_and_leaves_the_money_in_the_link_row() {
     assert_eq!((link.state, link.moved_credits), (LinkState::Moving, Some(40)));
     assert_eq!(world.d1_balance("u1"), 0);
 }
+
+#[test]
+fn rows_the_wallet_keeps_refusing_cannot_starve_the_links_behind_them() {
+    struct Refuses<'a> {
+        inner: &'a FakeWallets,
+        midgar_prefix: &'static str,
+    }
+    impl super::client::WalletTransport for Refuses<'_> {
+        async fn send(&self, midgar_id: &str, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<(u16, serde_json::Value), AppError> {
+            if midgar_id.starts_with(self.midgar_prefix) {
+                return Err(AppError::WalletUnavailable);
+            }
+            self.inner.send(midgar_id, method, path, body).await
+        }
+    }
+    let world = World::new();
+    for (n, user) in ["bad0", "bad1", "good0", "good1"].into_iter().enumerate() {
+        world.add_user(user, 10, 0);
+        let midgar = if user.starts_with("bad") { format!("bad-{n}") } else { format!("{MIDGAR}-{n}") };
+        world.start_moving(user, &midgar);
+        world.age_link(user, &format!("2026-01-01T00:00:0{n}+00:00"));
+    }
+    let refused = Linker { db: &world.d1, wallets: &Refuses { inner: &world.wallets, midgar_prefix: "bad-" } };
+    for _ in 0..2 {
+        block_on(refused.resume_stale(2)).unwrap();
+    }
+    assert_eq!(world.link("good0").state, LinkState::Linked);
+    assert_eq!(world.link("good1").state, LinkState::Linked);
+    for user in ["bad0", "bad1"] {
+        let link = world.link(user);
+        assert_eq!((link.state, link.moved_credits), (LinkState::Moving, Some(10)));
+        assert_eq!(world.d1_balance(user), 0);
+    }
+    assert_eq!(world.wallets.balance(&format!("{MIDGAR}-2"), APP) + world.wallets.balance(&format!("{MIDGAR}-3"), APP), 20);
+}
+
+#[test]
+fn a_link_the_wallet_refused_after_its_freeze_still_finishes_once_the_wallet_answers() {
+    let world = World::new();
+    for n in 0..3 {
+        let user = format!("u{n}");
+        world.add_user(&user, 10, 0);
+        world.start_moving(&user, &format!("{MIDGAR}-{n}"));
+        world.age_link(&user, &format!("2026-01-01T00:00:0{n}+00:00"));
+    }
+    for crash_after in 0..12 {
+        let budget = Budget::of(crash_after);
+        let flaky = Linker { db: &Flaky { inner: &world.d1, budget: &budget }, wallets: &Flaky { inner: &world.wallets, budget: &budget } };
+        let _ = block_on(flaky.resume_stale(2));
+    }
+    while block_on(world.linker().resume_stale(2)).unwrap() > 0 {}
+    for n in 0..3 {
+        assert_eq!(world.link(&format!("u{n}")).state, LinkState::Linked);
+        assert_eq!(world.wallets.balance(&format!("{MIDGAR}-{n}"), APP), 10);
+        assert_eq!(world.d1_balance(&format!("u{n}")), 0);
+        assert_eq!(world.migrate_entries(&format!("{MIDGAR}-{n}")), 1);
+    }
+}

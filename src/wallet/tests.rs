@@ -441,3 +441,11 @@ fn the_sharing_pool_is_read_nowhere() {
     ];
     assert!(source.iter().all(|file| !file.contains("sharing")));
 }
+
+#[test]
+fn the_wallet_stub_is_opened_by_id_so_runtimes_without_get_by_name_still_reach_the_object() {
+    let client = include_str!("client.rs");
+    let by_name = ["get", "by", "name("].join("_");
+    assert!(!client.contains(&by_name), "DurableObjectNamespace.getByName is missing on some local runtimes");
+    assert!(client.contains(".id_from_name(") && client.contains(".get_stub()"));
+}

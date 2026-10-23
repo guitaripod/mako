@@ -121,6 +121,30 @@ PY
   chmod 600 "$2"
 }
 
+# A production export holds the final schema and the rows. Replaying the migrations (ALTER, DROP, RENAME of rebuilt
+# tables) is not that shape and `tables_first` would break it, so the synthetic fixture is migrated in SQLite and
+# written out as a dump with the deferred foreign keys pragma a D1 export starts with, and without the transaction
+# statements D1 refuses.
+dump_as_export() {
+  python3 -I - "$1" "$2" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(":memory:")
+db.executescript(open(sys.argv[1], encoding="utf-8").read())
+refused = {"BEGIN TRANSACTION;", "COMMIT;"}
+dump = ["PRAGMA defer_foreign_keys=TRUE;"] + [line for line in db.iterdump() if line not in refused]
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(dump) + "\n")
+PY
+  local status=$?
+  chmod 600 "$2"
+  return $status
+}
+
+report_link_failures() {
+  grep -aE "wallet (stub|fetch|call|answered)|link resume failed|residue sweep failed" "$LOG" \
+    | sed -E 's/\x1b\[[0-9;]*m//g; s/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<id>/g; s/^[^A-Za-z]*(ERROR[^A-Za-z]*)?//' \
+    | sort | uniq -c | sort -rn | head -6 | sed 's/^/        /'
+}
+
 rows() {
   wr d1 execute "$DB_NAME" --local --json --command "$1" 2>>"$STATE/wrangler.log" | python3 -I -c '
 import json, sys
@@ -210,8 +234,12 @@ lines.append(
 print("\n".join(lines))
 PY
   umask 077
-  { cat $(ls migrations/*.sql | sort); cat "$sql"; } > "$out"
-  echo "fixture: $out (every migration, then $(grep -c '^INSERT INTO users ' "$sql") users)"
+  { cat $(ls migrations/*.sql | sort); cat "$sql"; } > "$STATE/fixture-all.sql"
+  if ! dump_as_export "$STATE/fixture-all.sql" "$out"; then
+    echo "FAIL  the fixture did not load into SQLite"
+    exit 1
+  fi
+  echo "fixture: $out (the schema after every migration, dumped the way D1 exports it, and $(grep -c '^INSERT INTO users ' "$sql") users)"
 }
 
 if [ -n "$MAKE_FIXTURE" ]; then
@@ -304,6 +332,11 @@ for _ in $(seq 1 "$RUNS"); do
   curl -s -o /dev/null "$BASE/__scheduled?cron=*/30+*+*+*+*"
   [ "$(value "SELECT COUNT(*) FROM wallet_links WHERE state = 'moving'")" = "0" ] && break
 done
+STILL_MOVING="$(value "SELECT COUNT(*) FROM wallet_links WHERE state = 'moving'")"
+if [ "$STILL_MOVING" != "0" ]; then
+  echo "      $STILL_MOVING links are still moving; why, from the server log (ids removed):"
+  report_link_failures
+fi
 check "every link finished" "$USERS" "$(value "SELECT COUNT(*) FROM wallet_links WHERE state = 'linked'")"
 
 echo "== pass criteria"

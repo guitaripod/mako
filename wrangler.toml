@@ -45,7 +45,7 @@ ENVIRONMENT = "production"
 # requests and routes every credit change through the wallet when the user has a link. Anything else leaves every
 # account on its D1 balance and runs none of that code. Needs the IDENTITY_LOOKUP_SECRET secret for grants addressed
 # to a Midgar ID no user is linked to yet; see docs/p3.07-wallet-design.md.
-WALLET_LINKING = "off"
+WALLET_LINKING = "on"
 
 # Identity tells mako when a Midgar ID is deleted (POST /internal/wallet/erase_all) or merged away (POST
 # /internal/wallet/merge). Both routes need the WALLET_LIFECYCLE_SECRET secret, the same value on midgar-identity, and
