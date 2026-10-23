@@ -22,7 +22,7 @@ npx wrangler secret put OPENAI_API_KEY
 - Build failures: `cargo install worker-build` first.
 
 ## Rules that break things
-- Deploy from arch: `cd ~/Dev/rust/mako && git pull --ff-only`, then the migration and `npx wrangler deploy`. That clone is the mirror, which the nightly job updates at 04:30; run `midgar sync intelligence --push` first when the change must go out today. Run `scripts/test-local.sh` on the mac (arch has no `shasum`). Deploy the gateway before mako when mako starts handing out a new gateway route.
+- Deploy from arch: `cd ~/Dev/midgar && git pull --ff-only && cd services/intelligence`, then the migration and `npx wrangler deploy`. `~/Dev/rust/mako` on either machine is the read-only mirror; never deploy from it. Run `scripts/test-local.sh` on the mac (arch has no `shasum`). Deploy the gateway before mako when mako starts handing out a new gateway route.
 - Migrations: tables have foreign keys, so order matters. Apply a migration before deploying code that reads its columns (the image purge reads `apps.purge_expired_images`; until the column exists it fails and deletes nothing).
 - Onboard a tenant with data only: `migrations/0XX_seed_<app>.sql` (model on `014_seed_livingdex.sql` or `012_seed_helia.sql`): `apps` row plus optional `capability_costs` and `credit_packs`, then `wrangler d1 execute ... --remote --file`. Set `REVENUECAT_IOS_API_KEY_<APPID>` if the app has a premium tier.
 - Privacy: never store or log the raw attribution token (SHA-256 fingerprint only); no IDFA, `ASIdentifierManager` or ATT prompt; apps running campaigns disclose it in `src/privacy.rs` (`ad_measurement_section`). No provider error body, prompt or request body is ever logged (`src/redact.rs`).
