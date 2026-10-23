@@ -42,7 +42,7 @@ cleanup() {
 trap cleanup EXIT
 
 export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/private/tmp/mako-target}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/mako-target}"
 
 wrangler_local() {
   npx wrangler "$@" --config "$CONFIG" --persist-to "$STATE"

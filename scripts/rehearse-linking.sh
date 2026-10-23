@@ -46,7 +46,7 @@ done
 [ -z "$FROM_SQL" ] || [ -f "$FROM_SQL" ] || { echo "no such file: $FROM_SQL" >&2; exit 2; }
 
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/private/tmp/mako-target}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/mako-target}"
 
 STATE="$(mktemp -d "${TMPDIR:-/tmp}/mako-rehearsal.XXXXXX")"
 CONFIG="$ROOT/wrangler.rehearsal.toml"
@@ -91,6 +91,34 @@ wr() {
 
 sql_file() {
   wr d1 execute "$DB_NAME" --local --file "$1" >/dev/null 2>>"$STATE/wrangler.log"
+}
+
+# Production D1 exports a table where its last rebuild left it, so a table can come after rows of other tables whose
+# foreign keys name it, which a local D1 refuses ("no such table"). The copy loads with every CREATE TABLE first and
+# the rest in the export's own order.
+tables_first() {
+  python3 -I - "$1" "$2" <<'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+creates, rest, current = [], [], None
+for line in lines:
+    if current is not None:
+        current.append(line)
+        if line.rstrip().endswith(");"):
+            creates.append("\n".join(current))
+            current = None
+    elif line.startswith("CREATE TABLE"):
+        if line.rstrip().endswith(");"):
+            creates.append(line)
+        else:
+            current = [line]
+    else:
+        rest.append(line)
+pragmas = [l for l in rest if l.startswith("PRAGMA")]
+body = [l for l in rest if not l.startswith("PRAGMA")]
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(pragmas + creates + body))
+PY
+  chmod 600 "$2"
 }
 
 rows() {
@@ -207,7 +235,9 @@ else
   chmod 600 "$DUMP"
 fi
 mkdir -p "$STATE/d1"
-if ! sql_file "$DUMP"; then
+ORDERED="$STATE/export-tables-first.sql"
+tables_first "$DUMP" "$ORDERED"
+if ! sql_file "$ORDERED"; then
   echo "FAIL  the export did not load into a local D1"
   sed -E 's#https?://[^ ]+#<url>#g' "$STATE/wrangler.log" | tail -5
   exit 1
