@@ -98,7 +98,7 @@ struct LedgerReverser<'a, D: D1Exec, W: WalletTransport> {
 }
 
 impl<D: D1Exec, W: WalletTransport> Reverser for LedgerReverser<'_, D, W> {
-    async fn reverse(&self, purchase: &CreditedPurchase, _first_claim: bool) -> Result<Step, AppError> {
+    async fn reverse(&self, purchase: &CreditedPurchase) -> Result<Step, AppError> {
         let Some(link) = links::read(self.db, self.app_id, &purchase.user_id).await? else { return Ok(Step::Declined) };
         let account = account_of(&link);
         let Account::Wallet { midgar_id, .. } = &account else {

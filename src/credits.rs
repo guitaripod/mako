@@ -506,17 +506,17 @@ pub async fn record_purchase(
     Ok(purchase_id)
 }
 
-/// Records a RevenueCat purchase and completes it, guarding against a second
+/// Records a RevenueCat purchase and completes it into the D1 balance, guarding against a second
 /// `credit_purchases` row ever being created for the same
 /// `(app_id, payment_provider, payment_id)` — the webhook and the client
 /// fast-track both reach this for the same external transaction and can race
 /// each other, unlike Stripe/crypto where the caller already holds a single
 /// `purchase_id` minted up front. The row comes from `wallet::purchase::record_pending`, the
 /// one guarded statement that also refuses a transaction whose refund was claimed
-/// (`AppError::Refunded`) and mirrors the `UPDATE ... RETURNING` guard below: D1
-/// serializes writes, so a second identical attempt always sees the first one's
-/// committed row, and at most one row — and one `complete_purchase` grant — can
-/// ever exist per transaction, however many callers race.
+/// (`AppError::Refunded`), and the credit is `wallet::purchase::complete_locally`, one D1
+/// batch that flips the status and adds the balance together. D1 serializes writes, so a
+/// second identical attempt always sees the first one's committed row, and at most one row
+/// — and one credit — can ever exist per transaction, however many callers race.
 pub async fn record_and_complete_purchase(
     app_id: &str,
     user_id: &str,
@@ -526,81 +526,12 @@ pub async fn record_and_complete_purchase(
     payment_id: &str,
     db: &D1Database,
 ) -> Result<String> {
-    let purchase_id = crate::wallet::purchase::record_pending(db, app_id, user_id, pack_id, credits, amount_usd_cents, payment_id).await?;
-    complete_purchase(&purchase_id, db).await?;
+    let (purchase_id, completed) =
+        crate::wallet::purchase::record_and_complete_locally(db, app_id, user_id, pack_id, credits, amount_usd_cents, payment_id).await?;
+    if completed {
+        tag_purchase_attribution(db, app_id, user_id, &purchase_id, pack_id, amount_usd_cents as i64).await;
+    }
     Ok(purchase_id)
-}
-
-/// Completes a pending purchase atomically: the pending -> completed status
-/// flip is a single guarded `UPDATE ... RETURNING`, so two concurrent callers
-/// (the payment webhook, the client's status poll, and the RevenueCat
-/// fast-track path can all reach this for the same purchase) can never both
-/// see 'pending' and both grant credits for it.
-pub async fn complete_purchase(
-    purchase_id: &str,
-    db: &D1Database,
-) -> Result<()> {
-    match claim_purchase(purchase_id, db).await? {
-        Some(purchase) => credit_claimed_purchase(&purchase, purchase_id, db).await,
-        None => complete_purchase_already_claimed(purchase_id, db).await,
-    }
-}
-
-/// The guarded `pending` to `completed` flip of `complete_purchase`: the purchase row when this call won it, `None`
-/// when the purchase was not pending.
-pub(crate) async fn claim_purchase(purchase_id: &str, db: &D1Database) -> Result<Option<serde_json::Value>> {
-    let now = Utc::now().to_rfc3339();
-    db.prepare(
-        "UPDATE credit_purchases SET status = 'completed', completed_at = ?
-         WHERE id = ? AND status = 'pending'
-         RETURNING app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider",
-    )
-    .bind(&[now.into(), purchase_id.into()])?
-    .first::<serde_json::Value>(None)
-    .await
-}
-
-/// Adds the credits of a purchase this call just claimed to the D1 balance and tags its ad attribution.
-pub(crate) async fn credit_claimed_purchase(purchase: &serde_json::Value, purchase_id: &str, db: &D1Database) -> Result<()> {
-    let app_id = purchase.get("app_id").and_then(|v| v.as_str()).unwrap_or("pixie");
-    let user_id = purchase.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
-    let pack_id = purchase.get("pack_id").and_then(|v| v.as_str()).unwrap_or("");
-    let credits = purchase.get("credits").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
-    let payment_provider = purchase.get("payment_provider").and_then(|v| v.as_str()).unwrap_or("");
-
-    let description = match payment_provider {
-        "revenuecat" => format!("App Store purchase: {} pack", pack_id),
-        "stripe" => format!("Card purchase: {} pack", pack_id),
-        "nowpayments" => format!("Crypto purchase: {} pack", pack_id),
-        _ => format!("Purchased {} pack", pack_id),
-    };
-    add_credits(app_id, user_id, credits, "purchase", &description, Some(purchase_id), db).await?;
-
-    let amount_usd_cents = purchase.get("amount_usd_cents").and_then(|v| v.as_i64()).unwrap_or(0);
-    tag_purchase_attribution(db, app_id, user_id, purchase_id, pack_id, amount_usd_cents).await;
-
-    Ok(())
-}
-
-/// The status flip in `complete_purchase` matched no row: either the purchase
-/// was already completed by a concurrent caller (idempotent no-op) or it
-/// never existed / is in a terminal non-pending state (a real error).
-pub(crate) async fn complete_purchase_already_claimed(purchase_id: &str, db: &D1Database) -> Result<()> {
-    let status = db
-        .prepare("SELECT status FROM credit_purchases WHERE id = ?")
-        .bind(&[purchase_id.into()])?
-        .first::<serde_json::Value>(None)
-        .await?
-        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string()));
-
-    match status.as_deref() {
-        Some("completed") => {
-            worker::console_log!("Purchase {} already completed, skipping", purchase_id);
-            Ok(())
-        }
-        Some("refunded") => Err(AppError::Refunded(crate::storekit::REFUNDED_MESSAGE.to_string()).into()),
-        _ => Err(AppError::NotFound("Purchase not found".to_string()).into()),
-    }
 }
 
 /// Copies the buyer's Apple Ads campaign/keyword onto a completed credit-pack

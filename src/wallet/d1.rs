@@ -30,6 +30,11 @@ pub trait D1Exec {
 
     /// Runs statements in order as one transaction: all of them apply or none does.
     async fn batch(&self, statements: &[Stmt]) -> Result<(), AppError>;
+
+    /// Like `batch`, and returns how many rows each statement changed, in order. A statement can only be made
+    /// conditional on an earlier one by what the earlier one wrote, so the count of the statement that decides is how a
+    /// caller learns whether the whole batch took effect.
+    async fn batch_changes(&self, statements: &[Stmt]) -> Result<Vec<u64>, AppError>;
 }
 
 /// Converts bound values to what D1 binds.
@@ -62,6 +67,15 @@ impl D1Exec for D1Database {
             .collect::<Result<Vec<_>, _>>()?;
         self.batch(prepared).await?;
         Ok(())
+    }
+
+    async fn batch_changes(&self, statements: &[Stmt]) -> Result<Vec<u64>, AppError> {
+        let prepared = statements
+            .iter()
+            .map(|s| self.prepare(&s.sql).bind(&bindings(&s.params)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let results = self.batch(prepared).await?;
+        Ok(results.iter().map(|r| r.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u64).collect())
     }
 }
 

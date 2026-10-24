@@ -5,7 +5,7 @@ use super::ledger_grant::{self, Reason as GrantReason};
 use super::ledger_refund::{reverse, Outcome, Reason};
 use super::pack_credit::refund_pack;
 use super::pack_refund::Settlement;
-use super::testing::{Budget, FakeWallets, Flaky, LocalD1, WalletLedger};
+use super::testing::{Budget, FakeWallets, Flaky, LocalD1, TestLedger};
 use super::{pack_refund, purchase};
 use crate::error::AppError;
 use crate::storekit::{LedgerTransaction, REFUNDED_MESSAGE};
@@ -92,7 +92,7 @@ impl World {
     }
 
     fn revenuecat_refund(&self, id: &str) -> bool {
-        let ledger = WalletLedger { db: &self.d1, wallets: &self.wallets };
+        let ledger = TestLedger { db: &self.d1, wallets: &self.wallets };
         matches!(block_on(refund_pack(&self.d1, &ledger, APP, "small", id)).unwrap(), Settlement::Reversed { .. })
     }
 }

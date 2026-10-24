@@ -16,6 +16,7 @@ use super::d1::{D1Exec, Stmt};
 use super::link::account_of;
 use super::ops::{Reversal, WalletOps};
 use super::pack_credit::PurchaseLedger;
+use super::pack_refund::CreditedPurchase;
 use super::{links, purchase};
 use super::route::handle;
 use super::sql::{self, SqlBooks, SqlExec, Val};
@@ -170,11 +171,17 @@ impl D1Exec for LocalD1 {
     }
 
     async fn batch(&self, statements: &[Stmt]) -> Result<(), AppError> {
+        self.batch_changes(statements).await.map(|_| ())
+    }
+
+    async fn batch_changes(&self, statements: &[Stmt]) -> Result<Vec<u64>, AppError> {
         let transaction = self.0.unchecked_transaction().map_err(failure)?;
+        let mut changes = Vec::new();
         for statement in statements {
-            self.0.execute(&statement.sql, params_from_iter(bound(&statement.params))).map_err(failure)?;
+            changes.push(self.0.execute(&statement.sql, params_from_iter(bound(&statement.params))).map_err(failure)? as u64);
         }
-        transaction.commit().map_err(failure)
+        transaction.commit().map_err(failure)?;
+        Ok(changes)
     }
 }
 
@@ -288,6 +295,13 @@ impl D1Exec for Flaky<'_, LocalD1> {
         self.inner.batch(statements).await?;
         self.budget.tick()
     }
+
+    async fn batch_changes(&self, statements: &[Stmt]) -> Result<Vec<u64>, AppError> {
+        self.budget.tick()?;
+        let changes = self.inner.batch_changes(statements).await?;
+        self.budget.tick()?;
+        Ok(changes)
+    }
 }
 
 impl WalletTransport for Flaky<'_, FakeWallets> {
@@ -350,6 +364,13 @@ impl<T: D1Exec> D1Exec for Stepped<'_, T> {
             Park(false).await;
         }
         self.inner.batch(statements).await
+    }
+
+    async fn batch_changes(&self, statements: &[Stmt]) -> Result<Vec<u64>, AppError> {
+        if statements.iter().any(|s| contested(&s.sql)) {
+            Park(false).await;
+        }
+        self.inner.batch_changes(statements).await
     }
 }
 
@@ -437,18 +458,20 @@ pub fn interleavings(max_switches: Option<usize>, mut run: impl FnMut(&[usize]) 
     visited
 }
 
-/// The `PurchaseLedger` of a world with linked users, over D1 and the wallets alone: what `Ledgers` does for a wallet
-/// account, without the environment it needs.
-pub struct WalletLedger<'a, D: D1Exec, W: WalletTransport> {
+/// The `PurchaseLedger` of a world, over D1 and the wallets alone: what `Ledgers` does for a wallet account and for a
+/// local one, without the environment it needs. A user with a link row is a wallet account, any other a local one.
+pub struct TestLedger<'a, D: D1Exec, W: WalletTransport> {
     pub db: &'a D,
     pub wallets: &'a W,
 }
 
-impl<D: D1Exec, W: WalletTransport> PurchaseLedger for WalletLedger<'_, D, W> {
+impl<D: D1Exec, W: WalletTransport> PurchaseLedger for TestLedger<'_, D, W> {
     async fn complete(&self, purchase_id: &str) -> Result<(), AppError> {
         let row = purchase::read(self.db, purchase_id).await?.ok_or_else(|| AppError::NotFound("Purchase not found".to_string()))?;
-        let account = self.account_for(&row.app_id, &row.user_id).await?;
-        purchase::complete_in_wallet(self.db, self.wallets, &account, &row).await?;
+        match self.account_for(&row.app_id, &row.user_id).await? {
+            account @ Account::Wallet { .. } => purchase::complete_in_wallet(self.db, self.wallets, &account, &row).await?,
+            Account::Local { .. } => purchase::complete_locally(self.db, purchase_id).await?,
+        };
         Ok(())
     }
 
@@ -459,10 +482,13 @@ impl<D: D1Exec, W: WalletTransport> PurchaseLedger for WalletLedger<'_, D, W> {
         })
     }
 
-    async fn reverse(&self, account: &Account, reversal: &Reversal<'_>) -> Result<(i32, u32), AppError> {
-        let Account::Wallet { midgar_id, app_id, .. } = account else {
-            return Err(AppError::InternalError("the test ledger reverses wallet accounts only".to_string()));
-        };
-        WalletOps { wallets: self.wallets, db: self.db }.reverse(midgar_id, app_id, reversal).await
+    async fn reverse(&self, account: &Account, purchase: &CreditedPurchase, reversal: &Reversal<'_>) -> Result<Option<u32>, AppError> {
+        match account {
+            Account::Wallet { midgar_id, app_id, .. } => {
+                let (_, taken) = WalletOps { wallets: self.wallets, db: self.db }.reverse(midgar_id, app_id, reversal).await?;
+                Ok(Some(taken))
+            }
+            Account::Local { app_id, user_id } => purchase::reverse_locally(self.db, app_id, user_id, &purchase.id, reversal).await,
+        }
     }
 }

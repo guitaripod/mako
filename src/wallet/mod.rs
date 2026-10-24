@@ -28,6 +28,8 @@ pub mod testing;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod ledger_grant_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
+mod local_balance_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod ledger_refund_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lifecycle_tests;

@@ -17,8 +17,10 @@ pub trait PurchaseLedger {
     /// The account a stored user has right now.
     async fn account_for(&self, app_id: &str, user_id: &str) -> Result<Account, AppError>;
 
-    /// Takes back at most `reversal.amount` from an account: what was taken is the second value.
-    async fn reverse(&self, account: &Account, reversal: &Reversal<'_>) -> Result<(i32, u32), AppError>;
+    /// Takes back at most `reversal.amount` from an account and returns what was taken. A wallet reverses once per
+    /// key. A local balance reverses and flips the purchase to `refunded` in one batch that only applies to a
+    /// `completed` purchase, and answers `None` when it was not (nothing changed).
+    async fn reverse(&self, account: &Account, purchase: &CreditedPurchase, reversal: &Reversal<'_>) -> Result<Option<u32>, AppError>;
 }
 
 /// What a credit of a pack purchase came to.
@@ -69,8 +71,7 @@ pub async fn credit_pack<D: D1Exec, L: PurchaseLedger>(
 }
 
 /// The RevenueCat refund's half of a reversal: a purchase still `pending` is finished, and the credits are taken back
-/// from the account the purchase's user has now. A local balance has no idempotency key, so it is reversed only by the
-/// call that wrote the claim.
+/// from the account the purchase's user has now.
 struct RevenueCatReverser<'a, L: PurchaseLedger> {
     ledger: &'a L,
     app_id: &'a str,
@@ -79,7 +80,7 @@ struct RevenueCatReverser<'a, L: PurchaseLedger> {
 }
 
 impl<L: PurchaseLedger> Reverser for RevenueCatReverser<'_, L> {
-    async fn reverse(&self, purchase: &CreditedPurchase, first_claim: bool) -> Result<Step, AppError> {
+    async fn reverse(&self, purchase: &CreditedPurchase) -> Result<Step, AppError> {
         if purchase.is_pending() {
             match self.ledger.complete(&purchase.id).await {
                 Ok(()) => {}
@@ -88,14 +89,13 @@ impl<L: PurchaseLedger> Reverser for RevenueCatReverser<'_, L> {
             }
         }
         let account = self.ledger.account_for(self.app_id, &purchase.user_id).await?;
-        if matches!(account, Account::Local { .. }) && !first_claim {
-            return Ok(Step::Settled);
-        }
         let description = pack_refund::description(self.pack_id);
         let reference = crate::purchases::refund_reference(self.transaction_id);
         let reversal = pack_refund::reversal(self.transaction_id, "revenuecat", purchase.credits, &description, &reference);
-        let (_, taken) = self.ledger.reverse(&account, &reversal).await?;
-        Ok(Step::Taken(taken))
+        Ok(match self.ledger.reverse(&account, purchase, &reversal).await? {
+            Some(taken) => Step::Taken(taken),
+            None => Step::Settled,
+        })
     }
 }
 

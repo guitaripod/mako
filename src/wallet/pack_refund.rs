@@ -117,18 +117,18 @@ pub fn reversal<'a>(transaction_id: &str, source: &'static str, credits: u32, de
 pub enum Step {
     /// The credits were taken back, down to a zero balance: `Taken` is at most the purchase's credits.
     Taken(u32),
-    /// Another path already took the credits back, or this balance cannot be reversed twice safely: nothing was done.
+    /// Another path already took the credits back: nothing was done.
     Settled,
     /// The purchase is not in an account this path can reverse; another path owns it.
     Declined,
 }
 
 /// The part of a refund that differs per path: finishing a purchase a crash left `pending` and taking its credits back
-/// from the account it landed in. `first_claim` is true for the call that wrote the claim; a wallet reversal is
-/// idempotent by its key and ignores it, a local balance has no key and must not be reversed twice.
+/// from the account it landed in. Both reversals are idempotent: a wallet by its key `reverse:<transactionId>`, a local
+/// balance by the batch that reverses it and flips the purchase to `refunded` together (`purchase::reverse_locally`).
 #[allow(async_fn_in_trait)]
 pub trait Reverser {
-    async fn reverse(&self, purchase: &CreditedPurchase, first_claim: bool) -> Result<Step, AppError>;
+    async fn reverse(&self, purchase: &CreditedPurchase) -> Result<Step, AppError>;
 }
 
 /// How a refund settled.
@@ -164,7 +164,7 @@ pub async fn claim_and_settle<D: D1Exec, R: Reverser>(
         return Ok(Settlement::Settled(purchase));
     }
     stamp(db, app_id, transaction_id, &purchase).await?;
-    match reverser.reverse(&purchase, first_claim).await {
+    match reverser.reverse(&purchase).await {
         Ok(Step::Taken(taken)) => {
             mark_refunded(db, &purchase.id).await?;
             Ok(Settlement::Reversed { purchase, taken })

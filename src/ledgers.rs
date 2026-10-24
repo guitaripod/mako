@@ -6,6 +6,7 @@ use crate::wallet::client::DoWallets;
 use crate::wallet::link::{self, Linker};
 use crate::wallet::ops::{Charge, Grant, GrantResult, Reversal, WalletOps};
 use crate::wallet::pack_credit::PurchaseLedger;
+use crate::wallet::pack_refund::CreditedPurchase;
 use crate::wallet::purchase;
 use crate::wallet::{resolve, target};
 
@@ -251,50 +252,24 @@ impl<'a> Ledgers<'a> {
     }
 
     /// Completes a purchase into whichever account its user has now. A wallet account grants first under the
-    /// purchase's key and flips after, so a crash in between leaves `pending` for a retry to finish. A local account
-    /// keeps the flip-then-credit order of `credits::complete_purchase`, but looks at the link again once the flip is
-    /// won: a user who linked while the purchase was being processed is credited in the wallet under the same key a
-    /// concurrent wallet caller uses, so the purchase can never be credited in both places.
+    /// purchase's key and flips after, so a crash in between leaves `pending` for a retry to finish. A local account is
+    /// credited and flipped in one D1 batch (`purchase::complete_locally`), so there is no half state to finish. A user
+    /// who links while the purchase is being credited locally has the credit moved with the rest of the D1 balance by
+    /// the link saga or the residue sweep, never credited twice.
     pub async fn complete_purchase(&self, purchase_id: &str) -> Result<()> {
-        if !self.linking {
-            return credits::complete_purchase(purchase_id, self.db).await;
-        }
-        let Some(row) = purchase::read(self.db, purchase_id).await? else {
-            return credits::complete_purchase(purchase_id, self.db).await;
-        };
+        let row = purchase::read(self.db, purchase_id).await?.ok_or_else(|| AppError::NotFound("Purchase not found".to_string()))?;
         let account = self.account_for_user(&row.app_id, &row.user_id).await?;
-        let wallets = self.wallets.as_ref().ok_or(AppError::WalletUnavailable)?;
-        if matches!(account, Account::Wallet { .. }) {
-            if purchase::complete_in_wallet(self.db, wallets, &account, &row).await? {
-                credits::tag_purchase_attribution(self.db, &row.app_id, &row.user_id, &row.id, &row.pack_id, row.amount_usd_cents).await;
+        let completed = match &account {
+            Account::Wallet { .. } => {
+                let wallets = self.wallets.as_ref().ok_or(AppError::WalletUnavailable)?;
+                purchase::complete_in_wallet(self.db, wallets, &account, &row).await?
             }
-            return Ok(());
-        }
-        let Some(claimed) = credits::claim_purchase(purchase_id, self.db).await? else {
-            return credits::complete_purchase_already_claimed(purchase_id, self.db).await;
+            Account::Local { .. } => purchase::complete_locally(self.db, purchase_id).await?,
         };
-        match self.account_for_user(&row.app_id, &row.user_id).await {
-            Ok(Account::Local { .. }) => credits::credit_claimed_purchase(&claimed, purchase_id, self.db).await,
-            Ok(wallet) => {
-                if let Err(e) = purchase::grant_purchase(self.db, wallets, &wallet, &row).await {
-                    self.release_claim(purchase_id).await;
-                    return Err(e.into());
-                }
-                credits::tag_purchase_attribution(self.db, &row.app_id, &row.user_id, &row.id, &row.pack_id, row.amount_usd_cents).await;
-                Ok(())
-            }
-            Err(e) => {
-                self.release_claim(purchase_id).await;
-                Err(e)
-            }
+        if completed {
+            credits::tag_purchase_attribution(self.db, &row.app_id, &row.user_id, &row.id, &row.pack_id, row.amount_usd_cents).await;
         }
-    }
-
-    /// Puts a claimed purchase back to `pending` after this call could not credit it, so a retry or the cron does.
-    async fn release_claim(&self, purchase_id: &str) {
-        if let Err(e) = purchase::release_claim(self.db, purchase_id).await {
-            crate::wallet::log::error(&format!("purchase {purchase_id} stays completed without a credit: {e:?}"));
-        }
+        Ok(())
     }
 
     /// Cron: finishes RevenueCat purchases that stayed `pending` for more than five minutes. Returns how many it
@@ -385,8 +360,20 @@ impl PurchaseLedger for Ledgers<'_> {
         Ok(self.account_for_user(app_id, user_id).await?)
     }
 
-    async fn reverse(&self, account: &Account, reversal: &Reversal<'_>) -> std::result::Result<(i32, u32), AppError> {
-        Ok(Ledgers::reverse(self, account, reversal, "admin_adjustment").await?)
+    async fn reverse(&self, account: &Account, purchase: &CreditedPurchase, reversal: &Reversal<'_>) -> std::result::Result<Option<u32>, AppError> {
+        match account {
+            Account::Local { app_id, user_id } => {
+                let Some(taken) = purchase::reverse_locally(self.db, app_id, user_id, &purchase.id, reversal).await? else { return Ok(None) };
+                if taken >= reversal.amount {
+                    return Ok(Some(taken));
+                }
+                let Some(wallet) = self.relinked(app_id, user_id).await? else { return Ok(Some(taken)) };
+                let rest = Reversal { key: format!("{}:late", reversal.key), amount: reversal.amount - taken, ..reversal.clone() };
+                let (_, also_taken) = Box::pin(Ledgers::reverse(self, &wallet, &rest, "admin_adjustment")).await?;
+                Ok(Some(taken + also_taken))
+            }
+            Account::Wallet { .. } => Ok(Some(Ledgers::reverse(self, account, reversal, "admin_adjustment").await?.1)),
+        }
     }
 }
 

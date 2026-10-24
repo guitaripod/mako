@@ -51,6 +51,9 @@ impl D1Exec for NoDb {
     async fn batch(&self, _: &[super::d1::Stmt]) -> Result<(), AppError> {
         panic!("linking off must not write D1")
     }
+    async fn batch_changes(&self, _: &[super::d1::Stmt]) -> Result<Vec<u64>, AppError> {
+        panic!("linking off must not write D1")
+    }
 }
 
 struct NoWallet;
@@ -265,24 +268,6 @@ fn a_purchase_completed_meanwhile_through_the_local_balance_is_not_granted_again
     let flipped = block_on(purchase::complete_in_wallet(&d1, &wallets, &account, &stale)).unwrap();
     assert!(!flipped);
     assert_eq!(wallets.balance(MIDGAR, APP), 0);
-}
-
-#[test]
-fn a_claimed_purchase_can_be_released_for_a_retry_and_then_credits_once() {
-    let d1 = LocalD1::migrated();
-    let wallets = FakeWallets::new();
-    d1.user(APP, "u1", 0);
-    link(&d1, "u1", MIDGAR, "linked");
-    pending(&d1, "p-1", "u1", "revenuecat", "tx-1", 100);
-    d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'p-1'", &[]);
-    block_on(purchase::release_claim(&d1, "p-1")).unwrap();
-    assert_eq!(row(&d1, "p-1").status, "pending");
-    complete(&d1, &wallets, "p-1", &wallet(MIDGAR, "u1")).unwrap();
-    complete(&d1, &wallets, "p-1", &wallet(MIDGAR, "u1")).unwrap();
-    assert_eq!(wallets.balance(MIDGAR, APP), 100);
-    d1.run("UPDATE credit_purchases SET status = 'refunded' WHERE id = 'p-1'", &[]);
-    block_on(purchase::release_claim(&d1, "p-1")).unwrap();
-    assert_eq!(row(&d1, "p-1").status, "refunded", "only a completed row is released");
 }
 
 #[test]
