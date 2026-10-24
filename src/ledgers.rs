@@ -5,6 +5,7 @@ use crate::error::AppError;
 use crate::wallet::client::DoWallets;
 use crate::wallet::link::{self, Linker};
 use crate::wallet::ops::{Charge, Grant, GrantResult, Reversal, WalletOps};
+use crate::wallet::pack_credit::PurchaseLedger;
 use crate::wallet::purchase;
 use crate::wallet::{resolve, target};
 
@@ -249,19 +250,6 @@ impl<'a> Ledgers<'a> {
         Ok(resolve::account_for_user(true, &self.linker()?, app_id, user_id).await?)
     }
 
-    /// Records a RevenueCat purchase as `pending` once per store transaction and returns its id.
-    pub async fn record_pending_purchase(
-        &self,
-        app_id: &str,
-        user_id: &str,
-        pack_id: &str,
-        credits: u32,
-        amount_usd_cents: u32,
-        payment_id: &str,
-    ) -> Result<String> {
-        Ok(purchase::record_pending(self.db, app_id, user_id, pack_id, credits, amount_usd_cents, payment_id).await?)
-    }
-
     /// Completes a purchase into whichever account its user has now. A wallet account grants first under the
     /// purchase's key and flips after, so a crash in between leaves `pending` for a retry to finish. A local account
     /// keeps the flip-then-credit order of `credits::complete_purchase`, but looks at the link again once the flip is
@@ -385,6 +373,20 @@ impl<'a> Ledgers<'a> {
             Ok(_) => {}
             Err(e) => crate::wallet::log::error(&format!("pending purchase sweep failed: {e:?}")),
         }
+    }
+}
+
+impl PurchaseLedger for Ledgers<'_> {
+    async fn complete(&self, purchase_id: &str) -> std::result::Result<(), AppError> {
+        Ok(self.complete_purchase(purchase_id).await?)
+    }
+
+    async fn account_for(&self, app_id: &str, user_id: &str) -> std::result::Result<Account, AppError> {
+        Ok(self.account_for_user(app_id, user_id).await?)
+    }
+
+    async fn reverse(&self, account: &Account, reversal: &Reversal<'_>) -> std::result::Result<(i32, u32), AppError> {
+        Ok(Ledgers::reverse(self, account, reversal, "admin_adjustment").await?)
     }
 }
 

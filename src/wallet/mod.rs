@@ -10,6 +10,7 @@ pub mod link;
 pub mod links;
 pub mod log;
 pub mod ops;
+pub mod pack_credit;
 pub mod pack_refund;
 pub mod purchase;
 pub mod resolve;
@@ -38,6 +39,8 @@ mod ops_tests;
 mod target_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod refund_race_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests;
 

@@ -5,9 +5,11 @@ use uuid::Uuid;
 use super::client::WalletTransport;
 use super::d1::{int, text, D1Exec};
 use super::ops::{Grant, WalletOps};
+use super::pack_refund;
 use super::types::Kind;
 use crate::error::AppError;
 use crate::ledgers::Account;
+use crate::storekit::REFUNDED_MESSAGE;
 
 /// A stored RevenueCat purchase waits this long as `pending` before the cron finishes it.
 const PENDING_AFTER_MINUTES: i64 = 5;
@@ -81,8 +83,12 @@ pub async fn revenuecat_status(db: &impl D1Exec, app_id: &str, payment_id: &str)
     Ok(db.rows(sql, &[app_id.into(), payment_id.into()]).await?.first().and_then(|r| text(r, "status")).map(str::to_string))
 }
 
-/// Records a RevenueCat purchase as `pending` unless the transaction already has a row, and returns the id of the
-/// row there is. The webhook and the fast-track race on one transaction; at most one row ever exists for it.
+/// Records a RevenueCat purchase as `pending` unless the transaction already has a row or its refund was claimed, and
+/// returns the id of the row there is. This is the one place a pack purchase row is born, and the statement is the
+/// linearization point against a refund: D1 applies one statement at a time, and the insert only happens while no
+/// `purchase_refunds` claim exists, so a refund that claims first leaves no row for a credit to create
+/// (`AppError::Refunded`), and a refund that claims after finds the row this statement made. The webhook, the
+/// fast-track and the ledger's grant race on one transaction; at most one row ever exists for it.
 pub async fn record_pending(
     db: &impl D1Exec,
     app_id: &str,
@@ -96,7 +102,8 @@ pub async fn record_pending(
     db.exec(
         "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'revenuecat', ?7, 'pending', ?8
-         WHERE NOT EXISTS (SELECT 1 FROM credit_purchases WHERE app_id = ?2 AND payment_provider = 'revenuecat' AND payment_id = ?7)",
+         WHERE NOT EXISTS (SELECT 1 FROM credit_purchases WHERE app_id = ?2 AND payment_provider = 'revenuecat' AND payment_id = ?7)
+           AND NOT EXISTS (SELECT 1 FROM purchase_refunds WHERE app_id = ?2 AND transaction_id = ?7)",
         &[
             Uuid::new_v4().to_string().into(),
             app_id.into(),
@@ -115,10 +122,13 @@ pub async fn record_pending(
             &[app_id.into(), payment_id.into()],
         )
         .await?;
-    rows.first()
-        .and_then(|r| text(r, "id"))
-        .map(str::to_string)
-        .ok_or_else(|| AppError::InternalError("purchase row vanished".to_string()))
+    if let Some(id) = rows.first().and_then(|r| text(r, "id")) {
+        return Ok(id.to_string());
+    }
+    match pack_refund::refunded_error(db, app_id, payment_id).await? {
+        Some(refunded) => Err(refunded),
+        None => Err(AppError::InternalError("purchase row vanished".to_string())),
+    }
 }
 
 /// Credits a purchase to a wallet account, once per its key. The caller decides whether the purchase may still be
@@ -149,7 +159,10 @@ pub async fn grant_purchase<W: WalletTransport>(
 /// idempotent by its key, so a crash between the two leaves `pending`, which a retry or the cron finishes without a
 /// lost or a doubled credit. The status is read again right before the grant, so a purchase that a concurrent caller
 /// completed through the local balance while the account was being resolved is not credited a second time. Returns
-/// true when this call flipped the status, false when it was already completed.
+/// true when this call flipped the status, false when it was already completed. A purchase a refund already reversed
+/// is `AppError::Refunded`: the flip only ever leaves `pending`, so it can never overwrite `refunded`, and the grant
+/// stays idempotent by its key, so a refund that finished this credit and a caller that grants afterwards never
+/// double-grant.
 pub async fn complete_in_wallet<W: WalletTransport>(
     db: &impl D1Exec,
     wallets: &W,
@@ -160,6 +173,7 @@ pub async fn complete_in_wallet<W: WalletTransport>(
     match current.status.as_str() {
         "completed" => return Ok(false),
         "pending" => {}
+        "refunded" => return Err(AppError::Refunded(REFUNDED_MESSAGE.to_string())),
         _ => return Err(AppError::NotFound("Purchase not found".to_string())),
     }
     grant_purchase(db, wallets, account, &current).await?;

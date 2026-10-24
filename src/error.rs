@@ -101,6 +101,11 @@ pub fn is_wallet_unavailable(error: &worker::Error) -> bool {
     error.to_string().starts_with("AppError::WalletUnavailable::")
 }
 
+/// True when a ledger call failed because the purchase's refund was claimed.
+pub fn is_refunded(error: &worker::Error) -> bool {
+    error.to_string().starts_with("AppError::Refunded::")
+}
+
 /// Answers a wallet outage with its 503, and hands any other error back untouched, for handlers that let a ledger
 /// failure propagate as they always did.
 pub fn wallet_outage_response(error: worker::Error) -> Result<Response> {

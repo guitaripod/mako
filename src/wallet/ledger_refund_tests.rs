@@ -3,8 +3,9 @@ use serde_json::json;
 
 use super::ledger_grant::{self, Reason as GrantReason};
 use super::ledger_refund::{reverse, Outcome, Reason};
-use super::ops::WalletOps;
-use super::testing::{Budget, FakeWallets, Flaky, LocalD1};
+use super::pack_credit::refund_pack;
+use super::pack_refund::Settlement;
+use super::testing::{Budget, FakeWallets, Flaky, LocalD1, WalletLedger};
 use super::{pack_refund, purchase};
 use crate::error::AppError;
 use crate::storekit::{LedgerTransaction, REFUNDED_MESSAGE};
@@ -91,16 +92,8 @@ impl World {
     }
 
     fn revenuecat_refund(&self, id: &str) -> bool {
-        let purchase = block_on(pack_refund::refundable_purchase(&self.d1, APP, id)).unwrap().unwrap();
-        if !block_on(pack_refund::claim(&self.d1, APP, id, &purchase.user_id, purchase.credits)).unwrap() {
-            return false;
-        }
-        let reference = crate::purchases::refund_reference(id);
-        let description = pack_refund::description("small");
-        let reversal = pack_refund::reversal(id, "revenuecat", purchase.credits, &description, &reference);
-        block_on((WalletOps { wallets: &self.wallets, db: &self.d1 }).reverse(MIDGAR, APP, &reversal)).unwrap();
-        block_on(pack_refund::mark_refunded(&self.d1, &purchase.id)).unwrap();
-        true
+        let ledger = WalletLedger { db: &self.d1, wallets: &self.wallets };
+        matches!(block_on(refund_pack(&self.d1, &ledger, APP, "small", id)).unwrap(), Settlement::Reversed { .. })
     }
 }
 
@@ -333,4 +326,39 @@ fn a_crash_after_any_write_reverses_exactly_once_on_the_retry() {
     }
     assert!(crashes >= 3, "the injector walked through the writes ({crashes})");
     assert!(finished);
+}
+
+#[test]
+fn a_purchase_row_is_never_created_for_a_transaction_whose_refund_was_claimed() {
+    let world = World::linked();
+    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded);
+    let error = block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap_err();
+    assert!(matches!(error, AppError::Refunded(message) if message == REFUNDED_MESSAGE));
+    assert_eq!(world.status(TX), None);
+    assert!(block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, SECOND_TX)).is_ok());
+}
+
+#[test]
+fn a_claim_that_comes_after_the_purchase_row_finds_the_row() {
+    let world = World::linked();
+    let id = block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap();
+    assert!(block_on(pack_refund::claim(&world.d1, APP, TX, "", 0)).unwrap());
+    assert_eq!(block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap(), id, "the row that exists is the one returned");
+    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { credits: 5, taken: 5, .. }));
+    assert_eq!(world.status(TX).as_deref(), Some("refunded"));
+}
+
+#[test]
+fn a_credit_that_finishes_after_the_refund_reversed_the_purchase_changes_nothing() {
+    let world = World::linked();
+    world.bought(SECOND_TX);
+    let id = block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap();
+    let stale = block_on(purchase::read(&world.d1, &id)).unwrap().unwrap();
+    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { .. }));
+    let account = crate::ledgers::Account::Wallet { midgar_id: MIDGAR.to_string(), app_id: APP.to_string(), user_id: "u1".to_string() };
+    let late = block_on(purchase::complete_in_wallet(&world.d1, &world.wallets, &account, &stale)).unwrap_err();
+    assert!(matches!(late, AppError::Refunded(_)));
+    assert_eq!(world.d1_status(&id), "refunded");
+    assert_eq!(world.balance(), PACK_CREDITS);
+    assert_eq!(world.reversals(TX), 1);
 }

@@ -33,7 +33,10 @@ web-sys = { version = "=0.3.82", features = ["Crypto", "CryptoKey", "SubtleCrypt
 jwt-simple = "0.12"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
 
 [profile.release]
 lto = true

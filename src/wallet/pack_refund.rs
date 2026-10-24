@@ -60,15 +60,9 @@ pub async fn refunded_error(db: &impl D1Exec, app_id: &str, transaction_id: &str
     Ok(is_claimed(db, app_id, transaction_id).await?.then(|| AppError::Refunded(REFUNDED_MESSAGE.to_string())))
 }
 
-/// Records the refund of a transaction no credit path has seen yet, so a purchase event or a grant that arrives later is
-/// refused (`is_claimed`). The claim names no user and no credits, because nothing was credited.
-pub async fn record_uncredited(db: &impl D1Exec, app_id: &str, transaction_id: &str) -> Result<(), AppError> {
-    claim(db, app_id, transaction_id, "", 0).await?;
-    Ok(())
-}
-
 /// Claims the refund of a store transaction in `purchase_refunds`, which is shared by every path that reverses a pack.
-/// True for the call that wrote the claim, false when one already existed.
+/// True for the call that wrote the claim, false when one already existed. The claim is also the tombstone that
+/// `purchase::record_pending` checks inside the statement that creates a purchase row.
 pub async fn claim(db: &impl D1Exec, app_id: &str, transaction_id: &str, user_id: &str, credits: u32) -> Result<bool, AppError> {
     let changed = db
         .exec(
@@ -78,6 +72,17 @@ pub async fn claim(db: &impl D1Exec, app_id: &str, transaction_id: &str, user_id
         )
         .await?;
     Ok(changed > 0)
+}
+
+/// Names the buyer and the credits on a claim written before the purchase row was read, which `claim` could not know.
+/// A claim that already names a user is left alone, so this is safe to repeat.
+async fn stamp(db: &impl D1Exec, app_id: &str, transaction_id: &str, purchase: &CreditedPurchase) -> Result<(), AppError> {
+    db.exec(
+        "UPDATE purchase_refunds SET user_id = ?3, credits = ?4 WHERE app_id = ?1 AND transaction_id = ?2 AND user_id = ''",
+        &[app_id.into(), transaction_id.into(), purchase.user_id.as_str().into(), (purchase.credits as i64).into()],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Releases a claim whose reversal failed, so the retry of whichever path sees the refund first can finish the job.
@@ -105,4 +110,77 @@ pub fn description(pack_id: &str) -> String {
 /// The clamped debit that takes `credits` back for a refunded store transaction, tagged with where the refund came from.
 pub fn reversal<'a>(transaction_id: &str, source: &'static str, credits: u32, description: &'a str, reference: &'a str) -> Reversal<'a> {
     Reversal { key: reversal_key(transaction_id), kind: Kind::Reversal, source, amount: credits, description, reference: Some(reference) }
+}
+
+/// What one path's reversal of a claimed refund came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The credits were taken back, down to a zero balance: `Taken` is at most the purchase's credits.
+    Taken(u32),
+    /// Another path already took the credits back, or this balance cannot be reversed twice safely: nothing was done.
+    Settled,
+    /// The purchase is not in an account this path can reverse; another path owns it.
+    Declined,
+}
+
+/// The part of a refund that differs per path: finishing a purchase a crash left `pending` and taking its credits back
+/// from the account it landed in. `first_claim` is true for the call that wrote the claim; a wallet reversal is
+/// idempotent by its key and ignores it, a local balance has no key and must not be reversed twice.
+#[allow(async_fn_in_trait)]
+pub trait Reverser {
+    async fn reverse(&self, purchase: &CreditedPurchase, first_claim: bool) -> Result<Step, AppError>;
+}
+
+/// How a refund settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settlement {
+    /// No credit path had made a purchase row: the claim stands as the tombstone every later credit finds.
+    Tombstone,
+    /// The purchase was already reversed, by this or another path.
+    Settled(CreditedPurchase),
+    /// This call took the credits back and marked the purchase `refunded`.
+    Reversed { purchase: CreditedPurchase, taken: u32 },
+    /// The purchase belongs to an account this path does not reverse; the claim this call wrote was released.
+    Declined(CreditedPurchase),
+}
+
+/// Records the refund of a store transaction and settles it, the one function every refund path calls. The claim is
+/// written first and the purchase row read after, so the two orders a credit can race with are both closed:
+/// a row that exists by the time of the claim is read here, finished if it is `pending`, and reversed; a row that does
+/// not exist can no longer appear, because the statement that creates one only runs while no claim exists
+/// (`purchase::record_pending`). A claim a crash left behind is finished by the retry, since the row is read again
+/// whatever the claim says. A claim whose reversal failed or was declined is released when this call wrote it.
+pub async fn claim_and_settle<D: D1Exec, R: Reverser>(
+    db: &D,
+    app_id: &str,
+    transaction_id: &str,
+    reverser: &R,
+) -> Result<Settlement, AppError> {
+    let first_claim = claim(db, app_id, transaction_id, "", 0).await?;
+    let Some(purchase) = refundable_purchase(db, app_id, transaction_id).await? else {
+        return Ok(Settlement::Tombstone);
+    };
+    if purchase.is_refunded() {
+        return Ok(Settlement::Settled(purchase));
+    }
+    stamp(db, app_id, transaction_id, &purchase).await?;
+    match reverser.reverse(&purchase, first_claim).await {
+        Ok(Step::Taken(taken)) => {
+            mark_refunded(db, &purchase.id).await?;
+            Ok(Settlement::Reversed { purchase, taken })
+        }
+        Ok(Step::Settled) => Ok(Settlement::Settled(purchase)),
+        Ok(Step::Declined) => {
+            if first_claim {
+                release(db, app_id, transaction_id).await?;
+            }
+            Ok(Settlement::Declined(purchase))
+        }
+        Err(error) => {
+            if first_claim {
+                let _ = release(db, app_id, transaction_id).await;
+            }
+            Err(error)
+        }
+    }
 }

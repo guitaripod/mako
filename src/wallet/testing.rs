@@ -1,16 +1,27 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::{pin, Pin};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
+use futures::task::noop_waker_ref;
+use rusqlite::backup::Backup;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params_from_iter, Connection};
 use serde_json::{Map, Value};
 
 use super::client::WalletTransport;
 use super::d1::{D1Exec, Stmt};
+use super::link::account_of;
+use super::ops::{Reversal, WalletOps};
+use super::pack_credit::PurchaseLedger;
+use super::{links, purchase};
 use super::route::handle;
 use super::sql::{self, SqlBooks, SqlExec, Val};
 use super::types::WalletError;
 use crate::error::AppError;
+use crate::ledgers::Account;
 
 /// The clock every host test uses for the wallet objects.
 pub const NOW: i64 = 1_760_000_000;
@@ -32,7 +43,7 @@ pub struct Rusqlite(pub Connection);
 impl SqlExec for Rusqlite {
     fn run(&self, sql: &str, params: &[Val]) -> Result<Vec<Vec<Val>>, WalletError> {
         let storage = |e: rusqlite::Error| WalletError::Storage(e.to_string());
-        let mut statement = self.0.prepare(sql).map_err(storage)?;
+        let mut statement = self.0.prepare_cached(sql).map_err(storage)?;
         let columns = statement.column_count();
         let mut rows = statement.query(params_from_iter(bound(params))).map_err(storage)?;
         let mut out = Vec::new();
@@ -52,25 +63,41 @@ impl SqlExec for Rusqlite {
     }
 }
 
+thread_local! {
+    static MIGRATED: Connection = replay_migrations();
+}
+
+/// Every migration of the service, replayed in order on a fresh in-memory database.
+fn replay_migrations() -> Connection {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    names.sort();
+    let db = Connection::open_in_memory().unwrap();
+    for name in names {
+        let sql = std::fs::read_to_string(dir.join(&name)).unwrap();
+        db.execute_batch(&sql).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    db
+}
+
 /// A D1 stand-in: SQLite with every migration of the service applied, running the exact statements production sends.
 pub struct LocalD1(pub Connection);
 
 impl LocalD1 {
-    /// A fresh database with all migrations replayed in order.
+    /// A fresh database with all migrations applied, copied from one replay per thread so a test that builds thousands
+    /// of worlds does not replay thirty files each time.
     pub fn migrated() -> Self {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter(|n| n.ends_with(".sql"))
-            .collect();
-        names.sort();
-        let db = Connection::open_in_memory().unwrap();
-        for name in names {
-            let sql = std::fs::read_to_string(dir.join(&name)).unwrap();
-            db.execute_batch(&sql).unwrap_or_else(|e| panic!("{name}: {e}"));
-        }
-        Self(db)
+        let copy = MIGRATED.with(|template| {
+            let mut copy = Connection::open_in_memory().unwrap();
+            Backup::new(template, &mut copy).unwrap().run_to_completion(i32::MAX, Duration::ZERO, None).unwrap();
+            copy
+        });
+        copy.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        Self(copy)
     }
 
     /// Runs a statement the test itself needs, panicking on failure.
@@ -116,7 +143,7 @@ fn failure(e: rusqlite::Error) -> AppError {
 
 impl D1Exec for LocalD1 {
     async fn rows(&self, sql: &str, params: &[Val]) -> Result<Vec<Value>, AppError> {
-        let mut statement = self.0.prepare(sql).map_err(failure)?;
+        let mut statement = self.0.prepare_cached(sql).map_err(failure)?;
         let names: Vec<String> = statement.column_names().iter().map(|n| n.to_string()).collect();
         let mut rows = statement.query(params_from_iter(bound(params))).map_err(failure)?;
         let mut out = Vec::new();
@@ -138,7 +165,8 @@ impl D1Exec for LocalD1 {
     }
 
     async fn exec(&self, sql: &str, params: &[Val]) -> Result<u64, AppError> {
-        self.0.execute(sql, params_from_iter(bound(params))).map(|n| n as u64).map_err(failure)
+        let mut statement = self.0.prepare_cached(sql).map_err(failure)?;
+        statement.execute(params_from_iter(bound(params))).map(|n| n as u64).map_err(failure)
     }
 
     async fn batch(&self, statements: &[Stmt]) -> Result<(), AppError> {
@@ -271,5 +299,170 @@ impl WalletTransport for Flaky<'_, FakeWallets> {
         let answer = self.inner.send(midgar_id, method, path, body).await?;
         self.budget.tick()?;
         Ok(answer)
+    }
+}
+
+/// A future that is pending the first time it is polled, so a flow parks right before the operation that follows it.
+struct Park(bool);
+
+impl Future for Park {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+/// True for a statement that reads or writes the state a credit and a refund of one transaction race on.
+fn contested(sql: &str) -> bool {
+    sql.contains("credit_purchases") || sql.contains("purchase_refunds")
+}
+
+/// A store that parks its flow before every contested D1 statement and every wallet call, so `race` can run another
+/// flow between any two of them. Each parked operation then runs as one atomic step, which is how D1 applies a statement
+/// and how a wallet object applies a request.
+pub struct Stepped<'a, T> {
+    pub inner: &'a T,
+}
+
+impl<T: D1Exec> D1Exec for Stepped<'_, T> {
+    async fn rows(&self, sql: &str, params: &[Val]) -> Result<Vec<Value>, AppError> {
+        if contested(sql) {
+            Park(false).await;
+        }
+        self.inner.rows(sql, params).await
+    }
+
+    async fn exec(&self, sql: &str, params: &[Val]) -> Result<u64, AppError> {
+        if contested(sql) {
+            Park(false).await;
+        }
+        self.inner.exec(sql, params).await
+    }
+
+    async fn batch(&self, statements: &[Stmt]) -> Result<(), AppError> {
+        if statements.iter().any(|s| contested(&s.sql)) {
+            Park(false).await;
+        }
+        self.inner.batch(statements).await
+    }
+}
+
+impl<T: WalletTransport> WalletTransport for Stepped<'_, T> {
+    async fn send(&self, midgar_id: &str, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), AppError> {
+        Park(false).await;
+        self.inner.send(midgar_id, method, path, body).await
+    }
+}
+
+/// Which flow ran at one point where both were parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pick {
+    pub chosen: usize,
+}
+
+/// Runs two flows to the end on one thread, taking turns at their parking points. Both first run up to their first
+/// contested operation, which is not yet a choice. At each point where both are parked
+/// the next entry of `prefix` says which one runs (0 or 1), and the first flow once the prefix is used up. Returns both
+/// results and the choices made, so `interleavings` can branch on every one of them.
+pub fn race<A, B>(first: impl Future<Output = A>, second: impl Future<Output = B>, prefix: &[usize]) -> (A, B, Vec<Pick>) {
+    let mut first = pin!(first);
+    let mut second = pin!(second);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let mut done_first = match first.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => Some(value),
+        Poll::Pending => None,
+    };
+    let mut done_second = match second.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => Some(value),
+        Poll::Pending => None,
+    };
+    let mut picks = Vec::new();
+    loop {
+        let chosen = match (done_first.is_some(), done_second.is_some()) {
+            (false, false) => {
+                let chosen = prefix.get(picks.len()).copied().unwrap_or(0);
+                picks.push(Pick { chosen });
+                chosen
+            }
+            (false, true) => 0,
+            (true, false) => 1,
+            (true, true) => break,
+        };
+        if chosen == 0 {
+            if let Poll::Ready(value) = first.as_mut().poll(&mut cx) {
+                done_first = Some(value);
+            }
+        } else if let Poll::Ready(value) = second.as_mut().poll(&mut cx) {
+            done_second = Some(value);
+        }
+    }
+    (done_first.unwrap(), done_second.unwrap(), picks)
+}
+
+/// How many times the running flow changes along a schedule that follows `choices` and then runs the first flow to the
+/// end: a change back to the first flow after the last choice counts.
+fn switches(choices: &[usize]) -> usize {
+    let changes = choices.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    let back = usize::from(choices.last() == Some(&1));
+    changes + back
+}
+
+/// Visits every interleaving of two flows exactly once: `run` receives the choices to follow, runs a fresh world through
+/// `race` with them and checks it, and returns the choices `race` made. The next runs branch at every point where the
+/// default (the first flow) was taken. With `max_switches` set, schedules that change the running flow more often are
+/// left out, which keeps a search that also walks a crash through every write affordable. Returns how many
+/// interleavings were run.
+pub fn interleavings(max_switches: Option<usize>, mut run: impl FnMut(&[usize]) -> Vec<Pick>) -> usize {
+    let mut pending: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut visited = 0;
+    while let Some(prefix) = pending.pop() {
+        let picks = run(&prefix);
+        visited += 1;
+        for at in prefix.len()..picks.len() {
+            if picks[at].chosen == 0 {
+                let mut branch: Vec<usize> = picks[..at].iter().map(|p| p.chosen).collect();
+                branch.push(1);
+                if max_switches.is_none_or(|bound| switches(&branch) <= bound) {
+                    pending.push(branch);
+                }
+            }
+        }
+    }
+    visited
+}
+
+/// The `PurchaseLedger` of a world with linked users, over D1 and the wallets alone: what `Ledgers` does for a wallet
+/// account, without the environment it needs.
+pub struct WalletLedger<'a, D: D1Exec, W: WalletTransport> {
+    pub db: &'a D,
+    pub wallets: &'a W,
+}
+
+impl<D: D1Exec, W: WalletTransport> PurchaseLedger for WalletLedger<'_, D, W> {
+    async fn complete(&self, purchase_id: &str) -> Result<(), AppError> {
+        let row = purchase::read(self.db, purchase_id).await?.ok_or_else(|| AppError::NotFound("Purchase not found".to_string()))?;
+        let account = self.account_for(&row.app_id, &row.user_id).await?;
+        purchase::complete_in_wallet(self.db, self.wallets, &account, &row).await?;
+        Ok(())
+    }
+
+    async fn account_for(&self, app_id: &str, user_id: &str) -> Result<Account, AppError> {
+        Ok(match links::read(self.db, app_id, user_id).await? {
+            Some(link) => account_of(&link),
+            None => Account::local(app_id, user_id),
+        })
+    }
+
+    async fn reverse(&self, account: &Account, reversal: &Reversal<'_>) -> Result<(i32, u32), AppError> {
+        let Account::Wallet { midgar_id, app_id, .. } = account else {
+            return Err(AppError::InternalError("the test ledger reverses wallet accounts only".to_string()));
+        };
+        WalletOps { wallets: self.wallets, db: self.db }.reverse(midgar_id, app_id, reversal).await
     }
 }

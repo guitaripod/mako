@@ -6,7 +6,8 @@ use crate::error::AppError;
 use crate::handlers::credits::{ValidateRevenueCatPurchaseRequest, ValidateRevenueCatPurchaseResponse};
 use crate::ledgers::{Account, Ledgers};
 use crate::midgar_token::MidgarCaller;
-use crate::storekit::{already_settled, pack_of_product, tenant_bundle, vet, Expected, LedgerService, PENDING_MESSAGE};
+use crate::storekit::{already_settled, pack_of_product, tenant_bundle, vet, Expected, LedgerService, PENDING_MESSAGE, REFUNDED_MESSAGE};
+use crate::wallet::pack_credit::{credit_pack, Credit};
 use crate::wallet::{log, pack_refund, purchase};
 
 /// The text of an `already_processed` answer, as the RevenueCat path has always worded it.
@@ -101,16 +102,21 @@ async fn credit_signed(
         Err(error) => return pending(error).to_response(),
     };
     let credits = (pack.credits + pack.bonus_credits) as u32;
-    let credited = async {
-        let id = ledgers
-            .record_pending_purchase(app_id, account.user_id(), &pack.id, credits, pack.price_usd_cents as u32, &transaction.transaction_id)
-            .await?;
-        ledgers.complete_purchase(&id).await?;
-        Ok::<String, worker::Error>(id)
-    }
+    let credited = credit_pack(
+        db,
+        &ledgers,
+        app_id,
+        account.user_id(),
+        &pack.id,
+        credits,
+        pack.price_usd_cents as u32,
+        &transaction.transaction_id,
+    )
     .await;
     let purchase_id = match credited {
-        Ok(id) => id,
+        Ok(Credit::Credited { purchase_id }) => purchase_id,
+        Ok(Credit::Duplicate) => return AppError::AlreadyProcessed(ALREADY_PROCESSED_MESSAGE.to_string()).to_response(),
+        Ok(Credit::Refunded) | Err(AppError::Refunded(_)) => return AppError::Refunded(REFUNDED_MESSAGE.to_string()).to_response(),
         Err(error) => return pending(error).to_response(),
     };
     let new_balance = ledgers.get_user_balance(&account).await?;

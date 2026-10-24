@@ -1,7 +1,8 @@
 use worker::{Request, Response, RouteContext, Result, Env, Fetch, Method, Headers};
 use crate::error::AppError;
 use crate::auth;
-use crate::wallet::pack_refund;
+use crate::wallet::pack_credit::{credit_pack, refund_pack, Credit};
+use crate::wallet::pack_refund::{self, Settlement};
 use crate::credits::{
     get_user_transactions, get_credit_packs, get_credit_packs_for_app,
     record_purchase, record_and_complete_purchase, estimate_image_cost
@@ -1050,16 +1051,25 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
 
     let ledgers = crate::ledgers::Ledgers::new(&env, &db);
     let purchase_id = if let crate::ledgers::Account::Wallet { .. } = &auth.account {
-        let credited = async {
-            let id = ledgers
-                .record_pending_purchase(&app_id, &user_id, &validate_req.pack_id, total_credits as u32, pack.price_usd_cents as u32, &validate_req.purchase_token)
-                .await?;
-            ledgers.complete_purchase(&id).await?;
-            Ok::<String, worker::Error>(id)
-        }
+        let credited = credit_pack(
+            &db,
+            &ledgers,
+            &app_id,
+            &user_id,
+            &validate_req.pack_id,
+            total_credits as u32,
+            pack.price_usd_cents as u32,
+            &validate_req.purchase_token,
+        )
         .await;
         match credited {
-            Ok(id) => id,
+            Ok(Credit::Credited { purchase_id }) => purchase_id,
+            Ok(Credit::Duplicate) => {
+                return AppError::AlreadyProcessed("Purchase has already been processed".to_string()).to_response();
+            }
+            Ok(Credit::Refunded) | Err(AppError::Refunded(_)) => {
+                return AppError::Refunded(crate::storekit::REFUNDED_MESSAGE.to_string()).to_response();
+            }
             Err(e) => {
                 worker::console_log!("RevenueCat fast-track could not credit the wallet, deferring to webhook: {:?}", e);
                 return AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response();
@@ -1072,7 +1082,6 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
             &validate_req.pack_id,
             total_credits as u32,
             pack.price_usd_cents as u32,
-            "revenuecat",
             &validate_req.purchase_token,
             &db,
         ).await?
@@ -1642,23 +1651,32 @@ async fn credit_pack_from_event(
         return Ok(());
     }
 
-    let purchase_id = record_and_complete_purchase(
+    let purchase_id = match record_and_complete_purchase(
         app_id,
         &event.app_user_id,
         &pack_id,
         total_credits as u32,
         pack.price_usd_cents as u32,
-        "revenuecat",
         &event.transaction_id,
         db,
-    ).await?;
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) if crate::error::is_refunded(&e) => {
+            worker::console_log!("Transaction {} was refunded; not credited", event.transaction_id);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     worker::console_log!("Processed RevenueCat purchase {} for app {} user {}", purchase_id, app_id, event.app_user_id);
     Ok(())
 }
 
 /// Credits a pack to a wallet account. A purchase already settled, whatever its final status, is not credited again;
-/// one left `pending` by a crash is finished here, and the wallet grant is idempotent by the store transaction id.
+/// one left `pending` by a crash is finished here, and the wallet grant is idempotent by the store transaction id. A
+/// transaction whose refund was claimed, before the row or while it was being completed, is not credited.
 async fn credit_pack_to_wallet(
     ledgers: &crate::ledgers::Ledgers<'_>,
     db: &worker::D1Database,
@@ -1668,32 +1686,28 @@ async fn credit_pack_to_wallet(
     pack: &crate::credits::CreditPack,
     pack_id: &str,
 ) -> Result<()> {
-    if let Some(status) = crate::wallet::purchase::revenuecat_status(db, app_id, &event.transaction_id).await? {
-        if status != "pending" {
-            worker::console_log!("Transaction {} already processed ({})", event.transaction_id, status);
-            return Ok(());
-        }
-    }
     let credits = (pack.credits + pack.bonus_credits) as u32;
-    let purchase_id = ledgers
-        .record_pending_purchase(app_id, user_id, pack_id, credits, pack.price_usd_cents as u32, &event.transaction_id)
-        .await?;
-    ledgers.complete_purchase(&purchase_id).await?;
-    worker::console_log!("Processed RevenueCat purchase {} for app {} wallet user {}", purchase_id, app_id, user_id);
+    match credit_pack(db, ledgers, app_id, user_id, pack_id, credits, pack.price_usd_cents as u32, &event.transaction_id).await? {
+        Credit::Credited { purchase_id } => {
+            worker::console_log!("Processed RevenueCat purchase {} for app {} wallet user {}", purchase_id, app_id, user_id);
+        }
+        Credit::Duplicate => worker::console_log!("Transaction {} already processed", event.transaction_id),
+        Credit::Refunded => worker::console_log!("Transaction {} was refunded; not credited", event.transaction_id),
+    }
     Ok(())
 }
 
 /// Takes back the credits of a refunded credit-pack purchase, down to a zero
-/// balance, once per transaction. A product that is not a credit pack, or a
-/// transaction that never credited anything, is left alone, so subscriptions
-/// are never touched. The claim row in `purchase_refunds` is what makes a
-/// repeated delivery a no-op; it is released again if the reversal fails so
-/// RevenueCat's retry can finish the job. The claim, the reversal key and the
-/// purchase lookup are shared with the ledger's refund route
-/// (`wallet::ledger_refund`), so a refund that reaches both is reversed once.
-/// A refund for a transaction no purchase was recorded for is claimed anyway, so
-/// the credit paths refuse that transaction when it arrives later; a purchase
-/// still `pending` is finished first, then reversed.
+/// balance, once per transaction. A product that is not a credit pack is left
+/// alone, so subscriptions are never touched. The claim row in
+/// `purchase_refunds` is written first and the purchase read after
+/// (`pack_refund::claim_and_settle`), so no credit can slip in between, and
+/// it is released again if the reversal fails so RevenueCat's retry can finish
+/// the job. The claim, the reversal key and the purchase lookup are shared with
+/// the ledger's refund route (`wallet::ledger_refund`), so a refund that reaches
+/// both is reversed once. A refund for a transaction no purchase was recorded
+/// for stays claimed, so the credit paths refuse that transaction when it
+/// arrives later; a purchase still `pending` is finished first, then reversed.
 async fn reverse_pack_refund(
     env: &Env,
     db: &worker::D1Database,
@@ -1708,40 +1722,18 @@ async fn reverse_pack_refund(
         return Ok(());
     }
 
-    let Some(mut purchase) = pack_refund::refundable_purchase(db, app_id, &event.transaction_id).await? else {
-        pack_refund::record_uncredited(db, app_id, &event.transaction_id).await?;
-        worker::console_log!("Refund for transaction {} has no credited purchase; recorded so it is never credited", event.transaction_id);
-        return Ok(());
-    };
-    if purchase.is_pending() {
-        crate::ledgers::Ledgers::new(env, db).complete_purchase(&purchase.id).await?;
-        purchase.status = "completed".to_string();
-    }
-
-    if !pack_refund::claim(db, app_id, &event.transaction_id, &purchase.user_id, purchase.credits).await? {
-        worker::console_log!("Refund for transaction {} already reversed", event.transaction_id);
-        return Ok(());
-    }
-
-    let reference = crate::purchases::refund_reference(&event.transaction_id);
-    let description = pack_refund::description(pack_id);
     let ledgers = crate::ledgers::Ledgers::new(env, db);
-    let reversal = pack_refund::reversal(&event.transaction_id, "revenuecat", purchase.credits, &description, &reference);
-    let reversed = match ledgers.account_for_user(app_id, &purchase.user_id).await {
-        Ok(account) => ledgers.reverse(&account, &reversal, "admin_adjustment").await,
-        Err(e) => Err(e),
-    };
-    match reversed {
-        Ok((_, taken)) => {
-            pack_refund::mark_refunded(db, &purchase.id).await?;
+    match refund_pack(db, &ledgers, app_id, pack_id, &event.transaction_id).await? {
+        Settlement::Tombstone => {
+            worker::console_log!("Refund for transaction {} has no credited purchase; recorded so it is never credited", event.transaction_id);
+        }
+        Settlement::Settled(_) => worker::console_log!("Refund for transaction {} already reversed", event.transaction_id),
+        Settlement::Reversed { purchase, taken } => {
             worker::console_log!("Reversed {} of {} credits for refunded transaction {}", taken, purchase.credits, event.transaction_id);
-            Ok(())
         }
-        Err(e) => {
-            let _ = pack_refund::release(db, app_id, &event.transaction_id).await;
-            Err(e)
-        }
+        Settlement::Declined(_) => worker::console_log!("Refund for transaction {} is in no account this path reverses", event.transaction_id),
     }
+    Ok(())
 }
 
 #[cfg(test)]
