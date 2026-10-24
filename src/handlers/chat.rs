@@ -165,7 +165,7 @@ async fn chat_completion_inner(
     };
 
     let flat_cost = get_flat_capability_cost(&auth.app_id, "chat.completion", &db).await;
-    let premium = crate::handlers::credits::is_premium_user(&ctx.env, &db, &auth.app_id, &auth.user_id).await;
+    let premium = crate::handlers::credits::is_premium_user(&ctx.env, &db, &auth).await;
 
     check_and_acquire_lock(&auth.app_id, &auth.user_id, &db)
         .await

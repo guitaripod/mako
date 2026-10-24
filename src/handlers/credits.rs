@@ -1153,12 +1153,9 @@ struct RevenueCatNonSubscription {
 /// tenant must hold its own configured entitlement, and when RevenueCat cannot be
 /// reached the last answer from the previous 24 hours is used instead of treating
 /// a paying user as free.
-pub async fn is_premium_user(
-    env: &Env,
-    db: &worker::D1Database,
-    app_id: &str,
-    user_id: &str,
-) -> bool {
+pub async fn is_premium_user(env: &Env, db: &worker::D1Database, auth: &auth::AuthedUser) -> bool {
+    let app_id = auth.app_id.as_str();
+    let user_id = auth.user_id.as_str();
     let row = match db
         .prepare("SELECT * FROM apps WHERE app_id = ?1")
         .bind(&[app_id.into()])
@@ -1175,14 +1172,22 @@ pub async fn is_premium_user(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let project_id = row.get("rc_project_id").and_then(|v| v.as_str()).unwrap_or("");
-    let required = match required {
-        Some(r) if !project_id.is_empty() => r,
-        _ => return false,
+    let Some(required) = required else {
+        return false;
     };
+    let strict = crate::tenant::TenantPolicy::from_row(&row).strict_purchases;
+    if let Some(midgar_id) = premium_midgar_id(auth) {
+        if ledger_grants_premium(env, app_id, midgar_id, &required, strict).await {
+            return true;
+        }
+    }
+    let project_id = row.get("rc_project_id").and_then(|v| v.as_str()).unwrap_or("");
+    if project_id.is_empty() {
+        return false;
+    }
 
     let entitlements = fetch_active_entitlements(env, app_id, project_id, user_id).await;
-    if !crate::tenant::TenantPolicy::from_row(&row).strict_purchases {
+    if !strict {
         return entitlements.map(|items| !items.is_empty()).unwrap_or(false);
     }
 
@@ -1193,6 +1198,40 @@ pub async fn is_premium_user(
             premium
         }
         None => read_premium_cache(db, app_id, user_id).await.unwrap_or(false),
+    }
+}
+
+/// The Midgar ID whose purchases count for this caller: the verified token's, else the wallet the account is linked to.
+fn premium_midgar_id(auth: &auth::AuthedUser) -> Option<&str> {
+    auth.midgar.as_ref().map(|caller| caller.midgar_id.as_str()).or_else(|| auth.account.midgar_id())
+}
+
+/// Whether the purchase ledger lists the tenant's premium entitlement for this Midgar ID. Apps on MidgarStore buy
+/// without RevenueCat, so RevenueCat never learns of their subscriptions; the ledger has every App Store transaction.
+/// A ledger that cannot answer grants nothing here, and RevenueCat is asked as before.
+async fn ledger_grants_premium(env: &Env, app_id: &str, midgar_id: &str, required: &str, strict: bool) -> bool {
+    let Ok(ledger) = crate::storekit::LedgerService::open(env) else {
+        return false;
+    };
+    let slug = crate::tenant::registry_slug(app_id);
+    let production = crate::purchases::is_production(env.var("ENVIRONMENT").ok().map(|v| v.to_string()).as_deref());
+    for environment in premium_environments(strict, production) {
+        match ledger.entitlements(midgar_id, environment).await {
+            Ok(held) if crate::storekit::grants_entitlement(&held, &slug, required) => return true,
+            Ok(_) => {}
+            Err(failure) => worker::console_log!("premium: the ledger could not list entitlements for {}: {:?}", app_id, failure),
+        }
+    }
+    false
+}
+
+/// The ledger environments whose entitlements count: Sandbox is left out exactly where the RevenueCat webhook
+/// ignores sandbox events (a strict tenant on the production worker).
+fn premium_environments(strict: bool, production: bool) -> &'static [&'static str] {
+    if crate::purchases::should_ignore_event(strict, production, "Sandbox") {
+        &["Production"]
+    } else {
+        &["Production", "Sandbox"]
     }
 }
 
@@ -1779,6 +1818,13 @@ async fn reverse_pack_refund(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_subscriptions_count_for_premium_wherever_sandbox_purchases_do() {
+        assert_eq!(premium_environments(false, true), ["Production", "Sandbox"]);
+        assert_eq!(premium_environments(true, false), ["Production", "Sandbox"]);
+        assert_eq!(premium_environments(true, true), ["Production"]);
+    }
 
     #[test]
     fn a_linked_account_asks_revenuecat_for_its_mako_user_first_and_then_its_midgar_id() {

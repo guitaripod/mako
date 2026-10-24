@@ -294,3 +294,32 @@ fn a_purchase_row_in_any_final_status_counts_as_settled() {
     assert!(!already_settled(None));
     assert!(!already_settled(Some("pending")));
 }
+
+fn entitlement(app: &str, name: Option<&str>) -> LedgerEntitlement {
+    LedgerEntitlement { app: app.to_string(), entitlement: name.map(str::to_string) }
+}
+
+#[test]
+fn only_the_tenants_own_entitlement_grants_premium() {
+    let held = [entitlement("solar-beam", Some("premium")), entitlement("psywave", None)];
+    assert!(!grants_entitlement(&held, "psywave", "pro"));
+    assert!(!grants_entitlement(&held, "psywave", "premium"));
+    assert!(grants_entitlement(&[entitlement("psywave", Some("pro"))], "psywave", "pro"));
+    assert!(!grants_entitlement(&[], "psywave", "pro"));
+}
+
+#[test]
+fn the_entitlement_answer_is_a_list_only_when_the_ledger_says_200() {
+    let body = json!({ "midgarId": MIDGAR, "environment": "Sandbox", "serverTime": 1, "entitlements": [
+        { "app": "psywave", "entitlement": "pro", "productId": "com.marcusziade.psywave.pro.monthly", "kind": "subscription" },
+        { "app": "embr", "entitlement": null, "productId": "com.guitaripod.embr.unlock", "kind": "non_consumable" }
+    ] });
+    assert_eq!(
+        entitlements_from_answer(200, &body),
+        Ok(vec![entitlement("psywave", Some("pro")), entitlement("embr", None)])
+    );
+    assert!(matches!(entitlements_from_answer(401, &body), Err(VerifyFailure::Unavailable(_))));
+    assert!(matches!(entitlements_from_answer(404, &json!({})), Err(VerifyFailure::Unavailable(_))));
+    assert!(matches!(entitlements_from_answer(200, &json!({ "entitlements": "nope" })), Err(VerifyFailure::Unavailable(_))));
+    assert!(matches!(entitlements_from_answer(200, &Value::Null), Err(VerifyFailure::Unavailable(_))));
+}

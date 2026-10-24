@@ -127,7 +127,7 @@ async fn run(
     };
     let premium = !settled
         && unit > 0
-        && crate::handlers::credits::is_premium_user(env, db, &auth.app_id, &auth.user_id).await;
+        && crate::handlers::credits::is_premium_user(env, db, auth).await;
 
     let hold = art_hold(unit, request.n, premium, settled);
     if hold > 0 {

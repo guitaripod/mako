@@ -46,7 +46,7 @@ async fn run(
         0
     };
     let premium = needs_premium_check(cfg, settlement)
-        && crate::handlers::credits::is_premium_user(env, db, &auth.app_id, &auth.user_id).await;
+        && crate::handlers::credits::is_premium_user(env, db, auth).await;
     let mut plan = plan_charge(cfg, premium, used_before, settlement);
 
     ensure_affordable(env, db, auth, &plan).await?;

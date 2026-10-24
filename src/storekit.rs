@@ -16,6 +16,9 @@ const INTERNAL_HEADER: &str = "X-Midgar-Internal";
 /// The ledger route that verifies a StoreKit 2 signed transaction and stores nothing.
 const VERIFY_URL: &str = "https://ledger.internal/internal/verify-transaction";
 
+/// The ledger route that answers a Midgar ID's active entitlements in one environment.
+const ENTITLEMENTS_URL: &str = "https://ledger.internal/internal/entitlements";
+
 /// The App Store's name for a consumable in a verified transaction.
 pub const CONSUMABLE: &str = "Consumable";
 
@@ -40,6 +43,19 @@ pub struct LedgerTransaction {
     pub quantity: i64,
     #[serde(default)]
     pub registry_slug: Option<String>,
+}
+
+/// One active entitlement as the ledger's entitlement routes answer it: the registry app and the registry name of
+/// the entitlement (null for a product the registry does not name).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LedgerEntitlement {
+    pub app: String,
+    pub entitlement: Option<String>,
+}
+
+/// True when the tenant's own entitlement is among the active ones. An entitlement of another app never counts.
+pub fn grants_entitlement(entitlements: &[LedgerEntitlement], tenant_slug: &str, required: &str) -> bool {
+    entitlements.iter().any(|item| item.app == tenant_slug && item.entitlement.as_deref() == Some(required))
 }
 
 /// Why the ledger gave no transaction.
@@ -103,6 +119,36 @@ impl TransactionVerifier for LedgerService {
         let body = response.json::<Value>().await.unwrap_or(Value::Null);
         classify_answer(status, &body)
     }
+}
+
+impl LedgerService {
+    /// The Midgar ID's active entitlements in `environment` (`Production` or `Sandbox`). Anything but a 200 with a
+    /// readable list is the ledger being unavailable, never an empty answer.
+    pub async fn entitlements(&self, midgar_id: &str, environment: &str) -> Result<Vec<LedgerEntitlement>, VerifyFailure> {
+        let unavailable = |e: worker::Error| VerifyFailure::Unavailable(format!("the ledger could not be reached: {e}"));
+        let headers = Headers::new();
+        headers.set(INTERNAL_HEADER, &self.secret).map_err(unavailable)?;
+        headers.set("Content-Type", "application/json").map_err(unavailable)?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(serde_json::json!({ "midgarId": midgar_id, "environment": environment }).to_string().into()));
+        let mut response = self.fetcher.fetch(ENTITLEMENTS_URL, Some(init)).await.map_err(unavailable)?;
+        let status = response.status_code();
+        let body = response.json::<Value>().await.unwrap_or(Value::Null);
+        entitlements_from_answer(status, &body)
+    }
+}
+
+/// Reads the ledger's entitlement answer: 200 with an `entitlements` list, anything else unavailable.
+pub fn entitlements_from_answer(status: u16, body: &Value) -> Result<Vec<LedgerEntitlement>, VerifyFailure> {
+    if status != 200 {
+        return Err(VerifyFailure::Unavailable(format!("the ledger answered {status}")));
+    }
+    body.get("entitlements")
+        .cloned()
+        .and_then(|list| serde_json::from_value(list).ok())
+        .ok_or_else(|| VerifyFailure::Unavailable("the ledger answered unreadable entitlements".to_string()))
 }
 
 /// What a verified transaction has to match to be credited as a pack.
