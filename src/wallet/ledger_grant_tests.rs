@@ -15,6 +15,7 @@ const PACK_CREDITS: i64 = 5;
 const MIDGAR: &str = "0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d47";
 const OTHER: &str = "0195aaaa-7b1c-4d2e-9a60-3c5e8f1b2d47";
 const TX: &str = "2000000123";
+const USER: &str = "6ed586b2-0000-4000-8000-000000000001";
 
 fn transaction() -> LedgerTransaction {
     LedgerTransaction {
@@ -134,6 +135,55 @@ fn a_midgar_id_nobody_is_linked_to_is_refused_and_nothing_is_written() {
     world.d1.user(APP, "u2", 0);
     world.link("u2", OTHER, "linked");
     assert_eq!(world.credit(&transaction()).unwrap(), Outcome::Refused(Reason::NotLinked), "another ID's link is not this buyer's");
+}
+
+fn naming(token: &str) -> LedgerTransaction {
+    LedgerTransaction { app_account_token: Some(token.to_string()), ..transaction() }
+}
+
+#[test]
+fn a_revenuecat_apps_purchase_names_its_mako_user_and_credits_the_d1_balance_once() {
+    let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
+    world.d1.user(APP, USER, 2);
+    let outcome = world.credit(&naming(&USER.to_uppercase())).unwrap();
+    assert!(matches!(&outcome, Outcome::Credited { user_id, .. } if user_id == USER), "{outcome:?}");
+    assert_eq!(world.d1.d1_balance(APP, USER), 2 + PACK_CREDITS);
+    for _ in 0..2 {
+        assert!(matches!(world.credit(&naming(USER)).unwrap(), Outcome::Duplicate { .. }));
+    }
+    assert_eq!(world.d1.d1_balance(APP, USER), 2 + PACK_CREDITS);
+    assert_eq!(world.purchases(), 1);
+    assert_eq!(block_on(purchase::revenuecat_status(&world.d1, APP, TX)).unwrap().as_deref(), Some("completed"));
+    assert_eq!(world.wallets.count("POST /grant"), 0);
+}
+
+#[test]
+fn a_revenuecat_apps_purchase_for_a_linked_user_goes_to_that_users_wallet() {
+    let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
+    world.d1.user(APP, USER, 0);
+    world.link(USER, MIDGAR, "linked");
+    assert!(matches!(world.credit(&naming(USER)).unwrap(), Outcome::Credited { .. }));
+    assert_eq!(world.wallets.balance(MIDGAR, APP), PACK_CREDITS);
+    assert_eq!(world.entries(&format!("tx:{TX}")), 1);
+    assert_eq!(world.d1.d1_balance(APP, USER), 0);
+}
+
+#[test]
+fn the_validate_call_crediting_the_mako_user_first_leaves_nothing_for_the_ledger() {
+    let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
+    world.d1.user(APP, USER, 0);
+    block_on(purchase::record_and_complete_locally(&world.d1, APP, USER, "small", PACK_CREDITS as u32, 299, TX)).unwrap();
+    assert!(matches!(world.credit(&naming(USER)).unwrap(), Outcome::Duplicate { .. }));
+    assert_eq!(world.d1.d1_balance(APP, USER), PACK_CREDITS);
+}
+
+#[test]
+fn a_user_of_another_tenant_is_no_buyer_here_and_nothing_is_written() {
+    let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
+    world.d1.user("psywave", USER, 0);
+    assert_eq!(world.credit(&naming(USER)).unwrap(), Outcome::Refused(Reason::NotLinked));
+    assert_eq!(world.purchases(), 0);
+    assert_eq!(world.d1.d1_balance("psywave", USER), 0);
 }
 
 #[test]

@@ -18,8 +18,8 @@ const MIDGAR: &str = "0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d47";
 const TX: &str = "2000000123";
 const OTHER_TX: &str = "2000000124";
 
-/// The ways a store transaction gets credited. The two `Local` paths are the ones that credit a D1 balance: the RevenueCat
-/// webhook and the legacy validate call for a user with no wallet.
+/// The ways a store transaction gets credited. The `Local` paths are the ones that credit a D1 balance: the RevenueCat
+/// webhook, the legacy validate call and the ledger grant of a transaction naming the mako user, for a user with no wallet.
 #[derive(Debug, Clone, Copy)]
 enum CreditPath {
     LedgerGrant,
@@ -27,6 +27,7 @@ enum CreditPath {
     RevenueCatPurchase,
     LocalRevenueCatPurchase,
     LocalLegacyValidate,
+    LocalLedgerGrant,
 }
 
 /// Where the buyer's credits live.
@@ -54,7 +55,7 @@ enum Start {
 /// A credit path, a refund path and the account both act on.
 type Case = (CreditPath, RefundPath, Accounts);
 
-const CASES: [Case; 7] = [
+const CASES: [Case; 8] = [
     (CreditPath::LedgerGrant, RefundPath::Ledger, Accounts::Wallet),
     (CreditPath::SignedValidate, RefundPath::Ledger, Accounts::Wallet),
     (CreditPath::RevenueCatPurchase, RefundPath::RevenueCat, Accounts::Wallet),
@@ -62,6 +63,7 @@ const CASES: [Case; 7] = [
     (CreditPath::SignedValidate, RefundPath::RevenueCat, Accounts::Local),
     (CreditPath::LocalRevenueCatPurchase, RefundPath::RevenueCat, Accounts::Local),
     (CreditPath::LocalLegacyValidate, RefundPath::RevenueCat, Accounts::Local),
+    (CreditPath::LocalLedgerGrant, RefundPath::RevenueCat, Accounts::Local),
 ];
 
 /// Context switches a search that also crashes a flow after every write allows between the two flows.
@@ -227,6 +229,10 @@ async fn credit(path: CreditPath, world: &World, budget: &Budget) -> Result<(), 
                 return Ok(());
             }
             local_credit(&d1).await?;
+        }
+        CreditPath::LocalLedgerGrant => {
+            let naming_the_user = LedgerTransaction { app_account_token: Some("u1".to_string()), ..transaction(TX) };
+            ledger_grant::credit(&d1, &wallets, true, &naming_the_user).await?;
         }
     }
     Ok(())
@@ -431,6 +437,16 @@ fn a_crash_in_any_interleaving_of_a_revenuecat_purchase_and_a_revenuecat_refund_
 #[test]
 fn a_crash_in_any_interleaving_of_a_legacy_validate_and_a_revenuecat_refund_for_an_unlinked_user_is_finished_by_the_retry() {
     check_every_interleaving_with_a_crash(CASES[6]);
+}
+
+#[test]
+fn every_interleaving_of_a_ledger_grant_and_a_revenuecat_refund_for_an_unlinked_user_ends_in_an_allowed_state() {
+    check_every_interleaving(CASES[7]);
+}
+
+#[test]
+fn a_crash_in_any_interleaving_of_a_ledger_grant_and_a_revenuecat_refund_for_an_unlinked_user_is_finished_by_the_retry() {
+    check_every_interleaving_with_a_crash(CASES[7]);
 }
 
 /// Every interleaving of two refund deliveries of one credited transaction, from the two paths that reverse a pack.

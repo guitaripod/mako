@@ -55,13 +55,15 @@ pub enum Outcome {
     Refused(Reason),
 }
 
-/// Credits the consumable a verified StoreKit 2 transaction describes into the wallet of the Midgar ID in its
-/// `appAccountToken`, once per store transaction. The grant key is `tx:<transactionId>`, the key the RevenueCat webhook
-/// and the client's validate call use, so the three paths cannot credit one purchase twice. The tenant comes from the
-/// product id, and the transaction is held to the rules of the validate call (bundle, product, consumable, not
-/// revoked, purchased, quantity one, the sandbox rule). Only a Midgar ID some user is already linked to is credited: an
-/// unlinked ID would be credited a second time through RevenueCat's local `credit_purchases` row. A purchase row left
-/// `pending` by a crash is finished, and one that belongs to a user who is not linked is left to its own path. A
+/// Credits the consumable a verified StoreKit 2 transaction describes to the buyer its `appAccountToken` names, once per
+/// store transaction: the wallet of a Midgar ID some user is linked to (MidgarStore apps), or the user whose mako id it
+/// is (RevenueCat apps), in that user's wallet when linked and in the D1 balance otherwise. The grant key is
+/// `tx:<transactionId>` and the purchase row is the RevenueCat one, which the RevenueCat webhook and the client's
+/// validate call share, so no two paths credit one purchase twice. The tenant comes from the product id, and the
+/// transaction is held to the rules of the validate call (bundle, product, consumable, not revoked, purchased, quantity
+/// one, the sandbox rule). A Midgar ID no user is linked to is refused: identity may not know it, and the client's
+/// validate call credits it. A purchase row left `pending` by a crash is finished, and one that belongs to another
+/// user who is not linked is left to its own path. A
 /// transaction whose refund was claimed (it arrived first, or the pack was already reversed) is refused for good, also
 /// when the claim lands between this call's checks: the purchase row is created by one statement that does not run
 /// while a claim exists (`purchase::record_pending`), and the flip to `completed` never overwrites `refunded`.
@@ -71,8 +73,8 @@ pub async fn credit<D: D1Exec, W: WalletTransport>(
     production: bool,
     transaction: &LedgerTransaction,
 ) -> Result<Outcome, AppError> {
-    let midgar_id = match transaction.app_account_token.as_deref().map(str::to_lowercase) {
-        Some(id) if is_midgar_id(&id) => id,
+    let token = match transaction.app_account_token.as_deref().map(str::to_lowercase) {
+        Some(token) if !token.is_empty() => token,
         _ => return Ok(Outcome::Refused(Reason::NotAMidgarId)),
     };
     let Some((app_id, _prefix)) = tenant_of_product(db, &transaction.product_id).await? else {
@@ -81,7 +83,7 @@ pub async fn credit<D: D1Exec, W: WalletTransport>(
     let Some(facts) = tenant_facts(db, &app_id).await? else { return Ok(Outcome::Refused(Reason::UnknownTenant)) };
     let expected = Expected {
         product_id: &transaction.product_id,
-        midgar_id: &midgar_id,
+        midgar_id: &token,
         tenant_slug: &facts.slug,
         tenant_bundle: facts.bundle.as_deref(),
         strict: facts.strict,
@@ -99,15 +101,15 @@ pub async fn credit<D: D1Exec, W: WalletTransport>(
     if pack_refund::is_claimed(db, &app_id, &transaction.transaction_id).await? {
         return Ok(Outcome::Refused(Reason::Refunded));
     }
-    let Some(link) = links::oldest_for_midgar(db, &app_id, &midgar_id).await? else {
-        return Ok(Outcome::Refused(Reason::NotLinked));
+    let Some(buyer) = buyer_of(db, &app_id, &token).await? else {
+        return Ok(Outcome::Refused(if is_midgar_id(&token) { Reason::NotLinked } else { Reason::NotAMidgarId }));
     };
 
     let credits = (pack.credits + pack.bonus_credits).max(0) as u32;
     let purchase_id = match purchase::record_pending(
         db,
         &app_id,
-        &link.user_id,
+        &buyer,
         &pack_id,
         credits,
         pack.price_usd_cents.max(0) as u32,
@@ -128,13 +130,28 @@ pub async fn credit<D: D1Exec, W: WalletTransport>(
     if row.status != "pending" {
         return Ok(Outcome::Duplicate { purchase_id });
     }
-    let Some(owner) = links::read(db, &app_id, &row.user_id).await? else {
-        return Ok(Outcome::Refused(Reason::Elsewhere));
+    let completed = match links::read(db, &app_id, &row.user_id).await? {
+        Some(owner) => purchase::complete_in_wallet(db, wallets, &account_of(&owner), &row).await,
+        None if row.user_id == buyer => purchase::complete_locally(db, &purchase_id).await,
+        None => return Ok(Outcome::Refused(Reason::Elsewhere)),
     };
-    match purchase::complete_in_wallet(db, wallets, &account_of(&owner), &row).await {
+    match completed {
         Ok(true) => Ok(Outcome::Credited { app_id, user_id: row.user_id, purchase_id, pack_id, credits, amount_usd_cents: row.amount_usd_cents }),
         Ok(false) => Ok(Outcome::Duplicate { purchase_id }),
         Err(AppError::Refunded(_)) => Ok(Outcome::Refused(Reason::Refunded)),
         Err(error) => Err(error),
     }
+}
+
+/// The user of the tenant the transaction's `appAccountToken` names: the oldest user linked to it as a Midgar ID, else
+/// the tenant's user with that id. Apps on the RevenueCat SDK log RevenueCat in as their mako user and RevenueCat copies
+/// that UUID into `appAccountToken`, so their purchases name the user directly, linked to a wallet or not.
+async fn buyer_of<D: D1Exec>(db: &D, app_id: &str, token: &str) -> Result<Option<String>, AppError> {
+    if let Some(link) = links::oldest_for_midgar(db, app_id, token).await? {
+        return Ok(Some(link.user_id));
+    }
+    if links::user_exists(db, app_id, token).await? {
+        return Ok(Some(token.to_string()));
+    }
+    Ok(None)
 }
