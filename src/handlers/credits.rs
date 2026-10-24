@@ -1020,16 +1020,24 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
     // Verify with RevenueCat BEFORE granting anything. The authenticated webhook
     // (revenuecat_webhook) is the authoritative, idempotent source of truth; this
     // client path is a fast-track that must never grant on an unverified or failed check.
-    let revenuecat_customer = auth.account.midgar_id().unwrap_or(&user_id).to_string();
-    let validation_result = validate_with_revenuecat(
-        &env,
-        &db,
-        &app_id,
-        &revenuecat_customer,
-        &validate_req.purchase_token,
-        &validate_req.product_id,
-        &validate_req.platform,
-    ).await;
+    let mut answers = Vec::new();
+    for customer in revenuecat_customers(&user_id, auth.account.midgar_id()) {
+        let answer = validate_with_revenuecat(
+            &env,
+            &db,
+            &app_id,
+            &customer,
+            &validate_req.purchase_token,
+            &validate_req.product_id,
+            &validate_req.platform,
+        ).await;
+        let verified = matches!(answer, Ok(PurchaseVerification::Verified));
+        answers.push(answer);
+        if verified {
+            break;
+        }
+    }
+    let validation_result = fold_verifications(answers);
 
     match validation_result {
         Ok(PurchaseVerification::Verified) => {}
@@ -1301,6 +1309,38 @@ enum PurchaseVerification {
     /// propagated, or the API was unreachable). Do not grant on this path; the
     /// authenticated webhook is the authoritative, idempotent fallback.
     Defer,
+}
+
+/// The RevenueCat customer ids a purchase by this caller can be filed under, most likely first. Apps in the field log
+/// RevenueCat in as their mako user (and RevenueCat copies that id into the transaction's `appAccountToken`);
+/// MidgarCommerce apps log in as the Midgar ID. A linked account can arrive with either, so both are asked.
+fn revenuecat_customers(user_id: &str, midgar_id: Option<&str>) -> Vec<String> {
+    let mut customers = vec![user_id.to_string()];
+    if let Some(midgar_id) = midgar_id.filter(|id| !id.is_empty() && *id != user_id) {
+        customers.push(midgar_id.to_string());
+    }
+    customers
+}
+
+/// One answer from the answers for each customer id. A customer holding the purchase verifies it. Otherwise an
+/// unreachable RevenueCat leaves it to the webhook, a customer that answered without it rejects it, and customers
+/// RevenueCat does not know yet defer it.
+fn fold_verifications(answers: Vec<Result<PurchaseVerification>>) -> Result<PurchaseVerification> {
+    let mut rejected = false;
+    let mut unreachable = None;
+    for answer in answers {
+        match answer {
+            Ok(PurchaseVerification::Verified) => return Ok(PurchaseVerification::Verified),
+            Ok(PurchaseVerification::Rejected) => rejected = true,
+            Ok(PurchaseVerification::Defer) => {}
+            Err(e) => unreachable = Some(e),
+        }
+    }
+    match (unreachable, rejected) {
+        (Some(e), _) => Err(e),
+        (None, true) => Ok(PurchaseVerification::Rejected),
+        (None, false) => Ok(PurchaseVerification::Defer),
+    }
 }
 
 /// Verifies that `purchase_token` and `product_id` both belong to a real purchase
@@ -1739,6 +1779,35 @@ async fn reverse_pack_refund(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_linked_account_asks_revenuecat_for_its_mako_user_first_and_then_its_midgar_id() {
+        assert_eq!(revenuecat_customers("u-1", Some("m-1")), vec!["u-1", "m-1"]);
+        assert_eq!(revenuecat_customers("u-1", None), vec!["u-1"]);
+        assert_eq!(revenuecat_customers("m-1", Some("m-1")), vec!["m-1"]);
+        assert_eq!(revenuecat_customers("u-1", Some("")), vec!["u-1"]);
+    }
+
+    fn unreachable() -> Result<PurchaseVerification> {
+        Err(worker::Error::RustError("RevenueCat API error: 503".into()))
+    }
+
+    #[test]
+    fn any_customer_holding_the_purchase_verifies_it() {
+        use PurchaseVerification::*;
+        assert!(matches!(fold_verifications(vec![Ok(Rejected), Ok(Verified)]), Ok(Verified)));
+        assert!(matches!(fold_verifications(vec![Ok(Defer), Ok(Verified)]), Ok(Verified)));
+        assert!(matches!(fold_verifications(vec![unreachable(), Ok(Verified)]), Ok(Verified)));
+    }
+
+    #[test]
+    fn without_a_customer_holding_it_unreachable_beats_rejected_beats_deferred() {
+        use PurchaseVerification::*;
+        assert!(fold_verifications(vec![Ok(Rejected), unreachable()]).is_err());
+        assert!(matches!(fold_verifications(vec![Ok(Defer), Ok(Rejected)]), Ok(Rejected)));
+        assert!(matches!(fold_verifications(vec![Ok(Defer), Ok(Defer)]), Ok(Defer)));
+        assert!(matches!(fold_verifications(vec![]), Ok(Defer)));
+    }
 
     #[test]
     fn a_balance_without_weekly_buckets_serializes_exactly_as_before() {
