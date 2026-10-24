@@ -263,6 +263,10 @@ pub fn already_settled(status: Option<&str>) -> bool {
     matches!(status, Some(status) if status != "pending")
 }
 
+/// The text of a `refunded` answer. It must not contain the phrases a client without codes reads as a success ("already
+/// been processed") or as a retry ("could not be verified"), so that such a client treats it as final.
+pub const REFUNDED_MESSAGE: &str = "This purchase was refunded, so it is not credited.";
+
 /// The text of every `credit_pending` answer of the validate route. It is the sentence the fast-track always
 /// meant, now visible instead of masked behind a 500.
 pub const PENDING_MESSAGE: &str = "Could not verify the purchase right now; it will be credited shortly.";

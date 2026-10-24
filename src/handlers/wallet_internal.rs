@@ -68,6 +68,7 @@ fn refund_answer(outcome: &RefundOutcome) -> Value {
             json!({ "ok": true, "status": "reversed", "purchase_id": purchase_id, "credits": credits, "taken": taken })
         }
         RefundOutcome::Duplicate { purchase_id } => json!({ "ok": true, "status": "duplicate", "purchase_id": purchase_id }),
+        RefundOutcome::Recorded => json!({ "ok": true, "status": "recorded" }),
         RefundOutcome::Refused(reason) => json!({ "ok": true, "status": "refused", "reason": reason.as_str() }),
     }
 }
@@ -186,6 +187,7 @@ mod tests {
         assert_eq!(reversed, json!({ "ok": true, "status": "reversed", "purchase_id": "p1", "credits": 5, "taken": 2 }));
         let duplicate = refund_answer(&RefundOutcome::Duplicate { purchase_id: "p1".into() });
         assert_eq!(duplicate, json!({ "ok": true, "status": "duplicate", "purchase_id": "p1" }));
+        assert_eq!(refund_answer(&RefundOutcome::Recorded), json!({ "ok": true, "status": "recorded" }));
         let refused = refund_answer(&RefundOutcome::Refused(RefundReason::NotConsumable));
         assert_eq!(refused, json!({ "ok": true, "status": "refused", "reason": "not_consumable" }));
     }

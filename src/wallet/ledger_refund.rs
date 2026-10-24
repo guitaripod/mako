@@ -2,7 +2,7 @@ use super::client::WalletTransport;
 use super::d1::D1Exec;
 use super::link::account_of;
 use super::ops::WalletOps;
-use super::{links, pack_refund};
+use super::{links, pack_refund, purchase};
 use crate::credits::packs_for_app;
 use crate::error::AppError;
 use crate::ledgers::Account;
@@ -17,7 +17,6 @@ pub enum Reason {
     UnknownPack,
     WrongApp,
     NotConsumable,
-    NotCredited,
     NotLinked,
     LinkingOff,
 }
@@ -31,7 +30,6 @@ impl Reason {
             Reason::UnknownPack => "unknown_pack",
             Reason::WrongApp => "wrong_app",
             Reason::NotConsumable => "not_consumable",
-            Reason::NotCredited => "not_credited",
             Reason::NotLinked => "not_linked",
             Reason::LinkingOff => "wallet_linking_off",
         }
@@ -45,17 +43,21 @@ pub enum Outcome {
     Reversed { purchase_id: String, credits: u32, taken: u32 },
     /// The transaction was reversed before, by this route or the RevenueCat webhook.
     Duplicate { purchase_id: String },
+    /// No credit path has seen the transaction yet: the refund is recorded and every later credit of it is refused.
+    Recorded,
     Refused(Reason),
 }
 
 /// Takes back the credits of the credit pack a refunded StoreKit 2 transaction describes, once per store transaction,
 /// down to a zero balance. The transaction must be a consumable made in the app of a tenant that sells its product as a
-/// pack, so a subscription or any other product is never touched, and it must have been credited to a linked wallet
-/// (a purchase RevenueCat credited to a local balance is left to the RevenueCat webhook). The claim in
-/// `purchase_refunds` is the one the RevenueCat webhook writes and the wallet key `reverse:<transactionId>` is the one
-/// it reverses under, so a refund that reaches both paths is reversed once whichever arrives first. A claim whose
-/// reversal failed is released, and a claim left by a crash is finished by the retry, because the wallet replays a key
-/// it has seen.
+/// pack, so a subscription or any other product is never touched. A transaction nothing has credited yet is only
+/// recorded (`Outcome::Recorded`): the claim in `purchase_refunds` makes the grant, the validate call and the RevenueCat
+/// webhook refuse it afterwards. A purchase still `pending` is finished first and then reversed, so a credit a crash left
+/// half done cannot outlive its refund. The reversal needs the purchase to be in a linked wallet (a purchase RevenueCat
+/// credited to a local balance is left to the RevenueCat webhook). The claim is the one the RevenueCat webhook writes and
+/// the wallet key `reverse:<transactionId>` is the one it reverses under, so a refund that reaches both paths is reversed
+/// once whichever arrives first. A claim whose reversal failed is released, and a claim left by a crash is finished by
+/// the retry, because the wallet replays a key it has seen.
 pub async fn reverse<D: D1Exec, W: WalletTransport>(db: &D, wallets: &W, transaction: &LedgerTransaction) -> Result<Outcome, AppError> {
     let Some((app_id, _prefix)) = tenant_of_product(db, &transaction.product_id).await? else {
         return Ok(Outcome::Refused(Reason::UnknownProduct));
@@ -73,22 +75,28 @@ pub async fn reverse<D: D1Exec, W: WalletTransport>(db: &D, wallets: &W, transac
     if !packs_for_app(db, &app_id).await.iter().any(|p| p.id == pack_id) {
         return Ok(Outcome::Refused(Reason::UnknownPack));
     }
-    let Some(purchase) = pack_refund::credited_purchase(db, &app_id, &transaction.transaction_id).await? else {
-        return Ok(Outcome::Refused(Reason::NotCredited));
+    let Some(purchase) = pack_refund::refundable_purchase(db, &app_id, &transaction.transaction_id).await? else {
+        pack_refund::record_uncredited(db, &app_id, &transaction.transaction_id).await?;
+        return Ok(Outcome::Recorded);
     };
     if purchase.is_refunded() {
         return Ok(Outcome::Duplicate { purchase_id: purchase.id });
     }
     let Some(link) = links::read(db, &app_id, &purchase.user_id).await? else { return Ok(Outcome::Refused(Reason::NotLinked)) };
-    let Account::Wallet { midgar_id, .. } = account_of(&link) else {
+    let account = account_of(&link);
+    let Account::Wallet { midgar_id, .. } = &account else {
         return Err(AppError::InternalError("a link is not a wallet account".to_string()));
     };
+    if purchase.is_pending() {
+        let row = purchase::read(db, &purchase.id).await?.ok_or_else(|| AppError::InternalError("purchase row vanished".to_string()))?;
+        purchase::complete_in_wallet(db, wallets, &account, &row).await?;
+    }
 
     let newly_claimed = pack_refund::claim(db, &app_id, &transaction.transaction_id, &purchase.user_id, purchase.credits).await?;
     let description = pack_refund::description(&pack_id);
     let reference = crate::purchases::refund_reference(&transaction.transaction_id);
     let reversal = pack_refund::reversal(&transaction.transaction_id, "ledger", purchase.credits, &description, &reference);
-    match (WalletOps { wallets, db }).reverse(&midgar_id, &app_id, &reversal).await {
+    match (WalletOps { wallets, db }).reverse(midgar_id, &app_id, &reversal).await {
         Ok((_, taken)) => {
             pack_refund::mark_refunded(db, &purchase.id).await?;
             Ok(Outcome::Reversed { purchase_id: purchase.id, credits: purchase.credits, taken })

@@ -1012,6 +1012,10 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
         }
     }
     
+    if let Some(refunded) = pack_refund::refunded_error(&db, &app_id, &validate_req.purchase_token).await? {
+        return refunded.to_response();
+    }
+
     // Verify with RevenueCat BEFORE granting anything. The authenticated webhook
     // (revenuecat_webhook) is the authoritative, idempotent source of truth; this
     // client path is a fast-track that must never grant on an unverified or failed check.
@@ -1611,6 +1615,11 @@ async fn credit_pack_from_event(
         }
     };
 
+    if pack_refund::is_claimed(db, app_id, &event.transaction_id).await? {
+        worker::console_log!("Transaction {} was refunded; not credited", event.transaction_id);
+        return Ok(());
+    }
+
     let total_credits = pack.credits + pack.bonus_credits;
 
     let ledgers = crate::ledgers::Ledgers::new(env, db);
@@ -1682,6 +1691,9 @@ async fn credit_pack_to_wallet(
 /// RevenueCat's retry can finish the job. The claim, the reversal key and the
 /// purchase lookup are shared with the ledger's refund route
 /// (`wallet::ledger_refund`), so a refund that reaches both is reversed once.
+/// A refund for a transaction no purchase was recorded for is claimed anyway, so
+/// the credit paths refuse that transaction when it arrives later; a purchase
+/// still `pending` is finished first, then reversed.
 async fn reverse_pack_refund(
     env: &Env,
     db: &worker::D1Database,
@@ -1696,10 +1708,15 @@ async fn reverse_pack_refund(
         return Ok(());
     }
 
-    let Some(purchase) = pack_refund::credited_purchase(db, app_id, &event.transaction_id).await? else {
-        worker::console_log!("Refund for transaction {} has no credited purchase; nothing to reverse", event.transaction_id);
+    let Some(mut purchase) = pack_refund::refundable_purchase(db, app_id, &event.transaction_id).await? else {
+        pack_refund::record_uncredited(db, app_id, &event.transaction_id).await?;
+        worker::console_log!("Refund for transaction {} has no credited purchase; recorded so it is never credited", event.transaction_id);
         return Ok(());
     };
+    if purchase.is_pending() {
+        crate::ledgers::Ledgers::new(env, db).complete_purchase(&purchase.id).await?;
+        purchase.status = "completed".to_string();
+    }
 
     if !pack_refund::claim(db, app_id, &event.transaction_id, &purchase.user_id, purchase.credits).await? {
         worker::console_log!("Refund for transaction {} already reversed", event.transaction_id);

@@ -7,7 +7,7 @@ use crate::handlers::credits::{ValidateRevenueCatPurchaseRequest, ValidateRevenu
 use crate::ledgers::{Account, Ledgers};
 use crate::midgar_token::MidgarCaller;
 use crate::storekit::{already_settled, pack_of_product, tenant_bundle, vet, Expected, LedgerService, PENDING_MESSAGE};
-use crate::wallet::{log, purchase};
+use crate::wallet::{log, pack_refund, purchase};
 
 /// The text of an `already_processed` answer, as the RevenueCat path has always worded it.
 const ALREADY_PROCESSED_MESSAGE: &str = "Purchase has already been processed";
@@ -85,6 +85,11 @@ async fn credit_signed(
         return crate::storekit::Refusal::WrongProduct.into_error().to_response();
     }
 
+    match pack_refund::refunded_error(db, app_id, &transaction.transaction_id).await {
+        Ok(Some(refunded)) => return refunded.to_response(),
+        Ok(None) => {}
+        Err(error) => return pending(error).to_response(),
+    }
     match purchase::revenuecat_status(db, app_id, &transaction.transaction_id).await {
         Ok(status) if already_settled(status.as_deref()) => return AppError::AlreadyProcessed(ALREADY_PROCESSED_MESSAGE.to_string()).to_response(),
         Ok(_) => {}

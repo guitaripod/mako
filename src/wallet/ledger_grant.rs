@@ -2,7 +2,7 @@ use super::client::WalletTransport;
 use super::d1::D1Exec;
 use super::link::account_of;
 use super::target::is_midgar_id;
-use super::{links, purchase};
+use super::{links, pack_refund, purchase};
 use crate::credits::packs_for_app;
 use crate::error::AppError;
 use crate::storekit::{check, pack_of_product, tenant_facts, tenant_of_product, Expected, LedgerTransaction, Refusal};
@@ -18,6 +18,7 @@ pub enum Reason {
     NotLinked,
     LinkingOff,
     Elsewhere,
+    Refunded,
 }
 
 impl Reason {
@@ -31,6 +32,7 @@ impl Reason {
             Reason::NotLinked => "not_linked",
             Reason::LinkingOff => "wallet_linking_off",
             Reason::Elsewhere => "credited_elsewhere",
+            Reason::Refunded => "refunded",
             Reason::Transaction(Refusal::WrongApp) => "wrong_app",
             Reason::Transaction(Refusal::NotYours) => "not_yours",
             Reason::Transaction(Refusal::WrongProduct) => "wrong_product",
@@ -59,7 +61,8 @@ pub enum Outcome {
 /// product id, and the transaction is held to the rules of the validate call (bundle, product, consumable, not
 /// revoked, purchased, quantity one, the sandbox rule). Only a Midgar ID some user is already linked to is credited: an
 /// unlinked ID would be credited a second time through RevenueCat's local `credit_purchases` row. A purchase row left
-/// `pending` by a crash is finished, and one that belongs to a user who is not linked is left to its own path.
+/// `pending` by a crash is finished, and one that belongs to a user who is not linked is left to its own path. A
+/// transaction whose refund was claimed (it arrived first, or the pack was already reversed) is refused for good.
 pub async fn credit<D: D1Exec, W: WalletTransport>(
     db: &D,
     wallets: &W,
@@ -91,6 +94,9 @@ pub async fn credit<D: D1Exec, W: WalletTransport>(
     let Some(pack) = packs_for_app(db, &app_id).await.into_iter().find(|p| p.id == pack_id) else {
         return Ok(Outcome::Refused(Reason::UnknownPack));
     };
+    if pack_refund::is_claimed(db, &app_id, &transaction.transaction_id).await? {
+        return Ok(Outcome::Refused(Reason::Refunded));
+    }
     let Some(link) = links::oldest_for_midgar(db, &app_id, &midgar_id).await? else {
         return Ok(Outcome::Refused(Reason::NotLinked));
     };

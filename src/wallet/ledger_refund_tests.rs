@@ -1,13 +1,13 @@
 use futures::executor::block_on;
 use serde_json::json;
 
-use super::ledger_grant;
+use super::ledger_grant::{self, Reason as GrantReason};
 use super::ledger_refund::{reverse, Outcome, Reason};
 use super::ops::WalletOps;
 use super::testing::{Budget, FakeWallets, Flaky, LocalD1};
 use super::{pack_refund, purchase};
 use crate::error::AppError;
-use crate::storekit::LedgerTransaction;
+use crate::storekit::{LedgerTransaction, REFUNDED_MESSAGE};
 
 const APP: &str = "dreameater";
 const BUNDLE: &str = "com.marcusziade.DreamEater";
@@ -91,7 +91,7 @@ impl World {
     }
 
     fn revenuecat_refund(&self, id: &str) -> bool {
-        let purchase = block_on(pack_refund::credited_purchase(&self.d1, APP, id)).unwrap().unwrap();
+        let purchase = block_on(pack_refund::refundable_purchase(&self.d1, APP, id)).unwrap().unwrap();
         if !block_on(pack_refund::claim(&self.d1, APP, id, &purchase.user_id, purchase.credits)).unwrap() {
             return false;
         }
@@ -173,7 +173,7 @@ fn a_claim_left_by_a_crashed_revenuecat_reversal_is_finished_once_by_the_ledger(
     let world = World::linked();
     world.bought(TX);
     world.bought(SECOND_TX);
-    let purchase = block_on(pack_refund::credited_purchase(&world.d1, APP, TX)).unwrap().unwrap();
+    let purchase = block_on(pack_refund::refundable_purchase(&world.d1, APP, TX)).unwrap().unwrap();
     assert!(block_on(pack_refund::claim(&world.d1, APP, TX, &purchase.user_id, purchase.credits)).unwrap());
     assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { taken: 5, .. }));
     assert_eq!(world.balance(), PACK_CREDITS);
@@ -231,13 +231,63 @@ fn a_transaction_from_another_app_is_refused() {
 }
 
 #[test]
-fn a_refund_of_a_transaction_nothing_credited_is_refused_and_claims_nothing() {
+fn a_refund_of_a_transaction_nothing_has_credited_is_recorded_and_reverses_nothing() {
     let world = World::linked();
-    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Refused(Reason::NotCredited));
-    let id = block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap();
-    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Refused(Reason::NotCredited), "a pending purchase {id} holds no credit yet");
-    assert_eq!(world.claims(), 0);
+    world.bought(SECOND_TX);
+    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded);
+    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded, "a repeat records nothing new");
+    assert_eq!(world.claims(), 1);
+    assert_eq!(world.balance(), PACK_CREDITS);
     assert_eq!(world.wallets.count("POST /reverse"), 0);
+    assert!(block_on(pack_refund::is_claimed(&world.d1, APP, TX)).unwrap());
+    assert!(!block_on(pack_refund::is_claimed(&world.d1, APP, SECOND_TX)).unwrap());
+}
+
+#[test]
+fn a_refund_first_means_the_grant_that_follows_credits_nothing() {
+    let world = World::linked();
+    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded);
+    let outcome = block_on(ledger_grant::credit(&world.d1, &world.wallets, true, &transaction())).unwrap();
+    assert_eq!(outcome, ledger_grant::Outcome::Refused(GrantReason::Refunded));
+    assert_eq!(world.balance(), 0);
+    assert_eq!(world.status(TX), None);
+    assert_eq!(world.wallets.count("POST /grant"), 0);
+    assert_eq!(GrantReason::Refunded.as_str(), "refunded");
+    let other = LedgerTransaction { transaction_id: SECOND_TX.to_string(), original_transaction_id: SECOND_TX.to_string(), ..transaction() };
+    assert!(matches!(block_on(ledger_grant::credit(&world.d1, &world.wallets, true, &other)).unwrap(), ledger_grant::Outcome::Credited { .. }));
+}
+
+#[test]
+fn a_refund_first_means_the_validate_call_answers_refunded_and_final() {
+    let world = World::linked();
+    assert!(block_on(pack_refund::refunded_error(&world.d1, APP, TX)).unwrap().is_none());
+    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded);
+    let error = block_on(pack_refund::refunded_error(&world.d1, APP, TX)).unwrap().expect("a claimed refund is an error");
+    let parts = error.parts();
+    assert_eq!((parts.status, parts.code), (400, "refunded"));
+    assert_eq!(parts.message, REFUNDED_MESSAGE);
+    assert!(!parts.message.contains("already been processed") && !parts.message.contains("could not be verified"));
+    assert!(block_on(pack_refund::refunded_error(&world.d1, APP, SECOND_TX)).unwrap().is_none());
+}
+
+#[test]
+fn a_refund_first_means_the_revenuecat_purchase_event_finds_the_claim() {
+    let world = World::linked();
+    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded);
+    assert!(block_on(pack_refund::is_claimed(&world.d1, APP, TX)).unwrap(), "credit_pack_from_event stops here");
+    assert!(block_on(pack_refund::refundable_purchase(&world.d1, APP, TX)).unwrap().is_none());
+    assert_eq!(world.balance(), 0);
+}
+
+#[test]
+fn a_refund_after_a_pending_purchase_finishes_it_then_reverses_it() {
+    let world = World::linked();
+    block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap();
+    world.bought(SECOND_TX);
+    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { credits: 5, taken: 5, .. }));
+    assert_eq!(world.balance(), PACK_CREDITS);
+    assert_eq!(world.status(TX).as_deref(), Some("refunded"));
+    assert_eq!(world.reversals(TX), 1);
 }
 
 #[test]

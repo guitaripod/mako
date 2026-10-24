@@ -29,6 +29,9 @@ pub enum AppError {
     /// 400 `unverifiable_purchase`: the purchase could not be verified as it stands. A client may retry it for a
     /// while, because RevenueCat can lag the App Store.
     UnverifiablePurchase(String),
+    /// 400 `refunded`: the store transaction was refunded, so it is never credited. Final for a client: it is neither
+    /// pending nor a success.
+    Refunded(String),
 }
 
 /// What an error answers with, before it becomes a response.
@@ -59,6 +62,7 @@ impl AppError {
             AppError::CreditPending(msg) => (409, "conflict", msg.clone(), "credit_pending", None),
             AppError::AlreadyProcessed(msg) => (400, "invalid_request_error", msg.clone(), "already_processed", None),
             AppError::UnverifiablePurchase(msg) => (400, "invalid_request_error", msg.clone(), "unverifiable_purchase", None),
+            AppError::Refunded(msg) => (400, "invalid_request_error", msg.clone(), "refunded", None),
         };
         ErrorParts { status, error_type, message, code, balance }
     }
@@ -156,6 +160,9 @@ impl From<worker::Error> for AppError {
         if let Some(msg) = error_str.strip_prefix("AppError::UnverifiablePurchase::") {
             return AppError::UnverifiablePurchase(msg.to_string());
         }
+        if let Some(msg) = error_str.strip_prefix("AppError::Refunded::") {
+            return AppError::Refunded(msg.to_string());
+        }
         if let Some(msg) = error_str.strip_prefix("AppError::InternalError::") {
             return AppError::InternalError(msg.to_string());
         }
@@ -177,6 +184,7 @@ impl From<AppError> for worker::Error {
             AppError::CreditPending(msg) => format!("AppError::CreditPending::{}", msg),
             AppError::AlreadyProcessed(msg) => format!("AppError::AlreadyProcessed::{}", msg),
             AppError::UnverifiablePurchase(msg) => format!("AppError::UnverifiablePurchase::{}", msg),
+            AppError::Refunded(msg) => format!("AppError::Refunded::{}", msg),
             AppError::InternalError(msg) => format!("AppError::InternalError::{}", msg),
             AppError::RateLimitExceeded => "AppError::RateLimitExceeded::".to_string(),
             AppError::Truncated => "AppError::Truncated::".to_string(),
@@ -206,6 +214,7 @@ mod tests {
             (AppError::CreditPending("p".into()), 409, "credit_pending"),
             (AppError::AlreadyProcessed("a".into()), 400, "already_processed"),
             (AppError::UnverifiablePurchase("u".into()), 400, "unverifiable_purchase"),
+            (AppError::Refunded("r".into()), 400, "refunded"),
             (AppError::PaymentRequired("i".into(), Some(5)), 402, "insufficient_credits"),
             (AppError::WalletUnavailable, 503, "wallet_unavailable"),
         ];
@@ -255,6 +264,7 @@ mod tests {
         assert!(matches!(round_trip(AppError::CreditPending("p".into())), AppError::CreditPending(m) if m == "p"));
         assert!(matches!(round_trip(AppError::AlreadyProcessed("a".into())), AppError::AlreadyProcessed(m) if m == "a"));
         assert!(matches!(round_trip(AppError::UnverifiablePurchase("u".into())), AppError::UnverifiablePurchase(m) if m == "u"));
+        assert!(matches!(round_trip(AppError::Refunded("r".into())), AppError::Refunded(m) if m == "r"));
     }
 
     #[test]
