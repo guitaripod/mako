@@ -60,7 +60,7 @@ WALLET_LINKING = "on"
 # transaction for a Midgar ID that is already linked, credited once under tx:<transactionId> (the key the RevenueCat
 # webhook and the validate call share). Anything else hides the route (404). Needs the WALLET_INTERNAL_SECRET secret,
 # the same value on midgar-ledger, and WALLET_LINKING = "on"; the ledger forwards only when its own LEDGER_GRANTS is on.
-LEDGER_GRANTS = "off"
+LEDGER_GRANTS = "on"
 
 # Rate-limit enforcement switch. "false" = shadow (log would-be-limits, never
 # block); "true" = enforce. Kept off until shadow logs confirm no legit traffic
