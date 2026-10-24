@@ -1,6 +1,7 @@
 use worker::{Request, Response, RouteContext, Result, Env, Fetch, Method, Headers};
 use crate::error::AppError;
 use crate::auth;
+use crate::wallet::pack_refund;
 use crate::credits::{
     get_user_transactions, get_credit_packs, get_credit_packs_for_app,
     record_purchase, record_and_complete_purchase, estimate_image_cost
@@ -1678,7 +1679,9 @@ async fn credit_pack_to_wallet(
 /// transaction that never credited anything, is left alone, so subscriptions
 /// are never touched. The claim row in `purchase_refunds` is what makes a
 /// repeated delivery a no-op; it is released again if the reversal fails so
-/// RevenueCat's retry can finish the job.
+/// RevenueCat's retry can finish the job. The claim, the reversal key and the
+/// purchase lookup are shared with the ledger's refund route
+/// (`wallet::ledger_refund`), so a refund that reaches both is reversed once.
 async fn reverse_pack_refund(
     env: &Env,
     db: &worker::D1Database,
@@ -1693,72 +1696,32 @@ async fn reverse_pack_refund(
         return Ok(());
     }
 
-    let purchase = db
-        .prepare(
-            "SELECT id, user_id, credits FROM credit_purchases
-             WHERE app_id = ?1 AND payment_provider = 'revenuecat' AND payment_id = ?2 AND status IN ('completed', 'refunded')",
-        )
-        .bind(&[app_id.into(), event.transaction_id.clone().into()])?
-        .first::<serde_json::Value>(None)
-        .await?;
-    let Some(purchase) = purchase else {
+    let Some(purchase) = pack_refund::credited_purchase(db, app_id, &event.transaction_id).await? else {
         worker::console_log!("Refund for transaction {} has no credited purchase; nothing to reverse", event.transaction_id);
         return Ok(());
     };
-    let purchase_id = purchase.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let user_id = purchase.get("user_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let credits = purchase.get("credits").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32;
 
-    let claimed = db
-        .prepare(
-            "INSERT OR IGNORE INTO purchase_refunds (app_id, transaction_id, user_id, credits, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(&[
-            app_id.into(),
-            event.transaction_id.clone().into(),
-            user_id.clone().into(),
-            credits.into(),
-            chrono::Utc::now().to_rfc3339().into(),
-        ])?
-        .run()
-        .await?;
-    let newly_claimed = claimed.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0;
-    if !newly_claimed {
+    if !pack_refund::claim(db, app_id, &event.transaction_id, &purchase.user_id, purchase.credits).await? {
         worker::console_log!("Refund for transaction {} already reversed", event.transaction_id);
         return Ok(());
     }
 
     let reference = crate::purchases::refund_reference(&event.transaction_id);
-    let description = format!("App Store refund reversed: {} pack", pack_id);
+    let description = pack_refund::description(pack_id);
     let ledgers = crate::ledgers::Ledgers::new(env, db);
-    let reversal = crate::wallet::ops::Reversal {
-        key: format!("reverse:{}", event.transaction_id),
-        kind: crate::wallet::Kind::Reversal,
-        source: "revenuecat",
-        amount: credits,
-        description: &description,
-        reference: Some(&reference),
-    };
-    let reversed = match ledgers.account_for_user(app_id, &user_id).await {
+    let reversal = pack_refund::reversal(&event.transaction_id, "revenuecat", purchase.credits, &description, &reference);
+    let reversed = match ledgers.account_for_user(app_id, &purchase.user_id).await {
         Ok(account) => ledgers.reverse(&account, &reversal, "admin_adjustment").await,
         Err(e) => Err(e),
     };
     match reversed {
         Ok((_, taken)) => {
-            db.prepare("UPDATE credit_purchases SET status = 'refunded' WHERE id = ?1")
-                .bind(&[purchase_id.into()])?
-                .run()
-                .await?;
-            worker::console_log!("Reversed {} of {} credits for refunded transaction {}", taken, credits, event.transaction_id);
+            pack_refund::mark_refunded(db, &purchase.id).await?;
+            worker::console_log!("Reversed {} of {} credits for refunded transaction {}", taken, purchase.credits, event.transaction_id);
             Ok(())
         }
         Err(e) => {
-            let _ = db
-                .prepare("DELETE FROM purchase_refunds WHERE app_id = ?1 AND transaction_id = ?2")
-                .bind(&[app_id.into(), event.transaction_id.clone().into()])?
-                .run()
-                .await;
+            let _ = pack_refund::release(db, app_id, &event.transaction_id).await;
             Err(e)
         }
     }

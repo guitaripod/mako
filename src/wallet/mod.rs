@@ -4,11 +4,13 @@ pub mod client;
 pub mod d1;
 mod ledger;
 pub mod ledger_grant;
+pub mod ledger_refund;
 pub mod lifecycle;
 pub mod link;
 pub mod links;
 pub mod log;
 pub mod ops;
+pub mod pack_refund;
 pub mod purchase;
 pub mod resolve;
 mod object;
@@ -24,6 +26,8 @@ mod memory;
 pub mod testing;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod ledger_grant_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod ledger_refund_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lifecycle_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]

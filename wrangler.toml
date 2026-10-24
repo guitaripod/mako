@@ -60,6 +60,8 @@ WALLET_LINKING = "on"
 # transaction for a Midgar ID that is already linked, credited once under tx:<transactionId> (the key the RevenueCat
 # webhook and the validate call share). Anything else hides the route (404). Needs the WALLET_INTERNAL_SECRET secret,
 # the same value on midgar-ledger, and WALLET_LINKING = "on"; the ledger forwards only when its own LEDGER_GRANTS is on.
+# The same flag opens POST /internal/wallet/refund, where the ledger forwards an App Store refund of such a transaction;
+# it takes the pack's credits back once, under the claim the RevenueCat refund path shares.
 LEDGER_GRANTS = "on"
 
 # Rate-limit enforcement switch. "false" = shadow (log would-be-limits, never

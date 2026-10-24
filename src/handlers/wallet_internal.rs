@@ -7,6 +7,7 @@ use crate::internal;
 use crate::storekit::LedgerTransaction;
 use crate::wallet::client::DoWallets;
 use crate::wallet::ledger_grant::{self, Outcome};
+use crate::wallet::ledger_refund::{self, Outcome as RefundOutcome, Reason as RefundReason};
 use crate::wallet::lifecycle::{self, Erasure, Merged};
 use crate::wallet::target::is_midgar_id;
 use crate::wallet::{link, log, resolve};
@@ -58,6 +59,46 @@ async fn grant_inner(req: &mut Request, env: &Env) -> std::result::Result<Value,
     }
     log::info(&format!("ledger_grant tx={} {}", transaction.transaction_id, answer(&outcome)["status"]));
     Ok(answer(&outcome))
+}
+
+/// The answer to a forwarded refund, as the ledger reads it: every 2xx means the transaction needs no retry.
+fn refund_answer(outcome: &RefundOutcome) -> Value {
+    match outcome {
+        RefundOutcome::Reversed { purchase_id, credits, taken } => {
+            json!({ "ok": true, "status": "reversed", "purchase_id": purchase_id, "credits": credits, "taken": taken })
+        }
+        RefundOutcome::Duplicate { purchase_id } => json!({ "ok": true, "status": "duplicate", "purchase_id": purchase_id }),
+        RefundOutcome::Refused(reason) => json!({ "ok": true, "status": "refused", "reason": reason.as_str() }),
+    }
+}
+
+/// `POST /internal/wallet/refund`: the ledger forwards a verified consumable transaction that Apple refunded. Needs
+/// `WALLET_INTERNAL_SECRET` in `X-Midgar-Internal` and `LEDGER_GRANTS = "on"`; either missing is 404. Takes the pack's
+/// credits back from the buyer's wallet, down to a zero balance, once per store transaction and under the claim the
+/// RevenueCat webhook shares. With `WALLET_LINKING` off nothing is reversed, because no wallet exists. A wallet that
+/// cannot answer is a 503 the ledger retries.
+pub async fn refund(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    match refund_inner(&mut req, &ctx.env).await {
+        Ok(body) => Response::from_json(&body),
+        Err(error) => error.to_response(),
+    }
+}
+
+async fn refund_inner(req: &mut Request, env: &Env) -> std::result::Result<Value, AppError> {
+    internal::require(req, env, internal::GRANT_SECRET)?;
+    if !ledger_grants_on(env) {
+        return Err(AppError::NotFound("No such route.".to_string()));
+    }
+    let transaction: LedgerTransaction =
+        req.json().await.map_err(|_| AppError::BadRequest("The body is not a verified transaction.".to_string()))?;
+    if !link::enabled(env) {
+        return Ok(refund_answer(&RefundOutcome::Refused(RefundReason::LinkingOff)));
+    }
+    let db = env.d1("DB")?;
+    let wallets = DoWallets(env.durable_object("WALLET").map_err(|_| AppError::WalletUnavailable)?);
+    let outcome = ledger_refund::reverse(&db, &wallets, &transaction).await?;
+    log::info(&format!("ledger_refund tx={} {}", transaction.transaction_id, refund_answer(&outcome)["status"]));
+    Ok(refund_answer(&outcome))
 }
 
 /// The body of `POST /internal/wallet/erase_all`.
@@ -133,4 +174,19 @@ async fn merge_inner(req: &mut Request, env: &Env) -> std::result::Result<Value,
         Merged::Discarded => json!({ "ok": true, "status": "discarded" }),
         Merged::Same => json!({ "ok": true, "status": "same" }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_refund_answer_is_a_2xx_body_with_a_stable_status() {
+        let reversed = refund_answer(&RefundOutcome::Reversed { purchase_id: "p1".into(), credits: 5, taken: 2 });
+        assert_eq!(reversed, json!({ "ok": true, "status": "reversed", "purchase_id": "p1", "credits": 5, "taken": 2 }));
+        let duplicate = refund_answer(&RefundOutcome::Duplicate { purchase_id: "p1".into() });
+        assert_eq!(duplicate, json!({ "ok": true, "status": "duplicate", "purchase_id": "p1" }));
+        let refused = refund_answer(&RefundOutcome::Refused(RefundReason::NotConsumable));
+        assert_eq!(refused, json!({ "ok": true, "status": "refused", "reason": "not_consumable" }));
+    }
 }

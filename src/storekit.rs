@@ -17,7 +17,7 @@ const INTERNAL_HEADER: &str = "X-Midgar-Internal";
 const VERIFY_URL: &str = "https://ledger.internal/internal/verify-transaction";
 
 /// The App Store's name for a consumable in a verified transaction.
-const CONSUMABLE: &str = "Consumable";
+pub const CONSUMABLE: &str = "Consumable";
 
 /// The ownership of a transaction the buyer made themselves, not one shared through Family Sharing.
 const PURCHASED: &str = "PURCHASED";
@@ -146,14 +146,20 @@ impl Refusal {
     }
 }
 
+/// True when the transaction's bundle id belongs to the tenant: the registry app the ledger found for it is the tenant's
+/// slug, or its bundle id is the tenant's own `apple_app_bundle_id`.
+pub fn made_in_tenant(transaction: &LedgerTransaction, tenant_slug: &str, tenant_bundle: Option<&str>) -> bool {
+    let registry_match = transaction.registry_slug.as_deref() == Some(tenant_slug);
+    let bundle_match = tenant_bundle.is_some_and(|bundle| bundle == transaction.bundle_id);
+    registry_match || bundle_match
+}
+
 /// Decides whether a verified transaction may be credited: its bundle id belongs to the tenant (the registry app
 /// the ledger found for it, or the tenant's own `apple_app_bundle_id`), its `appAccountToken` is the caller's
 /// Midgar ID, it is the product the request names, a consumable, not revoked, bought by the Apple account itself,
 /// for one pack, and not a sandbox purchase where the tenant refuses them in production.
 pub fn check(transaction: &LedgerTransaction, expected: &Expected<'_>) -> Result<(), Refusal> {
-    let registry_match = transaction.registry_slug.as_deref() == Some(expected.tenant_slug);
-    let bundle_match = expected.tenant_bundle.is_some_and(|bundle| bundle == transaction.bundle_id);
-    if !registry_match && !bundle_match {
+    if !made_in_tenant(transaction, expected.tenant_slug, expected.tenant_bundle) {
         return Err(Refusal::WrongApp);
     }
     match transaction.app_account_token.as_deref() {
