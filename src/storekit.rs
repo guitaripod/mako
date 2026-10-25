@@ -122,9 +122,15 @@ impl TransactionVerifier for LedgerService {
 }
 
 impl LedgerService {
-    /// The Midgar ID's active entitlements in `environment` (`Production` or `Sandbox`). Anything but a 200 with a
+    /// The Midgar ID's active entitlements in `environment` (`Production` or `Sandbox`), also counting purchases whose
+    /// `appAccountToken` is one of `also_tokens` (ids mako vouches are the same caller's). Anything but a 200 with a
     /// readable list is the ledger being unavailable, never an empty answer.
-    pub async fn entitlements(&self, midgar_id: &str, environment: &str) -> Result<Vec<LedgerEntitlement>, VerifyFailure> {
+    pub async fn entitlements(
+        &self,
+        midgar_id: &str,
+        environment: &str,
+        also_tokens: &[String],
+    ) -> Result<Vec<LedgerEntitlement>, VerifyFailure> {
         let unavailable = |e: worker::Error| VerifyFailure::Unavailable(format!("the ledger could not be reached: {e}"));
         let headers = Headers::new();
         headers.set(INTERNAL_HEADER, &self.secret).map_err(unavailable)?;
@@ -132,7 +138,11 @@ impl LedgerService {
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
-            .with_body(Some(serde_json::json!({ "midgarId": midgar_id, "environment": environment }).to_string().into()));
+            .with_body(Some(
+                serde_json::json!({ "midgarId": midgar_id, "environment": environment, "appAccountTokens": also_tokens })
+                    .to_string()
+                    .into(),
+            ));
         let mut response = self.fetcher.fetch(ENTITLEMENTS_URL, Some(init)).await.map_err(unavailable)?;
         let status = response.status_code();
         let body = response.json::<Value>().await.unwrap_or(Value::Null);

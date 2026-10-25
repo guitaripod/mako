@@ -1177,7 +1177,7 @@ pub async fn is_premium_user(env: &Env, db: &worker::D1Database, auth: &auth::Au
     };
     let strict = crate::tenant::TenantPolicy::from_row(&row).strict_purchases;
     if let Some(midgar_id) = premium_midgar_id(auth) {
-        if ledger_grants_premium(env, app_id, midgar_id, &required, strict).await {
+        if ledger_grants_premium(env, app_id, midgar_id, &premium_tokens(user_id, midgar_id), &required, strict).await {
             return true;
         }
     }
@@ -1209,20 +1209,31 @@ fn premium_midgar_id(auth: &auth::AuthedUser) -> Option<&str> {
 /// Whether the purchase ledger lists the tenant's premium entitlement for this Midgar ID. Apps on MidgarStore buy
 /// without RevenueCat, so RevenueCat never learns of their subscriptions; the ledger has every App Store transaction.
 /// A ledger that cannot answer grants nothing here, and RevenueCat is asked as before.
-async fn ledger_grants_premium(env: &Env, app_id: &str, midgar_id: &str, required: &str, strict: bool) -> bool {
+async fn ledger_grants_premium(env: &Env, app_id: &str, midgar_id: &str, also_tokens: &[String], required: &str, strict: bool) -> bool {
     let Ok(ledger) = crate::storekit::LedgerService::open(env) else {
         return false;
     };
     let slug = crate::tenant::registry_slug(app_id);
     let production = crate::purchases::is_production(env.var("ENVIRONMENT").ok().map(|v| v.to_string()).as_deref());
     for environment in premium_environments(strict, production) {
-        match ledger.entitlements(midgar_id, environment).await {
+        match ledger.entitlements(midgar_id, environment, also_tokens).await {
             Ok(held) if crate::storekit::grants_entitlement(&held, &slug, required) => return true,
             Ok(_) => {}
             Err(failure) => worker::console_log!("premium: the ledger could not list entitlements for {}: {:?}", app_id, failure),
         }
     }
     false
+}
+
+/// The caller's other ids whose purchases are theirs too: the mako user id, which RevenueCat wrote into the
+/// `appAccountToken` of every purchase an app made through it before the app moved to MidgarStore. RevenueCat stops
+/// hearing of those subscriptions once the app drops its SDK, so the ledger, which gets every renewal from Apple, has to
+/// count them. Only a UUID can be a token.
+fn premium_tokens(user_id: &str, midgar_id: &str) -> Vec<String> {
+    if user_id.eq_ignore_ascii_case(midgar_id) || uuid::Uuid::parse_str(user_id).is_err() {
+        return Vec::new();
+    }
+    vec![user_id.to_lowercase()]
 }
 
 /// The ledger environments whose entitlements count: Sandbox is left out exactly where the RevenueCat webhook
@@ -1818,6 +1829,14 @@ async fn reverse_pack_refund(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_premium_check_also_counts_purchases_revenuecat_tagged_with_the_mako_user_id() {
+        let user = "6ED586B2-0000-4000-8000-000000000001";
+        assert_eq!(premium_tokens(user, "4c49d445-0000-4000-8000-000000000002"), vec![user.to_lowercase()]);
+        assert!(premium_tokens(user, &user.to_lowercase()).is_empty());
+        assert!(premium_tokens("u-1", "4c49d445-0000-4000-8000-000000000002").is_empty());
+    }
 
     #[test]
     fn sandbox_subscriptions_count_for_premium_wherever_sandbox_purchases_do() {
