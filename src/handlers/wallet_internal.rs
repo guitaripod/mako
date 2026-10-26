@@ -52,8 +52,7 @@ async fn grant_inner(req: &mut Request, env: &Env) -> std::result::Result<Value,
     }
     let db = env.d1("DB")?;
     let wallets = DoWallets(env.durable_object("WALLET").map_err(|_| AppError::WalletUnavailable)?);
-    let production = crate::purchases::is_production(env.var("ENVIRONMENT").ok().map(|v| v.to_string()).as_deref());
-    let outcome = ledger_grant::credit(&db, &wallets, production, &transaction).await?;
+    let outcome = ledger_grant::credit(&db, &wallets, &transaction).await?;
     if let Outcome::Credited { app_id, user_id, purchase_id, pack_id, amount_usd_cents, .. } = &outcome {
         crate::credits::tag_purchase_attribution(&db, app_id, user_id, purchase_id, pack_id, *amount_usd_cents).await;
     }

@@ -62,17 +62,13 @@ async fn credit_signed(
         return AppError::Unauthorized("A Midgar ID session is required to credit a signed purchase.".to_string()).to_response();
     };
     let app_id = auth.app_id.as_str();
-    let policy = crate::tenant::TenantPolicy::load(db, app_id).await?;
     let slug = crate::tenant::registry_slug(app_id);
     let bundle = tenant_bundle(db, app_id).await?;
-    let production = crate::purchases::is_production(env.var("ENVIRONMENT").ok().map(|v| v.to_string()).as_deref());
     let expected = Expected {
         product_id: &request.product_id,
         midgar_id: &caller.midgar_id,
         tenant_slug: &slug,
         tenant_bundle: bundle.as_deref(),
-        strict: policy.strict_purchases,
-        production,
     };
     let verifier = match LedgerService::open(env) {
         Ok(verifier) => verifier,

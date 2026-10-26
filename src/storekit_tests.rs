@@ -33,7 +33,7 @@ fn transaction() -> LedgerTransaction {
 }
 
 fn expected() -> Expected<'static> {
-    Expected { product_id: PRODUCT, midgar_id: MIDGAR, tenant_slug: "dream-eater", tenant_bundle: Some(BUNDLE), strict: true, production: true }
+    Expected { product_id: PRODUCT, midgar_id: MIDGAR, tenant_slug: "dream-eater", tenant_bundle: Some(BUNDLE) }
 }
 
 fn refused(transaction: &LedgerTransaction) -> Option<Refusal> {
@@ -112,11 +112,9 @@ fn only_one_pack_per_transaction_is_credited() {
 }
 
 #[test]
-fn the_sandbox_rule_is_the_webhooks_rule() {
+fn a_sandbox_purchase_is_credited_like_a_production_one() {
     let sandbox = LedgerTransaction { environment: "Sandbox".to_string(), ..transaction() };
-    assert_eq!(refused(&sandbox), Some(Refusal::Sandbox));
-    assert_eq!(check(&sandbox, &Expected { production: false, ..expected() }), Ok(()));
-    assert_eq!(check(&sandbox, &Expected { strict: false, ..expected() }), Ok(()));
+    assert_eq!(refused(&sandbox), None);
     assert_eq!(refused(&transaction()), None);
 }
 
@@ -125,7 +123,7 @@ fn refusals_map_to_codes_a_client_can_tell_apart() {
     let status = |r: Refusal| r.into_error().parts();
     assert_eq!((status(Refusal::NotYours).status, status(Refusal::NotYours).code), (403, "forbidden"));
     assert_eq!((status(Refusal::WrongApp).status, status(Refusal::WrongApp).code), (403, "forbidden"));
-    for refusal in [Refusal::WrongProduct, Refusal::NotConsumable, Refusal::Revoked, Refusal::NotPurchased, Refusal::Quantity, Refusal::Sandbox] {
+    for refusal in [Refusal::WrongProduct, Refusal::NotConsumable, Refusal::Revoked, Refusal::NotPurchased, Refusal::Quantity] {
         assert_eq!((status(refusal).status, status(refusal).code), (400, "bad_request"));
     }
 }

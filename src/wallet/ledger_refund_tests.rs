@@ -57,7 +57,7 @@ impl World {
 
     fn bought(&self, id: &str) {
         let paid = LedgerTransaction { transaction_id: id.to_string(), original_transaction_id: id.to_string(), ..transaction() };
-        let outcome = block_on(ledger_grant::credit(&self.d1, &self.wallets, true, &paid)).unwrap();
+        let outcome = block_on(ledger_grant::credit(&self.d1, &self.wallets, &paid)).unwrap();
         assert!(matches!(outcome, ledger_grant::Outcome::Credited { .. }), "{outcome:?}");
     }
 
@@ -240,14 +240,14 @@ fn a_refund_of_a_transaction_nothing_has_credited_is_recorded_and_reverses_nothi
 fn a_refund_first_means_the_grant_that_follows_credits_nothing() {
     let world = World::linked();
     assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded);
-    let outcome = block_on(ledger_grant::credit(&world.d1, &world.wallets, true, &transaction())).unwrap();
+    let outcome = block_on(ledger_grant::credit(&world.d1, &world.wallets, &transaction())).unwrap();
     assert_eq!(outcome, ledger_grant::Outcome::Refused(GrantReason::Refunded));
     assert_eq!(world.balance(), 0);
     assert_eq!(world.status(TX), None);
     assert_eq!(world.wallets.count("POST /grant"), 0);
     assert_eq!(GrantReason::Refunded.as_str(), "refunded");
     let other = LedgerTransaction { transaction_id: SECOND_TX.to_string(), original_transaction_id: SECOND_TX.to_string(), ..transaction() };
-    assert!(matches!(block_on(ledger_grant::credit(&world.d1, &world.wallets, true, &other)).unwrap(), ledger_grant::Outcome::Credited { .. }));
+    assert!(matches!(block_on(ledger_grant::credit(&world.d1, &world.wallets, &other)).unwrap(), ledger_grant::Outcome::Credited { .. }));
 }
 
 #[test]

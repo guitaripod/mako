@@ -19,16 +19,6 @@ pub fn webhook_authorized(header: Option<&str>, expected: &str) -> bool {
     constant_time_eq(header.unwrap_or("").as_bytes(), wanted.as_bytes())
 }
 
-/// Sandbox events never credit a production wallet. Only tenants on strict
-/// purchases skip them, so every other tenant keeps today's behaviour.
-pub fn should_ignore_event(strict: bool, worker_is_production: bool, event_environment: &str) -> bool {
-    strict && worker_is_production && event_environment.eq_ignore_ascii_case("SANDBOX")
-}
-
-pub fn is_production(environment: Option<&str>) -> bool {
-    environment.map(|e| e == "production").unwrap_or(true)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventAction {
     CreditPack,
@@ -120,22 +110,6 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"a"));
-    }
-
-    #[test]
-    fn sandbox_events_are_ignored_in_production_for_strict_tenants_only() {
-        assert!(should_ignore_event(true, true, "SANDBOX"));
-        assert!(should_ignore_event(true, true, "sandbox"));
-        assert!(!should_ignore_event(true, true, "PRODUCTION"));
-        assert!(!should_ignore_event(true, false, "SANDBOX"));
-        assert!(!should_ignore_event(false, true, "SANDBOX"));
-    }
-
-    #[test]
-    fn a_missing_environment_counts_as_production() {
-        assert!(is_production(Some("production")));
-        assert!(is_production(None));
-        assert!(!is_production(Some("development")));
     }
 
     #[test]

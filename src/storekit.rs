@@ -3,8 +3,6 @@ use serde_json::Value;
 use worker::{Env, Fetcher, Headers, Method, RequestInit};
 
 use crate::error::AppError;
-use crate::purchases::should_ignore_event;
-use crate::tenant::TenantPolicy;
 use crate::wallet::d1::{text, D1Exec};
 
 /// The secret that authorises the ledger's verify route, sent in `X-Midgar-Internal`.
@@ -168,8 +166,6 @@ pub struct Expected<'a> {
     pub midgar_id: &'a str,
     pub tenant_slug: &'a str,
     pub tenant_bundle: Option<&'a str>,
-    pub strict: bool,
-    pub production: bool,
 }
 
 /// Why a verified transaction is not credited.
@@ -182,7 +178,6 @@ pub enum Refusal {
     Revoked,
     NotPurchased,
     Quantity,
-    Sandbox,
 }
 
 impl Refusal {
@@ -197,7 +192,6 @@ impl Refusal {
             Refusal::Revoked => AppError::BadRequest("The transaction was refunded or revoked.".to_string()),
             Refusal::NotPurchased => AppError::BadRequest("The transaction was not purchased by this Apple account.".to_string()),
             Refusal::Quantity => AppError::BadRequest("Only a purchase of one pack is credited.".to_string()),
-            Refusal::Sandbox => AppError::BadRequest("Sandbox purchases are not credited here.".to_string()),
         }
     }
 }
@@ -213,7 +207,7 @@ pub fn made_in_tenant(transaction: &LedgerTransaction, tenant_slug: &str, tenant
 /// Decides whether a verified transaction may be credited: its bundle id belongs to the tenant (the registry app
 /// the ledger found for it, or the tenant's own `apple_app_bundle_id`), its `appAccountToken` is the caller's
 /// Midgar ID, it is the product the request names, a consumable, not revoked, bought by the Apple account itself,
-/// for one pack, and not a sandbox purchase where the tenant refuses them in production.
+/// for one pack. Sandbox purchases count like any other, so App Review and TestFlight buyers are credited.
 pub fn check(transaction: &LedgerTransaction, expected: &Expected<'_>) -> Result<(), Refusal> {
     if !made_in_tenant(transaction, expected.tenant_slug, expected.tenant_bundle) {
         return Err(Refusal::WrongApp);
@@ -236,9 +230,6 @@ pub fn check(transaction: &LedgerTransaction, expected: &Expected<'_>) -> Result
     }
     if transaction.quantity != 1 {
         return Err(Refusal::Quantity);
-    }
-    if should_ignore_event(expected.strict, expected.production, &transaction.environment) {
-        return Err(Refusal::Sandbox);
     }
     Ok(())
 }
@@ -293,12 +284,11 @@ pub async fn pack_of_product(db: &impl D1Exec, app_id: &str, product_id: &str) -
 }
 
 /// What the credit decision reads from a tenant's `apps` row: the registry slug and App Store bundle id its
-/// transactions are matched against, and whether it runs strict purchases.
+/// transactions are matched against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantFacts {
     pub slug: String,
     pub bundle: Option<String>,
-    pub strict: bool,
 }
 
 /// The facts of a configured tenant, `None` for an `app_id` that is no `apps` row. A tenant without a registry slug
@@ -308,7 +298,6 @@ pub async fn tenant_facts(db: &impl D1Exec, app_id: &str) -> Result<Option<Tenan
     Ok(rows.first().map(|row| TenantFacts {
         slug: text(row, "registry_slug").filter(|slug| !slug.is_empty()).unwrap_or(app_id).to_string(),
         bundle: text(row, "apple_app_bundle_id").filter(|bundle| !bundle.is_empty()).map(str::to_string),
-        strict: TenantPolicy::from_row(row).strict_purchases,
     }))
 }
 

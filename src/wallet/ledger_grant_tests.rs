@@ -55,7 +55,7 @@ impl World {
     }
 
     fn credit(&self, transaction: &LedgerTransaction) -> Result<Outcome, AppError> {
-        block_on(credit(&self.d1, &self.wallets, true, transaction))
+        block_on(credit(&self.d1, &self.wallets, transaction))
     }
 
     fn entries(&self, key: &str) -> usize {
@@ -241,7 +241,6 @@ fn the_validate_calls_rules_apply_to_the_forwarded_transaction() {
         (LedgerTransaction { revocation_date: Some(1_760_000_100_000), ..transaction() }, Refusal::Revoked),
         (LedgerTransaction { in_app_ownership_type: Some("FAMILY_SHARED".to_string()), ..transaction() }, Refusal::NotPurchased),
         (LedgerTransaction { quantity: 2, ..transaction() }, Refusal::Quantity),
-        (LedgerTransaction { environment: "Sandbox".to_string(), ..transaction() }, Refusal::Sandbox),
     ];
     for (refused, why) in cases {
         assert_eq!(world.credit(&refused).unwrap(), Outcome::Refused(Reason::Transaction(why)), "{why:?}");
@@ -251,13 +250,10 @@ fn the_validate_calls_rules_apply_to_the_forwarded_transaction() {
 }
 
 #[test]
-fn a_sandbox_purchase_credits_a_tenant_that_is_not_strict_and_off_production() {
+fn a_sandbox_purchase_credits_a_strict_tenant_on_production() {
     let world = World::linked();
     let sandbox = LedgerTransaction { environment: "Sandbox".to_string(), ..transaction() };
-    assert!(matches!(block_on(credit(&world.d1, &world.wallets, false, &sandbox)).unwrap(), Outcome::Credited { .. }));
-    let lax = World::linked();
-    lax.d1.run("UPDATE apps SET strict_purchases = 0 WHERE app_id = ?1", &[APP.into()]);
-    assert!(matches!(lax.credit(&sandbox).unwrap(), Outcome::Credited { .. }));
+    assert!(matches!(world.credit(&sandbox).unwrap(), Outcome::Credited { .. }));
 }
 
 #[test]
@@ -279,7 +275,7 @@ fn a_crash_after_any_write_loses_and_doubles_nothing() {
         let world = World::linked();
         let budget = Budget::of(ticks);
         let (d1, wallets) = (Flaky { inner: &world.d1, budget: &budget }, Flaky { inner: &world.wallets, budget: &budget });
-        match block_on(credit(&d1, &wallets, true, &transaction())) {
+        match block_on(credit(&d1, &wallets, &transaction())) {
             Ok(_) => finished = true,
             Err(_) => crashes += 1,
         }
@@ -304,7 +300,7 @@ fn an_answer_lost_after_the_wallet_granted_is_finished_by_the_retry_without_a_se
     let world = World::linked();
     let budget = Budget::of(4);
     let (d1, wallets) = (Flaky { inner: &world.d1, budget: &budget }, Flaky { inner: &world.wallets, budget: &budget });
-    let first = block_on(credit(&d1, &wallets, true, &transaction()));
+    let first = block_on(credit(&d1, &wallets, &transaction()));
     assert!(first.is_err());
     budget.lift();
     world.credit(&transaction()).unwrap();

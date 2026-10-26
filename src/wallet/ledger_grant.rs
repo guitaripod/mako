@@ -40,7 +40,6 @@ impl Reason {
             Reason::Transaction(Refusal::Revoked) => "revoked",
             Reason::Transaction(Refusal::NotPurchased) => "not_purchased",
             Reason::Transaction(Refusal::Quantity) => "quantity",
-            Reason::Transaction(Refusal::Sandbox) => "sandbox",
         }
     }
 }
@@ -61,7 +60,7 @@ pub enum Outcome {
 /// `tx:<transactionId>` and the purchase row is the RevenueCat one, which the RevenueCat webhook and the client's
 /// validate call share, so no two paths credit one purchase twice. The tenant comes from the product id, and the
 /// transaction is held to the rules of the validate call (bundle, product, consumable, not revoked, purchased, quantity
-/// one, the sandbox rule). A Midgar ID no user is linked to is refused: identity may not know it, and the client's
+/// one). A Midgar ID no user is linked to is refused: identity may not know it, and the client's
 /// validate call credits it. A purchase row left `pending` by a crash is finished, and one that belongs to another
 /// user who is not linked is left to its own path. A
 /// transaction whose refund was claimed (it arrived first, or the pack was already reversed) is refused for good, also
@@ -70,7 +69,6 @@ pub enum Outcome {
 pub async fn credit<D: D1Exec, W: WalletTransport>(
     db: &D,
     wallets: &W,
-    production: bool,
     transaction: &LedgerTransaction,
 ) -> Result<Outcome, AppError> {
     let token = match transaction.app_account_token.as_deref().map(str::to_lowercase) {
@@ -86,8 +84,6 @@ pub async fn credit<D: D1Exec, W: WalletTransport>(
         midgar_id: &token,
         tenant_slug: &facts.slug,
         tenant_bundle: facts.bundle.as_deref(),
-        strict: facts.strict,
-        production,
     };
     if let Err(refusal) = check(transaction, &expected) {
         return Ok(Outcome::Refused(Reason::Transaction(refusal)));

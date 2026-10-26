@@ -199,7 +199,7 @@ async fn credit(path: CreditPath, world: &World, budget: &Budget) -> Result<(), 
     let (d1, wallets) = (Stepped { inner: &flaky_d1 }, Stepped { inner: &flaky_wallets });
     match path {
         CreditPath::LedgerGrant => {
-            ledger_grant::credit(&d1, &wallets, true, &transaction(TX)).await?;
+            ledger_grant::credit(&d1, &wallets, &transaction(TX)).await?;
         }
         CreditPath::SignedValidate => {
             if pack_refund::refunded_error(&d1, APP, TX).await?.is_some() {
@@ -232,7 +232,7 @@ async fn credit(path: CreditPath, world: &World, budget: &Budget) -> Result<(), 
         }
         CreditPath::LocalLedgerGrant => {
             let naming_the_user = LedgerTransaction { app_account_token: Some("u1".to_string()), ..transaction(TX) };
-            ledger_grant::credit(&d1, &wallets, true, &naming_the_user).await?;
+            ledger_grant::credit(&d1, &wallets, &naming_the_user).await?;
         }
     }
     Ok(())

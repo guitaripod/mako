@@ -1177,7 +1177,7 @@ pub async fn is_premium_user(env: &Env, db: &worker::D1Database, auth: &auth::Au
     };
     let strict = crate::tenant::TenantPolicy::from_row(&row).strict_purchases;
     if let Some(midgar_id) = premium_midgar_id(auth) {
-        if ledger_grants_premium(env, app_id, midgar_id, &premium_tokens(user_id, midgar_id), &required, strict).await {
+        if ledger_grants_premium(env, app_id, midgar_id, &premium_tokens(user_id, midgar_id), &required).await {
             return true;
         }
     }
@@ -1209,13 +1209,12 @@ fn premium_midgar_id(auth: &auth::AuthedUser) -> Option<&str> {
 /// Whether the purchase ledger lists the tenant's premium entitlement for this Midgar ID. Apps on MidgarStore buy
 /// without RevenueCat, so RevenueCat never learns of their subscriptions; the ledger has every App Store transaction.
 /// A ledger that cannot answer grants nothing here, and RevenueCat is asked as before.
-async fn ledger_grants_premium(env: &Env, app_id: &str, midgar_id: &str, also_tokens: &[String], required: &str, strict: bool) -> bool {
+async fn ledger_grants_premium(env: &Env, app_id: &str, midgar_id: &str, also_tokens: &[String], required: &str) -> bool {
     let Ok(ledger) = crate::storekit::LedgerService::open(env) else {
         return false;
     };
     let slug = crate::tenant::registry_slug(app_id);
-    let production = crate::purchases::is_production(env.var("ENVIRONMENT").ok().map(|v| v.to_string()).as_deref());
-    for environment in premium_environments(strict, production) {
+    for environment in PREMIUM_ENVIRONMENTS {
         match ledger.entitlements(midgar_id, environment, also_tokens).await {
             Ok(held) if crate::storekit::grants_entitlement(&held, &slug, required) => return true,
             Ok(_) => {}
@@ -1236,15 +1235,9 @@ fn premium_tokens(user_id: &str, midgar_id: &str) -> Vec<String> {
     vec![user_id.to_lowercase()]
 }
 
-/// The ledger environments whose entitlements count: Sandbox is left out exactly where the RevenueCat webhook
-/// ignores sandbox events (a strict tenant on the production worker).
-fn premium_environments(strict: bool, production: bool) -> &'static [&'static str] {
-    if crate::purchases::should_ignore_event(strict, production, "Sandbox") {
-        &["Production"]
-    } else {
-        &["Production", "Sandbox"]
-    }
-}
+/// The ledger environments whose entitlements count. Sandbox subscriptions count too, so App Review and TestFlight
+/// buyers get what they paid for.
+const PREMIUM_ENVIRONMENTS: [&str; 2] = ["Production", "Sandbox"];
 
 fn revenuecat_api_key(env: &Env, app_id: &str) -> Option<String> {
     let key_name = format!("REVENUECAT_IOS_API_KEY_{}", app_id.to_uppercase());
@@ -1645,9 +1638,8 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
             .unwrap_or(false),
         None => false,
     };
-    let production = crate::purchases::is_production(env.var("ENVIRONMENT").ok().map(|v| v.to_string()).as_deref());
 
-    use crate::purchases::{classify_event, should_ignore_event, EventAction};
+    use crate::purchases::{classify_event, EventAction};
     match classify_event(&event.event_type, strict) {
         EventAction::CreditPack => {
             let Some((app_id, prefix)) = tenant else {
@@ -1655,10 +1647,6 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
                 tag_revenuecat_revenue(&db, event).await;
                 return Response::ok("OK");
             };
-            if should_ignore_event(strict, production, &event.environment) {
-                worker::console_log!("Ignoring sandbox event {} in production", event.id);
-                return Response::ok("OK");
-            }
             credit_pack_from_event(&env, &db, event, &app_id, &prefix).await?;
         },
         EventAction::TagRevenueOnly => {
@@ -1666,10 +1654,6 @@ pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Resu
         },
         EventAction::ReversePackRefund => {
             if let Some((app_id, prefix)) = tenant {
-                if should_ignore_event(strict, production, &event.environment) {
-                    worker::console_log!("Ignoring sandbox event {} in production", event.id);
-                    return Response::ok("OK");
-                }
                 reverse_pack_refund(&env, &db, event, &app_id, &prefix).await?;
             }
         },
@@ -1836,13 +1820,6 @@ mod tests {
         assert_eq!(premium_tokens(user, "4c49d445-0000-4000-8000-000000000002"), vec![user.to_lowercase()]);
         assert!(premium_tokens(user, &user.to_lowercase()).is_empty());
         assert!(premium_tokens("u-1", "4c49d445-0000-4000-8000-000000000002").is_empty());
-    }
-
-    #[test]
-    fn sandbox_subscriptions_count_for_premium_wherever_sandbox_purchases_do() {
-        assert_eq!(premium_environments(false, true), ["Production", "Sandbox"]);
-        assert_eq!(premium_environments(true, false), ["Production", "Sandbox"]);
-        assert_eq!(premium_environments(true, true), ["Production"]);
     }
 
     #[test]
