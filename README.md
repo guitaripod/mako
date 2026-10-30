@@ -1,52 +1,43 @@
 # mako
 
-**mako** is Midgar's shared, multi-tenant AI-credits backend, a Rust Cloudflare Worker that fronts LLM/image providers (OpenAI, Gemini, Anthropic Claude) behind a single credits ledger, per-app isolation, and RevenueCat entitlement handling. It serves every Midgar app (Helia, Pay Day, Psybeam, Dream Eater, Living Dex, the Pixie image apps, …) from one deployment.
+Midgar's shared AI backend: a Rust Cloudflare Worker that puts OpenAI, Gemini and Anthropic Claude behind one credits wallet per Midgar ID, with each app isolated as its own tenant. Pay Day, Psybeam, Double Kick, Psywave, Dream Eater, Living Dex and the Pixie apps all run on one deployment.
 
-> Deployed as the Cloudflare Worker `openai-image-proxy` at `mako.midgarcorp.cc`. The worker/D1/R2 retain the `openai-image-proxy` names (id-bound, invisible to clients); **mako** is the service identity.
+> The Worker, its D1 database and R2 bucket keep their original `openai-image-proxy` names (bound by id, invisible to clients). It is reached at `api.midgarcorp.cc/v1/intelligence` through the Midgar gateway, and at `mako.midgarcorp.cc`.
 
 ## What it does
 
-- **Multi-tenant** via the `X-App-ID` header; every app has its own credits, packs, capability costs, and premium entitlement in D1.
-- **Credits ledger** with a reserve/settle pattern and a scheduled sweep for orphaned reservations.
-- **RevenueCat** entitlement verification: premium users bypass credits (`credits_charged: 0`).
-- **Capabilities** exposed under `/v1/run/<capability>`:
-  - `chat.completion`: text + vision, routed by model id to Gemini / OpenAI / **Anthropic Claude**.
-  - `image` generation/editing (OpenAI, Gemini).
-  - `realtime.translate`: reserved-minute realtime sessions.
-- **Apple Ads attribution**: `POST /v1/attribution` exchanges an AdServices token with Apple server-side and records the campaign/ad group/keyword behind an install; purchases are tagged with it, and `GET /v1/attribution/keywords` reports installs, payers and revenue per keyword. No advertising identifier, no ATT prompt, and the token itself is never stored (only a SHA-256 fingerprint, for idempotency).
+- **Tenants** by the `X-App-ID` header: each app has its own credit packs, capability costs and premium entitlement in D1.
+- **Credits** reserve, then settle, with a scheduled sweep for orphaned reservations. Packs are App Store purchases whose signed transactions the app posts to the validate route; the wallet is credited once.
+- **Premium** users are not charged credits (`credits_charged: 0`). The purchase ledger is asked first, for the Midgar ID; RevenueCat second, only for subscriptions bought before an app moved to MidgarStore.
+- **Capabilities** under `/v1/run/<capability>`: `chat.completion` (text and vision, routed by model id), `image` generation and editing (OpenAI, Gemini) and `realtime.translate` (short-lived tokens for metered realtime sessions).
+- **Apple Ads attribution**: `POST /v1/attribution` exchanges an AdServices token with Apple and records the campaign, ad group and keyword behind an install; `GET /v1/attribution/keywords` reports installs, payers and revenue per keyword. No advertising identifier, no ATT prompt, and only a SHA-256 fingerprint of the token is stored.
 
 ## Providers
 
-Chat routing is by model-id prefix (`src/handlers/chat.rs`):
+Chat is routed by model id prefix (`src/handlers/chat.rs`):
 
 | Prefix | Provider | Secret |
 |---|---|---|
-| `claude*` / `anthropic*` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
-| `gpt*` / `o1` / `o3` / `o4` / `chatgpt*` | OpenAI | `OPENAI_API_KEY` |
+| `claude*`, `anthropic*` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
+| `gpt*`, `o1`, `o3`, `o4`, `chatgpt*` | OpenAI | `OPENAI_API_KEY` |
 | everything else | Gemini | `GEMINI_API_KEY` |
 
-## Onboarding a tenant
+## Adding a tenant
 
-Data-only, no deploy, add a `migrations/0XX_seed_<app>.sql` (see `migrations/014_seed_livingdex.sql`) with `apps` + optional `capability_costs` + `credit_packs` rows, then:
+Data only, no deploy: add `migrations/0XX_seed_<app>.sql` (`014_seed_livingdex.sql` is the model) with the `apps` row and any `capability_costs` and `credit_packs`, then:
 
 ```sh
 CLOUDFLARE_API_TOKEN=$(cat ~/.cloudflare-api-token) \
   npx wrangler d1 execute openai-image-proxy --remote --file migrations/0XX_seed_<app>.sql
 ```
 
-Set the tenant's RevenueCat secret if it has a premium tier: `wrangler secret put REVENUECAT_IOS_API_KEY_<APPID>`.
-
-## Removing `users.api_key` (migrations 027 to 029)
-
-Apply 027 and 028 first, then deploy the code release that no longer reads or writes `users.api_key`. **Migration 029 (`DROP COLUMN api_key`) is applied to production only after 028 and that release have soaked; it is irreversible, so export the database first.** Gate queries, the rehearsal script and the full order are in `docs/p3.07-wallet-design.md` section 7 and the mako runbook (`ops/runbooks/mako.md`).
-
-## Develop / deploy
+## Develop and deploy
 
 ```sh
 cargo check --target wasm32-unknown-unknown --all-targets   # type-check as CI does
-cargo test --lib                              # unit tests (host target)
-npx wrangler dev                              # local
-npx wrangler deploy                           # production (openai-image-proxy)
+cargo test --lib                                            # unit tests
+npx wrangler dev
+npx wrangler deploy
 ```
 
-See `docs/SETUP.md` for full setup and `openapi.yaml` for the API surface.
+`docs/SETUP.md` has the full setup and `openapi.yaml` the API.
