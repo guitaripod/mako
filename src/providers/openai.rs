@@ -18,12 +18,54 @@ fn openai_route(tail: &str) -> String {
     Routing::direct().route(&Provider::OpenAI, tail).url
 }
 
+/// The models mako sends to OpenAI's image endpoints. A legacy `gpt-image-1` request rides `gpt-image-2`, as it
+/// has since gpt-image-1 was retired here.
+pub const OPENAI_IMAGE_MODELS: [&str; 4] = ["gpt-image-1", "gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"];
+
 pub struct OpenAIProvider {
     api_key: String,
+    model: &'static str,
+    quality: Option<String>,
+}
+
+/// The model id OpenAI is asked for when a request names `model`.
+fn api_model(model: &str) -> &'static str {
+    match model {
+        "gpt-image-2.5-sunburst" => "gpt-image-2.5-sunburst",
+        "gpt-image-2.5-flare" => "gpt-image-2.5-flare",
+        _ => "gpt-image-2",
+    }
+}
+
+/// The quality sent: a chain link's own quality wins, then the request's when OpenAI accepts it, else `auto`.
+/// `xhigh` and `max` exist only on the 2.5 models.
+fn quality_for(model: &str, link: Option<&str>, requested: Option<&str>) -> String {
+    let accepted = |q: &str| match q {
+        "low" | "medium" | "high" | "auto" => true,
+        "xhigh" | "max" => model.starts_with("gpt-image-2.5"),
+        _ => false,
+    };
+    link.or(requested).filter(|q| accepted(q)).unwrap_or("auto").to_string()
+}
+
+/// OpenAI's sizes; anything else a client sends (Gemini-era values) becomes `auto`.
+fn size_for(requested: Option<&str>) -> &str {
+    match requested {
+        Some(size @ ("1024x1024" | "1536x1024" | "1024x1536" | "auto")) => size,
+        _ => "auto",
+    }
+}
+
+/// OpenAI's backgrounds; the old default `vivid` is not one of them and was rejected.
+fn background_for(requested: Option<&str>) -> &str {
+    match requested {
+        Some(background @ ("transparent" | "opaque" | "auto")) => background,
+        _ => "auto",
+    }
 }
 
 impl OpenAIProvider {
-    pub fn new(env: &Env) -> Result<Self> {
+    pub fn new(env: &Env, model: &str, quality: Option<String>) -> Result<Self> {
         let deployment_config = DeploymentConfig::from_env(env)
             .map_err(|e| worker::Error::from(AppError::InternalError(format!("Deployment config error: {:?}", e))))?;
 
@@ -38,7 +80,7 @@ impl OpenAIProvider {
             }
         };
 
-        Ok(Self { api_key })
+        Ok(Self { api_key, model: api_model(model), quality })
     }
 
     async fn call_openai_api(&self, url: &str, body: serde_json::Value, api_key: &str) -> Result<ImageResponse> {
@@ -83,12 +125,12 @@ impl ImageProvider for OpenAIProvider {
         let api_key = self.api_key.clone();
 
         let request_body = json!({
-            "model": "gpt-image-2",
+            "model": self.model,
             "prompt": request.prompt,
             "n": request.n.unwrap_or(1),
-            "size": request.size.clone().unwrap_or_else(|| "1024x1024".to_string()),
-            "quality": request.quality.clone().unwrap_or_else(|| "auto".to_string()),
-            "background": request.background.clone().unwrap_or_else(|| "vivid".to_string()),
+            "size": size_for(request.size.as_deref()),
+            "quality": quality_for(self.model, self.quality.as_deref(), request.quality.as_deref()),
+            "background": background_for(request.background.as_deref()),
             "output_format": request.output_format.clone().unwrap_or_else(|| "png".to_string()),
             "output_compression": request.output_compression,
             "moderation": request.moderation,
@@ -128,6 +170,7 @@ impl ImageProvider for OpenAIProvider {
             images,
             usage: response.usage,
             revised_prompts,
+            served_by: Some(self.model.to_string()),
         })
     }
 
@@ -138,17 +181,16 @@ impl ImageProvider for OpenAIProvider {
         let mut body_parts = Vec::new();
         
         for (i, image_data) in request.image.iter().enumerate() {
-            let image_base64 = image_data.trim_start_matches("data:image/png;base64,")
-                .trim_start_matches("data:image/jpeg;base64,")
-                .trim_start_matches("data:image/jpg;base64,");
+            let (mime_type, image_base64) = super::split_image_input(image_data)?;
             let image_bytes = BASE64.decode(image_base64)
                 .map_err(|e| AppError::BadRequest(format!("Invalid base64 image data: {}", e)))?;
             
             let field_name = if request.image.len() > 1 { "image[]" } else { "image" };
+            let extension = mime_type.trim_start_matches("image/");
             
             body_parts.push(format!(
-                "--{}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"image{}.png\"\r\nContent-Type: image/png\r\n\r\n",
-                boundary, field_name, i
+                "--{}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"image{}.{}\"\r\nContent-Type: {}\r\n\r\n",
+                boundary, field_name, i, extension, mime_type
             ).into_bytes());
             body_parts.push(image_bytes);
             body_parts.push(b"\r\n".to_vec());
@@ -170,14 +212,14 @@ impl ImageProvider for OpenAIProvider {
         }
         
         let n_str = request.n.unwrap_or(1).to_string();
+        let quality = quality_for(self.model, self.quality.as_deref(), request.quality.as_deref());
         let text_fields = vec![
             ("prompt", request.prompt.as_str()),
-            ("model", "gpt-image-2"),
+            ("model", self.model),
             ("n", n_str.as_str()),
-            ("size", request.size.as_deref().unwrap_or("1024x1024")),
-            ("quality", request.quality.as_deref().unwrap_or("auto")),
-            ("background", request.background.as_deref().unwrap_or("vivid")),
-            ("input_fidelity", request.input_fidelity.as_deref().unwrap_or("medium")),
+            ("size", size_for(request.size.as_deref())),
+            ("quality", quality.as_str()),
+            ("background", background_for(request.background.as_deref())),
             ("output_format", request.output_format.as_deref().unwrap_or("png")),
         ];
         
@@ -271,6 +313,7 @@ impl ImageProvider for OpenAIProvider {
             images,
             usage: openai_response.usage,
             revised_prompts,
+            served_by: Some(self.model.to_string()),
         })
     }
 

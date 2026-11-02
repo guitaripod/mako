@@ -7,6 +7,9 @@ use crate::error::AppError;
 pub mod openai;
 pub mod gemini;
 pub mod route;
+pub mod chain;
+
+pub(crate) use gemini::split_image_input;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedImageRequest {
@@ -45,6 +48,8 @@ pub struct ProviderResponse {
     pub images: Vec<ImageBytes>,
     pub usage: Option<ImageUsage>,
     pub revised_prompts: Vec<Option<String>>,
+    /// The model that made the images, when the provider knows it.
+    pub served_by: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,15 +91,36 @@ pub trait ImageProvider {
 }
 
 pub fn get_provider(model: &str, env: &worker::Env, policy: &crate::tenant::TenantPolicy) -> Result<Box<dyn ImageProvider>> {
+    provider_for(model, None, env, policy)
+}
+
+/// The provider for one model, with the quality a tier's chain link asks it for.
+pub fn provider_for(
+    model: &str,
+    quality: Option<String>,
+    env: &worker::Env,
+    policy: &crate::tenant::TenantPolicy,
+) -> Result<Box<dyn ImageProvider>> {
     if crate::mock::enabled(env) {
         return Ok(Box::new(crate::mock::MockImageProvider));
     }
     if let Some(gemini_model) = gemini::GeminiImageModel::from_model_id(model) {
         return Ok(Box::new(gemini::GeminiProvider::new(env, gemini_model, route::Routing::for_policy(env, policy)?)?));
     }
-    match model {
-        "gpt-image-1" | "gpt-image-2" => Ok(Box::new(openai::OpenAIProvider::new(env)?)),
-        _ => Err(AppError::BadRequest(format!("Unsupported model: {}", model)).into()),
+    if openai::OPENAI_IMAGE_MODELS.contains(&model) {
+        return Ok(Box::new(openai::OpenAIProvider::new(env, model, quality)?));
+    }
+    Err(AppError::BadRequest(format!("Unsupported model: {}", model)).into())
+}
+
+/// The provider name usage records carry for a model.
+pub fn provider_name(model: &str) -> &'static str {
+    if model.starts_with("gemini") || model == "nano-banana-pro" {
+        "gemini"
+    } else if model == "mock" {
+        "mock"
+    } else {
+        "openai"
     }
 }
 

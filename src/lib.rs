@@ -17,6 +17,7 @@ mod logger;
 mod providers;
 mod privacy;
 mod chat_alias;
+mod edits;
 mod purchases;
 mod storekit;
 mod art;

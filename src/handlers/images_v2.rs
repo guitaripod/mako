@@ -7,8 +7,10 @@ use crate::credits::get_flat_capability_cost;
 use crate::ledgers::{Account, Ledgers};
 use crate::tenant::TenantPolicy;
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
-use crate::providers::{self, UnifiedImageRequest, UnifiedEditRequest};
+use crate::providers::{self, ImageProvider, UnifiedImageRequest, UnifiedEditRequest};
+use crate::providers::chain::ChainProvider;
 use crate::providers::gemini::GEMINI_UNAVAILABLE;
+use crate::edits::{self, EditPricing, Funding, Tier};
 use crate::{log_debug, log_error};
 use serde_json::json;
 use uuid::Uuid;
@@ -59,11 +61,11 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         return Ok(Response::error("Another request is already in progress", 429)?);
     }
 
-    let provider = match providers::get_provider(&generation_req.model, &env, &policy) {
-        Ok(p) => p,
+    let (provider, priced) = match image_provider(&db, &env, &policy, &app_id, &generation_req.model).await {
+        Ok(resolved) => resolved,
         Err(e) => {
             let _ = release_lock(&app_id, &user_id, &db).await;
-            return Err(e);
+            return e.to_response();
         }
     };
 
@@ -85,10 +87,16 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
     if let Some(flat) = get_flat_capability_cost(&app_id, "image.generate", &db).await {
         cost_estimate.credits = flat;
     }
+    let funding = plan_funding(&env, &db, &auth, priced.as_ref(), generation_req.n).await;
+    if let Some(funding) = &funding {
+        cost_estimate.credits = funding.credits();
+    }
 
-    if let Err(e) = Ledgers::new(&env, &db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
-        let _ = release_lock(&app_id, &user_id, &db).await;
-        return credit_check_failure_response(e, &env, &db, &auth.account, "image.generate").await;
+    if cost_estimate.credits > 0 {
+        if let Err(e) = Ledgers::new(&env, &db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
+            let _ = release_lock(&app_id, &user_id, &db).await;
+            return credit_check_failure_response(e, &env, &db, &auth.account, "image.generate").await;
+        }
     }
 
     log_debug!("Sending request to provider", json!({
@@ -102,6 +110,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         Ok(resp) => resp,
         Err(e) => {
             let _ = release_lock(&app_id, &user_id, &db).await;
+            release_claim(&db, &auth, funding.as_ref()).await;
 
             let error_msg = e.to_string();
             record_failed_request(&db, FailedRequest {
@@ -125,6 +134,8 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
     let mut image_data_list = Vec::new();
     let mut r2_keys = Vec::new();
     let mut images_stored = 0;
+    let served_model = served_model(&provider_response, &generation_req.model);
+    let served_provider = providers::provider_name(&served_model);
     
     for (i, image_bytes) in provider_response.images.iter().enumerate() {
         let _base64_string = BASE64.encode(&image_bytes.data);
@@ -140,10 +151,10 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
             &user_id,
             &image_bytes.data,
             &generation_req.prompt,
-            &generation_req.model,
+            &served_model,
             &generation_req.size,
             Some(&generation_req.quality),
-            provider.get_name(),
+            served_provider,
         ).await {
             Ok(stored_image) => {
                 let db = env.d1("DB")?;
@@ -164,7 +175,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
                         stored_image.user_id.clone().into(),
                         stored_image.r2_key.clone().into(),
                         policy.prompt_for_storage(&stored_image.prompt).into(),
-                        provider.get_name().into(),
+                        served_provider.into(),
                         stored_image.model.clone().into(),
                         stored_image.size.clone().into(),
                         generation_req.quality.clone().into(),
@@ -200,9 +211,14 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         }
     }
     
-    if images_stored > 0 {
+    if images_stored == 0 {
+        release_claim(&db, &auth, funding.as_ref()).await;
+    } else if let Some(priced) = &priced {
+        edits::note_success(&db, &auth, &priced.pricing, Utc::now()).await;
+    }
+    if images_stored > 0 && cost_estimate.credits > 0 {
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / generation_req.n as u32;
-        let description = format!("Generated {} image(s) using {}", images_stored, generation_req.model);
+        let description = charge_description("Generated", images_stored, &served_model, priced.as_ref());
         
         if let Err(e) = Ledgers::new(&env, &db).deduct_credits_keyed(
             &auth.account,
@@ -227,7 +243,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         id: Uuid::new_v4().to_string(),
         user_id: user_id.clone(),
         request_type: "generation".to_string(),
-        model: generation_req.model.clone(),
+        model: served_model.clone(),
         prompt: policy.prompt_for_storage(&generation_req.prompt).to_string(),
         image_size: generation_req.size.clone(),
         image_quality: generation_req.quality.clone(),
@@ -252,7 +268,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
 
-    let simplified_cost = provider.get_name() == "gemini";
+    let simplified_cost = served_provider == "gemini";
 
     let _ = stmt
         .bind(&[
@@ -260,7 +276,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
             app_id.clone().into(),
             _usage_record.user_id.into(),
             _usage_record.request_type.into(),
-            provider.get_name().into(),
+            served_provider.into(),
             _usage_record.model.into(),
             _usage_record.prompt.into(),
             _usage_record.image_size.into(),
@@ -286,10 +302,10 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
     let response = ImageResponse {
         created: Utc::now().timestamp() as u64,
         data: image_data_list,
-        background: if provider.get_name() == "openai" { Some(generation_req.background) } else { None },
+        background: if served_provider == "openai" { Some(generation_req.background) } else { None },
         output_format: Some(generation_req.output_format),
         size: Some(generation_req.size),
-        quality: if provider.get_name() == "openai" { Some(generation_req.quality) } else { None },
+        quality: if served_provider == "openai" { Some(generation_req.quality) } else { None },
         usage: provider_response.usage,
     };
     
@@ -333,11 +349,11 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         return Ok(Response::error("Another request is already in progress", 429)?);
     }
 
-    let provider = match providers::get_provider(&edit_req.model, &env, &policy) {
-        Ok(p) => p,
+    let (provider, priced) = match image_provider(&db, &env, &policy, &app_id, &edit_req.model).await {
+        Ok(resolved) => resolved,
         Err(e) => {
             let _ = release_lock(&app_id, &user_id, &db).await;
-            return Err(e);
+            return e.to_response();
         }
     };
 
@@ -362,11 +378,17 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         user: edit_req.user.clone(),
     };
 
-    let cost_estimate = provider.estimate_edit_cost(&unified_request);
+    let mut cost_estimate = provider.estimate_edit_cost(&unified_request);
+    let funding = plan_funding(&env, &db, &auth, priced.as_ref(), edit_req.n).await;
+    if let Some(funding) = &funding {
+        cost_estimate.credits = funding.credits();
+    }
 
-    if let Err(e) = Ledgers::new(&env, &db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
-        let _ = release_lock(&app_id, &user_id, &db).await;
-        return credit_check_failure_response(e, &env, &db, &auth.account, "image.edit").await;
+    if cost_estimate.credits > 0 {
+        if let Err(e) = Ledgers::new(&env, &db).check_and_reserve_credits(&auth.account, cost_estimate.credits).await {
+            let _ = release_lock(&app_id, &user_id, &db).await;
+            return credit_check_failure_response(e, &env, &db, &auth.account, "image.edit").await;
+        }
     }
 
     log_debug!("Sending edit request to provider", json!({
@@ -380,6 +402,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         Ok(resp) => resp,
         Err(e) => {
             let _ = release_lock(&app_id, &user_id, &db).await;
+            release_claim(&db, &auth, funding.as_ref()).await;
 
             let error_msg = e.to_string();
             record_failed_request(&db, FailedRequest {
@@ -403,6 +426,8 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     let mut image_data_list = Vec::new();
     let mut r2_keys = Vec::new();
     let mut images_stored = 0;
+    let served_model = served_model(&provider_response, &edit_req.model);
+    let served_provider = providers::provider_name(&served_model);
     
     for (i, image_bytes) in provider_response.images.iter().enumerate() {
         if !policy.store_images {
@@ -416,10 +441,10 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
             &user_id,
             &image_bytes.data,
             &edit_req.prompt,
-            &edit_req.model,
+            &served_model,
             &edit_req.size,
             Some(&edit_req.quality),
-            provider.get_name(),
+            served_provider,
         ).await {
             Ok(stored_image) => {
                 let db = env.d1("DB")?;
@@ -440,7 +465,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
                         stored_image.user_id.clone().into(),
                         stored_image.r2_key.clone().into(),
                         policy.prompt_for_storage(&stored_image.prompt).into(),
-                        provider.get_name().into(),
+                        served_provider.into(),
                         stored_image.model.clone().into(),
                         stored_image.size.clone().into(),
                         edit_req.quality.clone().into(),
@@ -476,9 +501,14 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         }
     }
     
-    if images_stored > 0 {
+    if images_stored == 0 {
+        release_claim(&db, &auth, funding.as_ref()).await;
+    } else if let Some(priced) = &priced {
+        edits::note_success(&db, &auth, &priced.pricing, Utc::now()).await;
+    }
+    if images_stored > 0 && cost_estimate.credits > 0 {
         let actual_credits_to_charge = (cost_estimate.credits * images_stored) / edit_req.n as u32;
-        let description = format!("Edited {} image(s) using {}", images_stored, edit_req.model);
+        let description = charge_description("Edited", images_stored, &served_model, priced.as_ref());
         
         if let Err(e) = Ledgers::new(&env, &db).deduct_credits_keyed(
             &auth.account,
@@ -503,7 +533,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         id: Uuid::new_v4().to_string(),
         user_id: user_id.clone(),
         request_type: "edit".to_string(),
-        model: edit_req.model.clone(),
+        model: served_model.clone(),
         prompt: policy.prompt_for_storage(&edit_req.prompt).to_string(),
         image_size: edit_req.size.clone(),
         image_quality: edit_req.quality.clone(),
@@ -528,7 +558,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
 
-    let simplified_cost = provider.get_name() == "gemini";
+    let simplified_cost = served_provider == "gemini";
 
     let _ = stmt
         .bind(&[
@@ -536,7 +566,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
             app_id.clone().into(),
             _usage_record.user_id.into(),
             _usage_record.request_type.into(),
-            provider.get_name().into(),
+            served_provider.into(),
             _usage_record.model.into(),
             _usage_record.prompt.into(),
             _usage_record.image_size.into(),
@@ -562,10 +592,10 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     let response = ImageResponse {
         created: Utc::now().timestamp() as u64,
         data: image_data_list,
-        background: if provider.get_name() == "openai" { Some(edit_req.background) } else { None },
+        background: if served_provider == "openai" { Some(edit_req.background) } else { None },
         output_format: Some(edit_req.output_format),
         size: Some(edit_req.size),
-        quality: if provider.get_name() == "openai" { Some(edit_req.quality) } else { None },
+        quality: if served_provider == "openai" { Some(edit_req.quality) } else { None },
         usage: provider_response.usage,
     };
     
@@ -660,6 +690,53 @@ pub(crate) async fn record_failed_request(db: &D1Database, failed: FailedRequest
     }
 }
 
+/// A tenant with per-edit pricing (migration 035) gets its tier's model chain; every other tenant gets the provider
+/// of the model it named, as before.
+struct Priced {
+    pricing: EditPricing,
+    tier: Tier,
+}
+
+async fn image_provider(
+    db: &D1Database,
+    env: &worker::Env,
+    policy: &TenantPolicy,
+    app_id: &str,
+    model: &str,
+) -> std::result::Result<(Box<dyn ImageProvider>, Option<Priced>), AppError> {
+    let as_app_error = |e: worker::Error| AppError::from(e);
+    let Some(pricing) = EditPricing::load(db, app_id).await? else {
+        return Ok((providers::get_provider(model, env, policy).map_err(as_app_error)?, None));
+    };
+    let tier = edits::load_tier(db, app_id, model).await?;
+    let chain = ChainProvider::new(&tier.chain, env, policy).map_err(as_app_error)?;
+    Ok((Box::new(chain), Some(Priced { pricing, tier })))
+}
+
+async fn plan_funding(env: &worker::Env, db: &D1Database, auth: &auth::AuthedUser, priced: Option<&Priced>, n: u8) -> Option<Funding> {
+    let priced = priced?;
+    Some(edits::plan_funding(env, db, auth, &priced.pricing, &priced.tier, n as u32, Utc::now()).await)
+}
+
+async fn release_claim(db: &D1Database, auth: &auth::AuthedUser, funding: Option<&Funding>) {
+    if let Some(claim) = funding.and_then(Funding::claim) {
+        edits::release(db, auth, claim).await;
+    }
+}
+
+/// The model that made the images, or the requested one when the provider did not say.
+fn served_model(response: &providers::ProviderResponse, requested: &str) -> String {
+    response.served_by.clone().unwrap_or_else(|| requested.to_string())
+}
+
+/// The ledger line of a charge: a per-edit tenant's names the tier, every other the model.
+fn charge_description(verb: &str, images: u32, served_model: &str, priced: Option<&Priced>) -> String {
+    match priced {
+        Some(priced) => format!("{} {} image(s), {}", verb, images, priced.tier.name),
+        None => format!("{} {} image(s) using {}", verb, images, served_model),
+    }
+}
+
 /// The response for a provider call that produced nothing. A refusal is the request
 /// being declined, not a server fault: moderation answers 400, and a Gemini reply
 /// without an image (usually its safety filter on a photo of a person) answers 422
@@ -675,7 +752,7 @@ pub(crate) fn provider_failure_response(error_msg: &str, retry_subject: &str) ->
                 "moderation_blocked",
                 format!("Our AI backend is being a bit too cautious with this image. Nothing wrong on your end - just the underlying service being overly protective. Try a different {} and you should be good to go!", retry_subject),
             )
-        } else if error_msg.contains(GEMINI_UNAVAILABLE) {
+        } else if error_msg.contains(GEMINI_UNAVAILABLE) || error_msg.contains("OpenAI API error") {
             (
                 503,
                 "service_unavailable",

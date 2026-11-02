@@ -410,7 +410,11 @@ PY
 check "weekly bucket is full and resets at midnight UTC" "2 2 T00:00:00Z" "$(cat "$WEEKLY_OUT")"
 call GET /v1/credits/balance key_pixie "" pixie
 check "other tenants have no weekly field" "no" "$(has_key weekly)"
-check "other tenants' balance body is unchanged" '{"balance":100,"currency":"credits"}' "$(tr -d ' \n' < "$BODY")"
+check "a per-edit tenant's balance reads its edits, tiers and an unstarted runway" "100 4 standard:1,max:5 available 5" "$(python3 -I -c '
+import json, sys
+d = json.load(open(sys.argv[1])); e = d["edits"]
+print(d["balance"], e["balance_edits"], ",".join(t["tier"] + ":" + str(t["edits"]) for t in e["tiers"]), e["runway"]["state"], e["runway"]["today_remaining"])
+' "$BODY")"
 
 echo "== legacy chat (no alias)"
 call POST /v1/run/chat.completion key_free '{"messages":[{"role":"user","content":"I dreamed of a pier"}],"response_json":true}'
@@ -516,6 +520,24 @@ call GET /v1/images/user/u-pixie key_pixie "" pixie
 check "the gallery lists the kept image under the public gateway url" "https://api.midgarcorp.cc/v1/intelligence/r2/u-pixie/img-pixie-old.png" "$(python3 -I -c 'import json;d=json.load(open("'"$BODY"'"));print(next((i["url"] for i in d["images"] if i["id"] == "img-pixie-old"), "MISSING"))')"
 call POST /v1/images/generations key_pixie '{"prompt":"a cat","style":"ink","n":1}' pixie
 check "a stray style field from a tenant without styles is ignored" 200 "$STATUS"
+
+echo "== per-edit pricing"
+check "the first edit started the runway" 1 "$(sql_value "SELECT COUNT(*) FROM runways WHERE app_id = 'pixie' AND user_id = 'u-pixie'")"
+check "two runway edits cost no credits" 100 "$(balance_of key_pixie pixie)"
+call GET /v1/credits/balance key_pixie "" pixie
+check "the runway is active with three free edits left today" "active 3" "$(python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1]))["edits"]["runway"]; print(r["state"], r["today_remaining"])' "$BODY")"
+call POST /v1/images/generations key_pixie '{"prompt":"a lighthouse","model":"max","n":1}' pixie
+check "a Max image costs five edits, more than the balance holds" 402 "$STATUS"
+check "a refused Max image leaves today's runway alone" 2 "$(sql_value "SELECT used FROM edit_allowances WHERE app_id = 'pixie' AND user_id = 'u-pixie' AND bucket = 'runway'")"
+for prompt in a b c; do
+  call POST /v1/images/generations key_pixie "{\"prompt\":\"runway $prompt\",\"model\":\"gemini-3-pro-image\",\"n\":1}" pixie
+done
+check "a legacy Pro id is a standard edit the runway still covers" 100 "$(balance_of key_pixie pixie)"
+call POST /v1/images/generations key_pixie '{"prompt":"one past the runway","n":1}' pixie
+check "the sixth edit of the day is paid" 200 "$STATUS"
+check "a paid edit costs credits_per_edit" 79 "$(balance_of key_pixie pixie)"
+check "usage rows name the model that served" 1 "$(sql_value "SELECT CASE WHEN COUNT(*) >= 6 THEN 1 ELSE 0 END FROM usage_records WHERE app_id = 'pixie' AND model = 'mock'")"
+check "the paid edit's ledger line names the tier" 1 "$(sql_value "SELECT COUNT(*) FROM credit_transactions WHERE user_id = 'u-pixie' AND type = 'spend' AND description = 'Generated 1 image(s), standard'")"
 
 echo "== purchases"
 EVENT='{"api_version":"1.0","event":{"app_user_id":"u-free","environment":"PRODUCTION","event_timestamp_ms":1,"id":"ev1","is_family_share":false,"product_id":"com.dreameater.credits.small","purchased_at_ms":1,"store":"APP_STORE","transaction_id":"tx-1","type":"NON_RENEWING_PURCHASE"}}'

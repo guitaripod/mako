@@ -69,6 +69,7 @@ impl ImageProvider for MockImageProvider {
                 input_tokens_details: InputTokenDetails { text_tokens: 5, image_tokens: 0 },
             }),
             revised_prompts: (0..count).map(|_| None).collect(),
+            served_by: Some("mock".to_string()),
         })
     }
 

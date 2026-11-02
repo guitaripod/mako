@@ -63,7 +63,7 @@ impl GeminiImageModel {
     pub fn from_model_id(model: &str) -> Option<Self> {
         match model {
             "gemini-2.5-flash" | "gemini-2.5-flash-image-preview" | "gemini-2.5-flash-image"
-            | "gemini-3.1-flash" | "gemini-3.1-flash-image" => Some(Self::NanoBanana2),
+            | "gemini-3.1-flash" | "gemini-3.1-flash-image" | "gemini-nano-banana-2.1" => Some(Self::NanoBanana2),
             "gemini-3-pro-image" | "gemini-3-pro-image-preview" | "nano-banana-pro" => Some(Self::NanoBananaPro),
             _ => None,
         }
@@ -90,7 +90,7 @@ impl GeminiImageModel {
 
 /// Splits a `data:<mime>;base64,<payload>` input into its MIME type and payload. A bare
 /// base64 string is treated as JPEG, which is what clients sent before data URLs.
-fn split_image_input(input: &str) -> std::result::Result<(String, String), AppError> {
+pub(crate) fn split_image_input(input: &str) -> std::result::Result<(String, String), AppError> {
     let Some(rest) = input.strip_prefix("data:") else {
         return Ok(("image/jpeg".to_string(), input.to_string()));
     };
@@ -228,7 +228,8 @@ impl GeminiProvider {
             .map_err(|e| ImageFailure::Unavailable { status: None, detail: format!("Failed to parse Gemini response: {}", e) })
     }
 
-    async fn generate_images(&self, parts: Vec<GeminiPart>) -> Result<Vec<ImageBytes>> {
+    /// The images and the model that made them.
+    async fn generate_images(&self, parts: Vec<GeminiPart>) -> Result<(Vec<ImageBytes>, &'static str)> {
         let request_body = GeminiRequest {
             contents: vec![GeminiContent { parts }],
             generation_config: Self::image_generation_config(),
@@ -237,7 +238,7 @@ impl GeminiProvider {
         let mut failure = ImageFailure::Declined("no response".to_string());
         for model in self.model.api_models() {
             match self.images_from(model, &request_body).await {
-                Ok(images) => return Ok(images),
+                Ok(images) => return Ok((images, model)),
                 Err(refused) if refused.model_refused() => {
                     worker::console_log!("Gemini {} refused the request, trying the next model: {:?}", model, refused);
                     failure = refused;
@@ -312,10 +313,12 @@ impl ImageProvider for GeminiProvider {
         let n = request.n.unwrap_or(1);
         let mut all_images = Vec::new();
         let mut all_prompts = Vec::new();
+        let mut served_by = None;
 
         for _ in 0..n {
             let parts = vec![GeminiPart::Text { text: request.prompt.clone() }];
-            let images = self.generate_images(parts).await?;
+            let (images, model) = self.generate_images(parts).await?;
+            served_by = Some(model.to_string());
             for image in images {
                 all_images.push(image);
                 all_prompts.push(Some(request.prompt.clone()));
@@ -336,6 +339,7 @@ impl ImageProvider for GeminiProvider {
             images: all_images,
             usage,
             revised_prompts: all_prompts,
+            served_by,
         })
     }
 
@@ -347,6 +351,7 @@ impl ImageProvider for GeminiProvider {
         let n = request.n.unwrap_or(1);
         let mut all_images = Vec::new();
         let mut all_prompts = Vec::new();
+        let mut served_by = None;
 
         let (input_mime_type, input_image_data) = split_image_input(&request.image[0])?;
 
@@ -360,7 +365,8 @@ impl ImageProvider for GeminiProvider {
                     },
                 },
             ];
-            let images = self.generate_images(parts).await?;
+            let (images, model) = self.generate_images(parts).await?;
+            served_by = Some(model.to_string());
             for image in images {
                 all_images.push(image);
                 all_prompts.push(Some(request.prompt.clone()));
@@ -381,6 +387,7 @@ impl ImageProvider for GeminiProvider {
             images: all_images,
             usage,
             revised_prompts: all_prompts,
+            served_by,
         })
     }
 
@@ -423,7 +430,7 @@ mod tests {
 
     #[test]
     fn legacy_and_current_flash_ids_resolve_to_nano_banana_2() {
-        for id in ["gemini-2.5-flash", "gemini-2.5-flash-image", "gemini-3.1-flash-image"] {
+        for id in ["gemini-2.5-flash", "gemini-2.5-flash-image", "gemini-3.1-flash-image", "gemini-nano-banana-2.1"] {
             assert_eq!(GeminiImageModel::from_model_id(id), Some(GeminiImageModel::NanoBanana2));
         }
         assert_eq!(GeminiImageModel::NanoBanana2.api_models(), ["gemini-nano-banana-2.1", "gemini-3.1-flash-image"]);
