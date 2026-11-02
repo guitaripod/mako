@@ -8,6 +8,7 @@ use crate::ledgers::{Account, Ledgers};
 use crate::tenant::TenantPolicy;
 use crate::rate_limit::{check_and_acquire_lock, release_lock};
 use crate::providers::{self, UnifiedImageRequest, UnifiedEditRequest};
+use crate::providers::gemini::GEMINI_UNAVAILABLE;
 use crate::{log_debug, log_error};
 use serde_json::json;
 use uuid::Uuid;
@@ -662,7 +663,9 @@ pub(crate) async fn record_failed_request(db: &D1Database, failed: FailedRequest
 /// The response for a provider call that produced nothing. A refusal is the request
 /// being declined, not a server fault: moderation answers 400, and a Gemini reply
 /// without an image (usually its safety filter on a photo of a person) answers 422
-/// `no_image`, so clients can explain it instead of reporting a server error.
+/// `no_image`, so clients can explain it instead of reporting a server error. A Gemini call
+/// that failed outright (billing, outage) answers 503 `provider_unavailable`, which tells the
+/// user to come back later instead of rewording a request that was never the problem.
 pub(crate) fn provider_failure_response(error_msg: &str, retry_subject: &str) -> Result<Response> {
     let (status, error_type, code, message) =
         if error_msg.contains("content_policy_violation") || error_msg.contains("moderation") {
@@ -671,6 +674,13 @@ pub(crate) fn provider_failure_response(error_msg: &str, retry_subject: &str) ->
                 "moderation_error",
                 "moderation_blocked",
                 format!("Our AI backend is being a bit too cautious with this image. Nothing wrong on your end - just the underlying service being overly protective. Try a different {} and you should be good to go!", retry_subject),
+            )
+        } else if error_msg.contains(GEMINI_UNAVAILABLE) {
+            (
+                503,
+                "service_unavailable",
+                "provider_unavailable",
+                "Image making is briefly unavailable on our side. You weren't charged - please try again in a little while.".to_string(),
             )
         } else if error_msg.contains("No images returned by Gemini") {
             (
