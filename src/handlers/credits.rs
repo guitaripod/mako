@@ -1183,7 +1183,8 @@ pub async fn is_premium_user(env: &Env, db: &worker::D1Database, auth: &auth::Au
     let Some(required) = required else {
         return false;
     };
-    let strict = crate::tenant::TenantPolicy::from_row(&row).strict_purchases;
+    let policy = crate::tenant::TenantPolicy::from_row(&row);
+    let strict = policy.strict_purchases || policy.strict_premium;
     if let Some(midgar_id) = premium_midgar_id(auth) {
         if ledger_grants_premium(env, app_id, midgar_id, &premium_tokens(user_id, midgar_id), &required).await {
             return true;

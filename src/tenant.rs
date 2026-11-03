@@ -13,6 +13,8 @@ pub struct TenantPolicy {
     pub store_images: bool,
     pub art_credits: Option<u32>,
     pub strict_purchases: bool,
+    /// Premium needs the tenant's own premium entitlement in RevenueCat, not any entitlement (migration 036).
+    pub strict_premium: bool,
 }
 
 impl Default for TenantPolicy {
@@ -22,6 +24,7 @@ impl Default for TenantPolicy {
             store_images: true,
             art_credits: None,
             strict_purchases: false,
+            strict_premium: false,
         }
     }
 }
@@ -37,6 +40,7 @@ impl TenantPolicy {
                 .and_then(|v| v.as_i64())
                 .map(|n| n.max(0) as u32),
             strict_purchases: flag(row, "strict_purchases", defaults.strict_purchases),
+            strict_premium: flag(row, "strict_premium", defaults.strict_premium),
         }
     }
 
@@ -195,6 +199,15 @@ mod tests {
         assert!(TenantPolicy::default().store_images);
         assert_eq!(TenantPolicy::default().art_credits, None);
         assert!(!TenantPolicy::default().strict_purchases);
+        assert!(!TenantPolicy::default().strict_premium);
+    }
+
+    #[test]
+    fn pixie_row_needs_its_own_premium_entitlement_without_strict_purchases() {
+        let row = json!({"app_id": "pixie", "premium_entitlement": "plus", "strict_purchases": 0, "strict_premium": 1});
+        let policy = TenantPolicy::from_row(&row);
+        assert!(policy.strict_premium);
+        assert!(!policy.strict_purchases);
     }
 
     #[test]
