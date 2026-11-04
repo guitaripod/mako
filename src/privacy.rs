@@ -1211,14 +1211,28 @@ fn render_support(app: &str) -> String {
 <p>See our <a href="/privacy/{app}">Privacy Policy</a> and <a href="/terms/{app}">Terms of Use</a>.</p>"#,
         name = c.name,
         contact = contact_link(app),
-        app = app,
+        app = link_slug(app),
     );
     page(c.name, "Support", &body)
+}
+
+/// The app path segment as it may appear inside a link: only ASCII letters, digits and hyphens survive, so a crafted
+/// `/support/:app` value cannot close the attribute or inject markup into the page.
+fn link_slug(app: &str) -> String {
+    app.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_support_page_keeps_a_crafted_app_segment_out_of_its_markup() {
+        let page = render_support("x\"><script>alert(1)</script>");
+        assert!(!page.contains("<script>alert(1)"));
+        assert!(page.contains(r#"href="/privacy/xscriptalert1script""#));
+        assert!(render_support("livingdex").contains(r#"href="/privacy/livingdex""#));
+    }
 
     #[test]
     fn moved_legal_pages_redirect_to_their_registry_slug() {
