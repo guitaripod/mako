@@ -286,24 +286,8 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
         }
     }
     
-    if let Some(user_id) = device_data.get("user_id").and_then(|v| v.as_str()) {
-        let user_exists = db
-            .prepare("SELECT id FROM users WHERE app_id = ? AND id = ?")
-            .bind(&[app_id.clone().into(), user_id.into()])?
-            .first::<serde_json::Value>(None)
-            .await?
-            .is_some();
-
-        if user_exists {
-            let api_key = issue_api_key(&db, &app_id, user_id).await?;
-
-            let response = DeviceTokenResponse {
-                api_key,
-                user_id: user_id.to_string(),
-            };
-
-            return Response::from_json(&response);
-        }
+    if device_code_was_redeemed(&device_data) {
+        return AppError::BadRequest("Device code already used. Start a new sign-in.".to_string()).to_response();
     }
 
     let device_code = device_data.get("device_code")
@@ -542,15 +526,19 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
         }
     };
     
-    let update_stmt = db.prepare(
-        "UPDATE device_auth_flows SET user_id = ? WHERE id = ?"
-    );
-    
-    update_stmt
+    let claimed = db
+        .prepare("UPDATE device_auth_flows SET user_id = ? WHERE id = ? AND user_id IS NULL")
         .bind(&[user_id.clone().into(), device_token_req.device_code.into()])?
         .run()
-        .await?;
-    
+        .await?
+        .meta()?
+        .and_then(|m| m.changes)
+        .unwrap_or(0);
+    if claimed != 1 {
+        revoke_issued_key(&db, &app_id, &user_id, &api_key).await;
+        return AppError::BadRequest("Device code already used. Start a new sign-in.".to_string()).to_response();
+    }
+
     let response = DeviceTokenResponse {
         api_key,
         user_id,
@@ -604,5 +592,43 @@ pub async fn device_auth_status(_req: Request, ctx: RouteContext<()>) -> Result<
         None => {
             AppError::NotFound("Invalid device code".to_string()).to_response()
         }
+    }
+}
+
+/// Withdraws the API key this poll issued when another poll completed the same device flow first, so a flow never
+/// leaves more than one working key behind. Best-effort: the key is unknown to the caller, who is refused anyway.
+async fn revoke_issued_key(db: &worker::D1Database, app_id: &str, user_id: &str, api_key: &str) {
+    let hash = crate::api_keys::hash_api_key(api_key);
+    let statements = [
+        "DELETE FROM api_keys WHERE key_hash = ?1 AND app_id = ?2 AND user_id = ?3",
+        "UPDATE users SET api_key_hash = NULL WHERE api_key_hash = ?1 AND app_id = ?2 AND id = ?3",
+    ];
+    for sql in statements {
+        let result = match db.prepare(sql).bind(&[hash.clone().into(), app_id.into(), user_id.into()]) {
+            Ok(statement) => statement.run().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            worker::console_log!("device flow key revocation failed: {:?}", e);
+        }
+    }
+}
+
+/// True when this device flow already handed out an API key. A device code is redeemed once: the poll that completes
+/// the flow returns the key, and every later poll is refused, so a copied code cannot mint further keys for the account.
+fn device_code_was_redeemed(device_data: &serde_json::Value) -> bool {
+    device_data.get("user_id").and_then(|v| v.as_str()).is_some()
+}
+
+#[cfg(test)]
+mod redemption_tests {
+    use super::device_code_was_redeemed;
+    use serde_json::json;
+
+    #[test]
+    fn a_completed_device_flow_is_redeemed_and_a_pending_one_is_not() {
+        assert!(device_code_was_redeemed(&json!({ "user_id": "u-1" })));
+        assert!(!device_code_was_redeemed(&json!({ "user_id": null })));
+        assert!(!device_code_was_redeemed(&json!({})));
     }
 }
