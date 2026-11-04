@@ -183,7 +183,7 @@ async fn load_settlement(
         ..Settlement::default()
     };
     if let Some(original) = &request.retry_of {
-        settlement.retry_of_settled = reference_is_settled(db, app_id, user_id, &ledger_reference(original)).await?;
+        settlement.retry_of_settled = retry_target_was_settled(db, app_id, user_id, &ledger_reference(original)).await?;
         settlement.retry_already_used = retry_was_used(db, app_id, user_id, original).await?;
     }
     Ok(settlement)
@@ -198,19 +198,26 @@ pub(crate) async fn replays_of_key(db: &D1Database, app_id: &str, user_id: &str,
     Ok(row.map(|r| r.get("replays").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32))
 }
 
-/// True when the ledger or the request table already holds this reference.
-async fn reference_is_settled(db: &D1Database, app_id: &str, user_id: &str, reference: &str) -> Result<bool, AppError> {
-    let row = db
-        .prepare(
+/// True when the retry target was settled as an original request: the ledger holds its charge, or the request table
+/// holds it as a request that was not itself a granted retry. A free retry never earns another free retry, so a chain
+/// of `retry_of` links cannot make paid calls free.
+pub(crate) async fn retry_target_was_settled(
+    db: &impl crate::wallet::d1::D1Exec,
+    app_id: &str,
+    user_id: &str,
+    reference: &str,
+) -> Result<bool, AppError> {
+    let rows = db
+        .rows(
             "SELECT 1 AS hit FROM credit_transactions WHERE app_id = ?1 AND user_id = ?2 AND reference_id = ?3
              UNION ALL
              SELECT 1 AS hit FROM chat_requests WHERE app_id = ?1 AND user_id = ?2 AND reference = ?3
+                 AND retry_of IS NULL AND kind <> 'repeat'
              LIMIT 1",
+            &[app_id.into(), user_id.into(), reference.into()],
         )
-        .bind(&[app_id.into(), user_id.into(), reference.into()])?
-        .first::<Value>(None)
         .await?;
-    Ok(row.is_some())
+    Ok(!rows.is_empty())
 }
 
 async fn retry_was_used(db: &D1Database, app_id: &str, user_id: &str, original: &str) -> Result<bool, AppError> {
@@ -427,4 +434,28 @@ pub async fn weekly_balances(
         );
     }
     Some(buckets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_target_was_settled;
+    use crate::wallet::testing::LocalD1;
+    use futures::executor::block_on;
+
+    #[test]
+    fn only_an_original_request_earns_a_free_retry() {
+        let d1 = LocalD1::migrated();
+        d1.run(
+            "INSERT INTO chat_requests (app_id, user_id, reference, alias, kind, retry_of, replays, created_at) VALUES
+             ('app', 'u-1', 'chat:k1', 'alias', 'paid', NULL, 0, '2026-11-04T00:00:00Z'),
+             ('app', 'u-1', 'chat:k2', 'alias', 'repeat', 'k1', 0, '2026-11-04T00:00:01Z'),
+             ('app', 'u-1', 'chat:k3', 'alias', 'weekly', NULL, 0, '2026-11-04T00:00:02Z')",
+            &[],
+        );
+        let settled = |user: &str, reference: &str| block_on(retry_target_was_settled(&d1, "app", user, reference)).unwrap();
+        assert!(settled("u-1", "chat:k1"));
+        assert!(!settled("u-1", "chat:k2"));
+        assert!(settled("u-1", "chat:k3"));
+        assert!(!settled("u-2", "chat:k1"));
+    }
 }
