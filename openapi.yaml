@@ -1228,7 +1228,7 @@ paths:
   /v1/usage/users/{user_id}:
     get:
       operationId: getUserUsage
-      summary: Get user usage statistics
+      summary: Get user usage statistics (the user itself, or an admin of the same app)
       tags: [Usage]
       parameters:
         - in: path
@@ -1245,6 +1245,10 @@ paths:
                 $ref: '#/components/schemas/UserUsageStats'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -1278,13 +1282,17 @@ paths:
                 $ref: '#/components/schemas/DetailedUsage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
   /v1/usage/system:
     get:
       operationId: getSystemUsage
-      summary: Get system-wide usage statistics
+      summary: Get usage statistics for the admin's app (admins only)
       tags: [Usage]
       responses:
         '200':

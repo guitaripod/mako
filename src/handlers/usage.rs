@@ -1,6 +1,6 @@
-use worker::{Request, Response, RouteContext, Result};
+use worker::{D1Database, Env, Request, Response, RouteContext, Result};
+use crate::auth::{self, AuthedUser};
 use crate::error::AppError;
-use crate::auth::resolve_app_id;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -27,9 +27,12 @@ pub async fn get_user_usage(req: Request, ctx: RouteContext<()>) -> Result<Respo
         .ok_or_else(|| AppError::BadRequest("Missing user_id parameter".to_string()))?
         .to_string();
 
-    let app_id = resolve_app_id(&req);
     let env = ctx.env;
     let db = env.d1("DB")?;
+    let app_id = match authorize_usage_reader(&req, &env, &db, &user_id).await {
+        Ok(reader) => reader.app_id,
+        Err(e) => return e.to_response(),
+    };
     let url = req.url()?;
     let query_params: std::collections::HashMap<String, String> = url
         .query_pairs()
@@ -94,9 +97,12 @@ pub async fn get_user_usage_details(req: Request, ctx: RouteContext<()>) -> Resu
         .ok_or_else(|| AppError::BadRequest("Missing user_id parameter".to_string()))?
         .to_string();
 
-    let app_id = resolve_app_id(&req);
     let env = ctx.env;
     let db = env.d1("DB")?;
+    let app_id = match authorize_usage_reader(&req, &env, &db, &user_id).await {
+        Ok(reader) => reader.app_id,
+        Err(e) => return e.to_response(),
+    };
     let url = req.url()?;
     let query_params: std::collections::HashMap<String, String> = url
         .query_pairs()
@@ -162,8 +168,10 @@ pub async fn get_user_usage_details(req: Request, ctx: RouteContext<()>) -> Resu
 pub async fn get_system_usage(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
     let db = env.d1("DB")?;
-    
-    // TODO: Add admin authentication check
+    let app_id = match authorize_system_usage_reader(&req, &env, &db).await {
+        Ok(admin) => admin.app_id,
+        Err(e) => return e.to_response(),
+    };
     let url = req.url()?;
     let query_params: std::collections::HashMap<String, String> = url
         .query_pairs()
@@ -191,13 +199,14 @@ pub async fn get_system_usage(req: Request, ctx: RouteContext<()>) -> Result<Res
             COALESCE(SUM(image_count), 0) as total_images,
             COALESCE(AVG(response_time_ms), 0) as avg_response_time
          FROM usage_records 
-         WHERE created_at >= ? 
+         WHERE app_id = ?
+           AND created_at >= ? 
            AND created_at <= ?
            AND error IS NULL"
     );
     
     let overall_result = overall_stmt
-        .bind(&[period_start.clone().into(), period_end.clone().into()])?
+        .bind(&[app_id.clone().into(), period_start.clone().into(), period_end.clone().into()])?
         .first::<serde_json::Value>(None)
         .await?;
     
@@ -207,7 +216,8 @@ pub async fn get_system_usage(req: Request, ctx: RouteContext<()>) -> Result<Res
             COUNT(*) as requests,
             COALESCE(SUM(total_tokens), 0) as tokens
          FROM usage_records 
-         WHERE created_at >= ? 
+         WHERE app_id = ?
+           AND created_at >= ? 
            AND created_at <= ?
            AND error IS NULL
          GROUP BY user_id
@@ -216,7 +226,7 @@ pub async fn get_system_usage(req: Request, ctx: RouteContext<()>) -> Result<Res
     );
     
     let top_users_results = top_users_stmt
-        .bind(&[period_start.clone().into(), period_end.clone().into()])?
+        .bind(&[app_id.clone().into(), period_start.clone().into(), period_end.clone().into()])?
         .all()
         .await?;
     
@@ -237,13 +247,14 @@ pub async fn get_system_usage(req: Request, ctx: RouteContext<()>) -> Result<Res
         "SELECT 
             COUNT(*) as error_count
          FROM usage_records 
-         WHERE created_at >= ? 
+         WHERE app_id = ?
+           AND created_at >= ? 
            AND created_at <= ?
            AND error IS NOT NULL"
     );
     
     let error_result = error_stmt
-        .bind(&[period_start.clone().into(), period_end.clone().into()])?
+        .bind(&[app_id.clone().into(), period_start.clone().into(), period_end.clone().into()])?
         .first::<serde_json::Value>(None)
         .await?;
     
@@ -272,4 +283,45 @@ pub async fn get_system_usage(req: Request, ctx: RouteContext<()>) -> Result<Res
         },
         "top_users": top_users
     }))
+}
+
+/// The caller, when it may read `user_id`'s usage: that user itself, or an admin of the same app.
+async fn authorize_usage_reader(req: &Request, env: &Env, db: &D1Database, user_id: &str) -> std::result::Result<AuthedUser, AppError> {
+    let caller = auth::authenticate_account(req, env, db).await?;
+    if may_read_user_usage(&caller.user_id, caller.is_admin, user_id) {
+        Ok(caller)
+    } else {
+        Err(AppError::Forbidden("You can only read your own usage".to_string()))
+    }
+}
+
+/// The caller, when it may read the app-wide usage summary: an admin of its app. The summary is scoped to that app.
+async fn authorize_system_usage_reader(req: &Request, env: &Env, db: &D1Database) -> std::result::Result<AuthedUser, AppError> {
+    let caller = auth::authenticate_account(req, env, db).await?;
+    if caller.is_admin {
+        Ok(caller)
+    } else {
+        Err(AppError::Forbidden("Admin access required".to_string()))
+    }
+}
+
+/// True when a caller with `caller_id` and `is_admin` may read the usage of `target_id`.
+fn may_read_user_usage(caller_id: &str, is_admin: bool, target_id: &str) -> bool {
+    is_admin || caller_id == target_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_read_user_usage;
+
+    #[test]
+    fn a_user_reads_only_its_own_usage() {
+        assert!(may_read_user_usage("user-a", false, "user-a"));
+        assert!(!may_read_user_usage("user-a", false, "user-b"));
+    }
+
+    #[test]
+    fn an_admin_reads_any_user_of_its_app() {
+        assert!(may_read_user_usage("admin", true, "user-b"));
+    }
 }
