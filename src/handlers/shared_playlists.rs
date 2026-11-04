@@ -190,7 +190,7 @@ async fn load(req: &Request, ctx: &RouteContext<()>, id: &str) -> std::result::R
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
-    enforce_read_rate_limit(&ctx.env, "psywave", &format!("ip:{}", ip), "playlists.read").await?;
+    enforce_read_rate_limit(&ctx.env, "psywave", &format!("ip:{}", crate::rate_limit::client_network(&ip)), "playlists.read").await?;
     let db = ctx.env.d1("DB")?;
     let row = db
         .prepare("SELECT payload FROM shared_playlists WHERE id = ?")

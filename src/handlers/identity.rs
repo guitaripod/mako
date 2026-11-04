@@ -70,7 +70,7 @@ async fn enforce_anon_register_rate_limit(
         _ => return Ok(()),
     };
 
-    match limiter.limit(format!("anon_register:{}", ip)).await {
+    match limiter.limit(format!("anon_register:{}", crate::rate_limit::client_network(&ip))).await {
         Ok(outcome) if !outcome.success => Err(AppError::RateLimitExceeded),
         Ok(_) => Ok(()),
         Err(e) => {
@@ -85,12 +85,15 @@ async fn anonymous_register_inner(
     ctx: RouteContext<()>,
 ) -> std::result::Result<Response, AppError> {
     enforce_anon_register_rate_limit(&req, &ctx).await?;
+    refuse_oversized_body(&req)?;
 
     let app_id = resolve_app_id(&req);
-    let body: AnonymousRegisterRequest = req
-        .json()
-        .await
-        .map_err(|_| AppError::BadRequest("Invalid request body".to_string()))?;
+    let text = req.text().await.map_err(|_| AppError::BadRequest("Invalid request body".to_string()))?;
+    if body_too_large(Some(text.len() as u64)) {
+        return Err(AppError::BadRequest("Request body too large".to_string()));
+    }
+    let body: AnonymousRegisterRequest =
+        serde_json::from_str(&text).map_err(|_| AppError::BadRequest("Invalid request body".to_string()))?;
 
     let db = ctx.env.d1("DB")?;
 
@@ -251,6 +254,7 @@ impl DeviceCheckConfig {
     /// than a permanent 400 deny of a legitimate paying device.
     async fn validate_device(&self, jwt: &str, device_token: &str) -> std::result::Result<(), AppError> {
         let mut saw_http_response = false;
+        let mut saw_unavailable = false;
         let mut last_status = 0u16;
 
         for base in &self.bases {
@@ -259,6 +263,7 @@ impl DeviceCheckConfig {
                 Ok(resp) => resp,
                 Err(e) => {
                     console_log!("DeviceCheck transport error on {}: {:?}", base, e);
+                    saw_unavailable = true;
                     continue;
                 }
             };
@@ -269,6 +274,7 @@ impl DeviceCheckConfig {
             }
             if status == 429 {
                 console_log!("DeviceCheck throttled (429) on {}", base);
+                saw_unavailable = true;
                 continue;
             }
 
@@ -278,11 +284,36 @@ impl DeviceCheckConfig {
             console_log!("DeviceCheck non-2xx on {}: {}", base, crate::redact::provider_error_summary(status, &detail));
         }
 
-        if !saw_http_response {
-            return Err(AppError::InternalError("device validation unavailable".to_string()));
-        }
-        Err(AppError::BadRequest(format!("device validation failed (last status {})", last_status)))
+        validation_outcome(saw_http_response, saw_unavailable, last_status)
     }
+}
+
+/// How a DeviceCheck round that found no 2xx ends. A token is valid on exactly one Apple host, so a throttled (429) or
+/// unreachable host may be the device's own: any such answer makes the failure retryable (500) rather than a permanent
+/// 400, which only a round where every host answered with a rejection earns.
+fn validation_outcome(saw_http_response: bool, saw_unavailable: bool, last_status: u16) -> std::result::Result<(), AppError> {
+    if saw_unavailable || !saw_http_response {
+        return Err(AppError::InternalError("device validation unavailable".to_string()));
+    }
+    Err(AppError::BadRequest(format!("device validation failed (last status {})", last_status)))
+}
+
+/// Largest anonymous-registration body accepted. The request carries a DeviceCheck token and a device id, a few KB.
+const MAX_REGISTER_BODY_BYTES: u64 = 16 * 1024;
+
+/// Refuses an anonymous registration whose declared body is larger than `MAX_REGISTER_BODY_BYTES` before it is read. A
+/// body sent without a length (chunked) is checked again once read, before it is parsed.
+fn refuse_oversized_body(req: &Request) -> std::result::Result<(), AppError> {
+    let declared = req.headers().get("Content-Length").ok().flatten().and_then(|v| v.trim().parse::<u64>().ok());
+    if body_too_large(declared) {
+        return Err(AppError::BadRequest("Request body too large".to_string()));
+    }
+    Ok(())
+}
+
+/// True when a declared Content-Length is over the registration body limit.
+fn body_too_large(declared: Option<u64>) -> bool {
+    declared.is_some_and(|n| n > MAX_REGISTER_BODY_BYTES)
 }
 
 fn verify_unverified(ctx: &RouteContext<()>, device_id: Option<&str>) -> std::result::Result<String, AppError> {
@@ -845,5 +876,25 @@ mod tests {
         assert!(!schema.columns["users"].contains("api_key"));
         assert!(!schema.columns.contains_key("user_credits_new"));
         assert!(schema.columns["usage_records"].contains("capability"));
+    }
+}
+
+#[cfg(test)]
+mod registration_guard_tests {
+    use super::{body_too_large, validation_outcome};
+    use crate::error::AppError;
+
+    #[test]
+    fn a_throttled_or_unreachable_devicecheck_host_makes_the_failure_retryable() {
+        assert!(matches!(validation_outcome(true, true, 400), Err(AppError::InternalError(_))));
+        assert!(matches!(validation_outcome(false, true, 0), Err(AppError::InternalError(_))));
+        assert!(matches!(validation_outcome(true, false, 400), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn an_oversized_registration_body_is_refused_before_it_is_read() {
+        assert!(body_too_large(Some(16 * 1024 + 1)));
+        assert!(!body_too_large(Some(512)));
+        assert!(!body_too_large(None));
     }
 }
