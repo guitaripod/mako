@@ -234,38 +234,20 @@ pub async fn purchase_credits(mut req: Request, ctx: RouteContext<()>) -> Result
         Ok(req) => req,
         Err(e) => return AppError::BadRequest(format!("Invalid request body: {}", e)).to_response(),
     };
-    
-    // Find the pack
-    let packs = get_credit_packs();
+
+    let db = env.d1("DB")?;
+    let packs = get_credit_packs_for_app(&app_id, &db).await;
     let pack = packs
         .iter()
         .find(|p| p.id == purchase_req.pack_id)
         .ok_or_else(|| AppError::BadRequest("Invalid pack_id".to_string()))?;
-    
+
     let total_credits = pack.credits + pack.bonus_credits;
-    
-    let db = env.d1("DB")?;
-    
+
     match purchase_req.payment_provider.as_str() {
-        "stripe" => {
-            let purchase_id = record_purchase(
-                &app_id,
-                &user_id,
-                &purchase_req.pack_id,
-                total_credits as u32,
-                pack.price_usd_cents as u32,
-                &purchase_req.payment_provider,
-                &purchase_req.payment_id,
-                &db,
-            ).await?;
-            
-            Response::from_json(&json!({
-                "purchase_id": purchase_id,
-                "status": "pending",
-                "credits": total_credits,
-                "amount_usd": format!("${:.2}", pack.price_usd_cents as f64 / 100.0),
-            }))
-        },
+        "stripe" => AppError::BadRequest(
+            "Card payments start at POST /v1/credits/purchase/stripe, which creates the checkout session".to_string()
+        ).to_response(),
         "nowpayments" => {
             if purchase_req.pack_id == "starter" {
                 return AppError::BadRequest(
@@ -646,21 +628,27 @@ pub async fn crypto_payment_webhook(mut req: Request, ctx: RouteContext<()>) -> 
     Response::ok("OK")
 }
 
-pub async fn get_purchase_status(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn get_purchase_status(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let purchase_id = ctx.param("purchase_id")
         .ok_or_else(|| AppError::BadRequest("Missing purchase_id".to_string()))?
         .to_string();
     let env = ctx.env;
-    
+
     let db = env.d1("DB")?;
-    
-    // Get purchase details
-    let purchase = db
-        .prepare("SELECT status, payment_provider, payment_id FROM credit_purchases WHERE id = ?")
-        .bind(&[purchase_id.clone().into()])?
+    let caller = match auth::authenticate_account(&req, &env, &db).await {
+        Ok(a) => a,
+        Err(e) => return e.to_response(),
+    };
+
+    let purchase = match db
+        .prepare("SELECT status, payment_provider, payment_id FROM credit_purchases WHERE id = ? AND app_id = ? AND user_id = ?")
+        .bind(&[purchase_id.clone().into(), caller.app_id.clone().into(), caller.user_id.clone().into()])?
         .first::<serde_json::Value>(None)
         .await?
-        .ok_or_else(|| AppError::NotFound("Purchase not found".to_string()))?;
+    {
+        Some(row) => row,
+        None => return AppError::NotFound("Purchase not found".to_string()).to_response(),
+    };
     
     let status = purchase.get("status")
         .and_then(|s| s.as_str())
@@ -719,8 +707,7 @@ pub async fn get_purchase_status(_req: Request, ctx: RouteContext<()>) -> Result
         if !session_id.is_empty() {
             match crate::stripe_payments::get_checkout_session(&env, session_id).await {
                 Ok(session) => {
-                    // If payment is completed, complete the purchase
-                    if session.payment_status == "paid" {
+                    if crate::stripe_payments::session_pays_for(&session, &purchase_id, crate::stripe_payments::test_mode_allowed(&env)) {
                         crate::ledgers::Ledgers::new(&env, &db).complete_purchase(&purchase_id).await?;
                         
                         Response::from_json(&json!({
@@ -786,13 +773,18 @@ pub async fn create_stripe_checkout(mut req: Request, ctx: RouteContext<()>) -> 
         Err(e) => return AppError::BadRequest(format!("Invalid request body: {}", e)).to_response(),
     };
     
-    // Find the pack
-    let packs = get_credit_packs();
-    let pack = packs
-        .iter()
-        .find(|p| p.id == checkout_req.pack_id)
-        .ok_or_else(|| AppError::BadRequest("Invalid pack_id".to_string()))?;
-    
+    let tenant_packs = {
+        let db = env.d1("DB")?;
+        get_credit_packs_for_app(&user_id.1, &db).await
+    };
+    let card = match card_pack(&tenant_packs, &checkout_req.pack_id) {
+        Some(pack) => pack,
+        None => return AppError::BadRequest(
+            format!("The '{}' pack is not available for card payments in this app.", checkout_req.pack_id)
+        ).to_response(),
+    };
+    let pack = &card;
+
     // Get Stripe price ID for this pack
     let stripe_price_id = crate::stripe_payments::get_stripe_price_id(&env, &checkout_req.pack_id)
         .ok_or_else(|| AppError::BadRequest(
@@ -885,13 +877,13 @@ pub async fn stripe_webhook(mut req: Request, ctx: RouteContext<()>) -> Result<R
             let session: crate::stripe_payments::StripeCheckoutSession = serde_json::from_value(event.data.object)
                 .map_err(|e| AppError::InternalError(format!("Failed to parse session: {}", e)))?;
             
-            // Only process if payment is successful
-            if session.payment_status == "paid" {
-                // Extract purchase_id from metadata
-                if let Some(purchase_id) = session.metadata.get("purchase_id") {
+            if let Some(purchase_id) = session.metadata.get("purchase_id") {
+                if crate::stripe_payments::session_pays_for(&session, purchase_id, crate::stripe_payments::test_mode_allowed(&env)) {
                     let db = env.d1("DB")?;
                     crate::ledgers::Ledgers::new(&env, &db).complete_purchase(purchase_id).await?;
                     worker::console_log!("Completed purchase: {}", purchase_id);
+                } else if !session.livemode {
+                    worker::console_log!("Ignored a test-mode Stripe session in production for purchase {}", purchase_id);
                 }
             }
         },
@@ -1819,9 +1811,50 @@ async fn reverse_pack_refund(
     Ok(())
 }
 
+/// The pack a card purchase sells: the app's own pack with this id, when its price equals the price of the Stripe
+/// price object `get_stripe_price_id` charges for that id (the reference catalog in `get_credit_packs`), so the
+/// card is charged exactly what the app's catalog lists and credited exactly what it promises.
+fn card_pack(tenant_packs: &[crate::credits::CreditPack], pack_id: &str) -> Option<crate::credits::CreditPack> {
+    let reference_price = get_credit_packs().into_iter().find(|p| p.id == pack_id)?.price_usd_cents;
+    tenant_packs
+        .iter()
+        .find(|p| p.id == pack_id && p.price_usd_cents == reference_price)
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack(id: &str, credits: i32, price: i32) -> crate::credits::CreditPack {
+        crate::credits::CreditPack {
+            id: id.to_string(),
+            name: id.to_string(),
+            credits,
+            price_usd_cents: price,
+            bonus_credits: 0,
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_card_purchase_credits_the_apps_own_pack_at_the_stripe_price() {
+        let pixie = vec![pack("starter", 210, 299), pack("basic", 840, 999)];
+        assert_eq!(card_pack(&pixie, "starter").map(|p| p.credits), Some(210));
+    }
+
+    #[test]
+    fn a_card_purchase_refuses_a_pack_whose_price_differs_from_the_stripe_price() {
+        let tenant = vec![pack("starter", 30, 199)];
+        assert!(card_pack(&tenant, "starter").is_none());
+    }
+
+    #[test]
+    fn a_card_purchase_refuses_a_pack_the_app_does_not_sell_or_stripe_cannot_charge() {
+        let dreameater = vec![pack("small", 5, 299)];
+        assert!(card_pack(&dreameater, "starter").is_none());
+        assert!(card_pack(&dreameater, "small").is_none());
+    }
 
     #[test]
     fn a_premium_check_also_counts_purchases_revenuecat_tagged_with_the_mako_user_id() {

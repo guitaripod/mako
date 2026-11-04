@@ -1427,7 +1427,7 @@ paths:
   /v1/credits/purchase/{purchase_id}/status:
     get:
       operationId: getPurchaseStatus
-      summary: Check purchase status
+      summary: Check the status of one of the caller's purchases
       tags: [Credits]
       parameters:
         - in: path
@@ -1444,6 +1444,8 @@ paths:
                 $ref: '#/components/schemas/PurchaseStatus'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
 

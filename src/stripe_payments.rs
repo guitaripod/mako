@@ -298,6 +298,20 @@ pub fn verify_webhook_signature(env: &Env, signature: &str, body: &str, timestam
 }
 
 // Helper function to get Stripe price IDs for each pack from environment variables
+/// True when a Stripe Checkout session pays for purchase `purchase_id`: it is paid, the server created it for that
+/// purchase (its `purchase_id` metadata is set only by `create_checkout_session`), and it is a live-mode session
+/// unless `allow_test_mode`. A session id alone is never proof of payment, because clients can name any session.
+pub fn session_pays_for(session: &StripeCheckoutSession, purchase_id: &str, allow_test_mode: bool) -> bool {
+    session.payment_status == "paid"
+        && session.metadata.get("purchase_id").map(String::as_str) == Some(purchase_id)
+        && (session.livemode || allow_test_mode)
+}
+
+/// Test-mode Stripe sessions grant credits only outside production. A missing `ENVIRONMENT` counts as production.
+pub fn test_mode_allowed(env: &Env) -> bool {
+    matches!(env.var("ENVIRONMENT").map(|v| v.to_string()).ok().as_deref(), Some(e) if e != "production")
+}
+
 pub fn get_stripe_price_id(env: &Env, pack_id: &str) -> Option<String> {
     let var_name = match pack_id {
         "starter" => "STRIPE_PRICE_ID_STARTER",
@@ -317,4 +331,52 @@ pub fn get_stripe_price_id(env: &Env, pack_id: &str) -> Option<String> {
     }
     
     result
+}
+
+#[cfg(test)]
+mod session_binding_tests {
+    use super::*;
+
+    fn session(purchase_id: Option<&str>, payment_status: &str, livemode: bool) -> StripeCheckoutSession {
+        let mut metadata = HashMap::new();
+        if let Some(id) = purchase_id {
+            metadata.insert("purchase_id".to_string(), id.to_string());
+        }
+        StripeCheckoutSession {
+            id: "cs_dummy".to_string(),
+            object: "checkout.session".to_string(),
+            amount_total: Some(299),
+            currency: Some("usd".to_string()),
+            customer: None,
+            customer_email: None,
+            livemode,
+            metadata,
+            mode: "payment".to_string(),
+            payment_status: payment_status.to_string(),
+            status: "complete".to_string(),
+            success_url: String::new(),
+            cancel_url: String::new(),
+            url: None,
+            created: 0,
+            expires_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_paid_live_session_pays_only_for_the_purchase_it_was_created_for() {
+        assert!(session_pays_for(&session(Some("p-1"), "paid", true), "p-1", false));
+        assert!(!session_pays_for(&session(Some("p-1"), "paid", true), "p-2", false));
+        assert!(!session_pays_for(&session(None, "paid", true), "p-1", false));
+    }
+
+    #[test]
+    fn an_unpaid_session_pays_for_nothing() {
+        assert!(!session_pays_for(&session(Some("p-1"), "unpaid", true), "p-1", false));
+    }
+
+    #[test]
+    fn a_test_mode_session_pays_only_where_test_mode_is_allowed() {
+        assert!(!session_pays_for(&session(Some("p-1"), "paid", false), "p-1", false));
+        assert!(session_pays_for(&session(Some("p-1"), "paid", false), "p-1", true));
+    }
 }
