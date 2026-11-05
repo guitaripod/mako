@@ -1,7 +1,7 @@
 use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
 use crate::auth::resolve_app_id;
-use crate::storage::public_image_url;
+use crate::storage::{public_image_url, retire_image_key, retires_key, MAX_KEYS_RETIRED_PER_REQUEST};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -356,6 +356,17 @@ pub async fn set_image_visibility(mut req: Request, ctx: RouteContext<()>) -> Re
     };
     let is_public: i32 = if body.is_public { 1 } else { 0 };
 
+    let current = db
+        .prepare("SELECT is_public, r2_key FROM stored_images WHERE app_id = ?1 AND id = ?2 AND user_id = ?3")
+        .bind(&[auth.app_id.clone().into(), image_id.clone().into(), auth.user_id.clone().into()])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    let Some(current) = current else {
+        return AppError::NotFound(format!("Image {} not found", image_id)).to_response();
+    };
+    let was_public = current.get("is_public").and_then(|v| v.as_i64()).map(|v| v != 0).unwrap_or(false);
+    let mut r2_key = current.get("r2_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
     let result = db
         .prepare("UPDATE stored_images SET is_public = ?1 WHERE app_id = ?2 AND id = ?3 AND user_id = ?4")
         .bind(&[
@@ -372,7 +383,15 @@ pub async fn set_image_visibility(mut req: Request, ctx: RouteContext<()>) -> Re
         return AppError::NotFound(format!("Image {} not found", image_id)).to_response();
     }
 
-    Response::from_json(&json!({ "image_id": image_id, "is_public": body.is_public }))
+    if retires_key(was_public, body.is_public) && !r2_key.is_empty() {
+        match retire_image_key(&env, &db, &auth.app_id, &auth.user_id, &image_id, &r2_key).await {
+            Ok(Some(new_key)) => r2_key = new_key,
+            Ok(None) => {}
+            Err(e) => crate::log_error!("Failed to retire a hidden image's key", json!({ "error": e.to_string(), "image_id": image_id })),
+        }
+    }
+
+    Response::from_json(&json!({ "image_id": image_id, "is_public": body.is_public, "url": public_image_url(&env, &r2_key) }))
 }
 
 /// Bulk-set the public/private flag on every image the caller owns. Backs the
@@ -395,12 +414,33 @@ pub async fn set_all_visibility(mut req: Request, ctx: RouteContext<()>) -> Resu
     };
     let is_public: i32 = if body.is_public { 1 } else { 0 };
 
+    let to_retire = if body.is_public {
+        Vec::new()
+    } else {
+        db.prepare("SELECT id, r2_key FROM stored_images WHERE app_id = ?1 AND user_id = ?2 AND is_public = 1")
+            .bind(&[auth.app_id.clone().into(), auth.user_id.clone().into()])?
+            .all()
+            .await?
+            .results::<serde_json::Value>()?
+    };
+
     let result = db
         .prepare("UPDATE stored_images SET is_public = ?1 WHERE app_id = ?2 AND user_id = ?3")
         .bind(&[is_public.into(), auth.app_id.clone().into(), auth.user_id.clone().into()])?
         .run()
         .await?;
 
+    let mut retired = 0usize;
+    for row in to_retire.iter().take(MAX_KEYS_RETIRED_PER_REQUEST) {
+        let (Some(id), Some(key)) = (row.get("id").and_then(|v| v.as_str()), row.get("r2_key").and_then(|v| v.as_str())) else { continue };
+        match retire_image_key(&env, &db, &auth.app_id, &auth.user_id, id, key).await {
+            Ok(Some(_)) => retired += 1,
+            Ok(None) => {}
+            Err(e) => crate::log_error!("Failed to retire a hidden image's key", json!({ "error": e.to_string(), "image_id": id })),
+        }
+    }
+    let pending = to_retire.len().saturating_sub(MAX_KEYS_RETIRED_PER_REQUEST);
+
     let updated = result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0);
-    Response::from_json(&json!({ "updated": updated, "is_public": body.is_public }))
+    Response::from_json(&json!({ "updated": updated, "is_public": body.is_public, "keys_retired": retired, "keys_pending": pending }))
 }

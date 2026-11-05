@@ -1,4 +1,4 @@
-use worker::{Env, Result};
+use worker::{D1Database, Env, Result};
 use crate::models::StoredImage;
 use crate::error::AppError;
 use uuid::Uuid;
@@ -105,6 +105,57 @@ pub async fn store_image_from_bytes(
     Ok(stored_image)
 }
 
+/// Most images one bulk hide moves to fresh keys in a single request: each move costs three R2 calls and one D1
+/// write, which keeps the request inside the Workers subrequest limit. The rest are reported as pending.
+pub const MAX_KEYS_RETIRED_PER_REQUEST: usize = 200;
+
+/// A fresh object key for one of `user_id`'s stored images: a new random name, so no URL of an earlier key reaches it.
+pub fn fresh_image_key(user_id: &str) -> String {
+    format!("{}/{}.png", user_id, Uuid::new_v4())
+}
+
+/// Whether a visibility change retires the image's key: only a public image being hidden, because a link to it could
+/// only have been shared while it was public (decision D28).
+pub fn retires_key(was_public: bool, now_public: bool) -> bool {
+    was_public && !now_public
+}
+
+/// Moves one stored image to a fresh R2 key and returns the key, or `None` when the object is already gone or the row
+/// moved meanwhile. It copies the object, points `stored_images` at the copy only while the row still names `old_key`,
+/// then deletes the old object, so every URL the image had stops working.
+pub async fn retire_image_key(
+    env: &Env,
+    db: &D1Database,
+    app_id: &str,
+    user_id: &str,
+    image_id: &str,
+    old_key: &str,
+) -> Result<Option<String>> {
+    let bucket = env.bucket("IMAGES").map_err(|e| AppError::InternalError(format!("Failed to get R2 bucket: {}", e)))?;
+    let Some(object) = bucket.get(old_key).execute().await? else { return Ok(None) };
+    let Some(body) = object.body() else { return Ok(None) };
+    let bytes = body.bytes().await?;
+    let new_key = fresh_image_key(user_id);
+    bucket
+        .put(&new_key, bytes)
+        .execute()
+        .await
+        .map_err(|e| AppError::InternalError(format!("Failed to copy image in R2: {}", e)))?;
+    let moved = db
+        .prepare("UPDATE stored_images SET r2_key = ?1 WHERE app_id = ?2 AND id = ?3 AND user_id = ?4 AND r2_key = ?5")
+        .bind(&[new_key.clone().into(), app_id.into(), image_id.into(), user_id.into(), old_key.into()])?
+        .run()
+        .await?;
+    if moved.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) == 0 {
+        bucket.delete(&new_key).await?;
+        return Ok(None);
+    }
+    if let Err(e) = bucket.delete(old_key).await {
+        crate::log_error!("Failed to delete a retired image key", serde_json::json!({ "error": e.to_string(), "r2_key": old_key }));
+    }
+    Ok(Some(new_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +184,22 @@ mod tests {
         );
         assert_eq!(image_url(Some("   "), "u1/i1.png"), image_url(None, "u1/i1.png"));
         assert_eq!(image_url(Some(""), "u1/i1.png"), image_url(None, "u1/i1.png"));
+    }
+
+    #[test]
+    fn a_fresh_key_stays_under_the_owner_and_is_new_every_time() {
+        let first = fresh_image_key("u1");
+        let second = fresh_image_key("u1");
+        assert!(first.starts_with("u1/") && first.ends_with(".png"));
+        assert_ne!(first, second);
+        assert_eq!(first.len(), "u1/".len() + 36 + ".png".len());
+    }
+
+    #[test]
+    fn only_hiding_a_public_image_retires_its_key() {
+        assert!(retires_key(true, false));
+        assert!(!retires_key(false, false));
+        assert!(!retires_key(true, true));
+        assert!(!retires_key(false, true));
     }
 }
