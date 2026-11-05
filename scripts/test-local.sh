@@ -178,7 +178,8 @@ INSERT INTO users (id, provider, provider_id, name, api_key_hash, created_at, up
  ('u-broke',    'anonymous', 'broke',    'Broke',    '$(key_hash key_broke)',    '$NOW', '$NOW', 'dreameater'),
  ('u-throw',    'anonymous', 'throw',    'Throw',    '$(key_hash key_throw)',    '$NOW', '$NOW', 'dreameater'),
  ('u-pixie',    'anonymous', 'pixie',    'Pixie',    '$(key_hash key_pixie)',    '$NOW', '$NOW', 'pixie'),
- ('u-scrub',    'anonymous', 'scrub',    'Scrub',    '$(key_hash key_scrub)',    '$NOW', '$NOW', 'scrubme');
+ ('u-scrub',    'anonymous', 'scrub',    'Scrub',    '$(key_hash key_scrub)',    '$NOW', '$NOW', 'scrubme'),
+ ('u-hide',     'anonymous', 'hide',     'Hide',     '$(key_hash key_hide)',     '$NOW', '$NOW', 'pixie');
 UPDATE users SET premium_cached = 1, premium_checked_at = '$NOW' WHERE id = 'u-premium';
 INSERT INTO api_keys (key_hash, user_id, app_id, created_at, last_used_at) VALUES
  ('prune-never-used-old', 'u-pixie', 'pixie', '2025-01-01T00:00:00+00:00', NULL),
@@ -208,6 +209,11 @@ INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, model, size, cre
 INSERT INTO apps (app_id, name, purge_expired_images) VALUES ('scrubme', 'Scrub Me', 1);
 INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, model, size, created_at, expires_at) VALUES
  ('img-default-old', 'psywave', 'u-pixie', 'u-pixie/img-default-old.png', 'an old dream', 'm', '1024x1024', '2026-01-01T00:00:00+00:00', '2026-01-08T00:00:00+00:00');
+INSERT INTO stored_images (id, app_id, user_id, r2_key, prompt, model, size, created_at, expires_at, is_public) VALUES
+ ('img-hide', 'pixie', 'u-hide', 'u-hide/img-hide.png', 'a public edit', 'm', '1024x1024', '$NOW', '2099-01-01T00:00:00+00:00', 1),
+ ('img-bulk-1', 'pixie', 'u-hide', 'u-hide/img-bulk-1.png', 'a public edit', 'm', '1024x1024', '$NOW', '2099-01-01T00:00:00+00:00', 1),
+ ('img-bulk-2', 'pixie', 'u-hide', 'u-hide/img-bulk-2.png', 'a public edit', 'm', '1024x1024', '$NOW', '2099-01-01T00:00:00+00:00', 1),
+ ('img-already-private', 'pixie', 'u-hide', 'u-hide/img-already-private.png', 'a private edit', 'm', '1024x1024', '$NOW', '2099-01-01T00:00:00+00:00', 0);
 INSERT INTO image_reports (id, app_id, image_id, reporter_user_id, created_at) VALUES
  ('rep-expired', 'scrubme', 'img-expired', 'u-pixie', '$NOW'),
  ('rep-fresh', 'scrubme', 'img-fresh', 'u-pixie', '$NOW');
@@ -222,7 +228,7 @@ fi
 rm -f "$SEED"
 echo "PASS  seeded tenants, users, the test aliases and rows to delete"
 
-for object in u-scrub/img-expired u-scrub/img-fresh u-pixie/img-pixie-old u-pixie/img-default-old; do
+for object in u-scrub/img-expired u-scrub/img-fresh u-pixie/img-pixie-old u-pixie/img-default-old u-hide/img-hide u-hide/img-bulk-1 u-hide/img-bulk-2 u-hide/img-already-private; do
   printf 'png' > "$STATE/retention.png"
   wrangler_local r2 object put "$BUCKET/$object.png" --file "$STATE/retention.png" --local --content-type image/png >/dev/null 2>>"$LOG"
 done
@@ -273,6 +279,29 @@ check "only the tenant the test opted in has purge_expired_images set" 1 "$(sql_
 check "the purge kept the expired image of a tenant that has not opted in" 1 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE id = 'img-default-old'")"
 check "the purge kept that tenant's R2 object" 200 "$(image_status u-pixie/img-default-old.png)"
 check "the scrubbed tenant's other images are untouched by the purge" 2 "$(sql_value "SELECT COUNT(*) FROM stored_images WHERE app_id = 'scrubme'")"
+
+echo "== hiding an image retires its URL"
+call PUT /v1/images/img-hide/visibility key_hide '{"is_public":false}' pixie
+check "hiding a public image answers 200" 200 "$STATUS"
+HIDDEN_KEY="$(sql_value "SELECT r2_key FROM stored_images WHERE id = 'img-hide'")"
+HIDDEN_MOVED=no
+[[ "$HIDDEN_KEY" == u-hide/*.png && "$HIDDEN_KEY" != u-hide/img-hide.png ]] && HIDDEN_MOVED=yes
+check "the hidden image moved to a fresh key under its owner" yes "$HIDDEN_MOVED"
+check "the hidden image's old URL answers 404" 404 "$(image_status u-hide/img-hide.png)"
+check "the hidden image is served at its new key" 200 "$(image_status "$HIDDEN_KEY")"
+check "the answer carries the new URL" "https://api.midgarcorp.cc/v1/intelligence/r2/$HIDDEN_KEY" "$(json_get url)"
+call PUT /v1/images/img-hide/visibility key_hide '{"is_public":false}' pixie
+check "hiding an already hidden image keeps its key" "$HIDDEN_KEY" "$(sql_value "SELECT r2_key FROM stored_images WHERE id = 'img-hide'")"
+call PUT /v1/images/img-hide/visibility key_hide '{"is_public":true}' pixie
+check "showing it again keeps the new key" "$HIDDEN_KEY" "$(sql_value "SELECT r2_key FROM stored_images WHERE id = 'img-hide'")"
+call PUT /v1/images/visibility key_hide '{"is_public":false}' pixie
+check "hiding everything answers 200" 200 "$STATUS"
+check "hiding everything retires the keys of the three public images" 3 "$(json_get keys_retired)"
+check "hiding everything leaves nothing pending" 0 "$(json_get keys_pending)"
+check "a bulk-hidden image's old URL answers 404" 404 "$(image_status u-hide/img-bulk-1.png)"
+check "the other bulk-hidden image's old URL answers 404" 404 "$(image_status u-hide/img-bulk-2.png)"
+check "an image that was private already keeps its key and URL" 200 "$(image_status u-hide/img-already-private.png)"
+check "every bulk-hidden image is still served at its new key" 200 "$(image_status "$(sql_value "SELECT r2_key FROM stored_images WHERE id = 'img-bulk-1'")")"
 
 echo "== api key hashing"
 call GET /v1/credits/balance key_free
