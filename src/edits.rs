@@ -111,10 +111,10 @@ pub fn runway_phase(started_at: Option<DateTime<Utc>>, now: DateTime<Utc>, days:
     }
 }
 
-/// The tier a request names. `max` and the GPT Image 2.5 ids are Max; everything else, `standard` and every legacy
-/// Nano Banana or GPT Image id an old client sends, is Standard, so no shipped client lands on an unknown tier.
+/// The tier a request names. `max` and the GPT Image 2.5 and 2.6 ids are Max; everything else, `standard` and every
+/// legacy Nano Banana or GPT Image id an old client sends, is Standard, so no shipped client lands on an unknown tier.
 pub fn tier_name_for(model: &str) -> &'static str {
-    if model == MAX || model.starts_with("gpt-image-2.5") {
+    if model == MAX || model.starts_with("gpt-image-2.5") || model.starts_with("gpt-image-2.6") {
         MAX
     } else {
         STANDARD
@@ -434,8 +434,8 @@ mod tests {
     }
 
     #[test]
-    fn max_and_the_gpt_image_2_5_ids_are_max_and_every_other_id_is_standard() {
-        for id in ["max", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"] {
+    fn max_and_the_gpt_image_2_5_and_2_6_ids_are_max_and_every_other_id_is_standard() {
+        for id in ["max", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare"] {
             assert_eq!(tier_name_for(id), MAX, "{id}");
         }
         for id in ["standard", "gemini-2.5-flash", "gemini-3.1-flash-image", "gemini-3-pro-image", "nano-banana-pro", "gpt-image-1", "gpt-image-2", ""] {

@@ -20,7 +20,14 @@ fn openai_route(tail: &str) -> String {
 
 /// The models mako sends to OpenAI's image endpoints. A legacy `gpt-image-1` request rides `gpt-image-2`, as it
 /// has since gpt-image-1 was retired here.
-pub const OPENAI_IMAGE_MODELS: [&str; 4] = ["gpt-image-1", "gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"];
+pub const OPENAI_IMAGE_MODELS: [&str; 6] = [
+    "gpt-image-1",
+    "gpt-image-2",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
+];
 
 pub struct OpenAIProvider {
     api_key: String,
@@ -33,16 +40,18 @@ fn api_model(model: &str) -> &'static str {
     match model {
         "gpt-image-2.5-sunburst" => "gpt-image-2.5-sunburst",
         "gpt-image-2.5-flare" => "gpt-image-2.5-flare",
+        "gpt-image-2.6-sunburst" => "gpt-image-2.6-sunburst",
+        "gpt-image-2.6-flare" => "gpt-image-2.6-flare",
         _ => "gpt-image-2",
     }
 }
 
 /// The quality sent: a chain link's own quality wins, then the request's when OpenAI accepts it, else `auto`.
-/// `xhigh` and `max` exist only on the 2.5 models.
+/// `xhigh` and `max` exist only on the 2.5 and 2.6 models.
 fn quality_for(model: &str, link: Option<&str>, requested: Option<&str>) -> String {
     let accepted = |q: &str| match q {
         "low" | "medium" | "high" | "auto" => true,
-        "xhigh" | "max" => model.starts_with("gpt-image-2.5"),
+        "xhigh" | "max" => model.starts_with("gpt-image-2.5") || model.starts_with("gpt-image-2.6"),
         _ => false,
     };
     link.or(requested).filter(|q| accepted(q)).unwrap_or("auto").to_string()
@@ -357,5 +366,27 @@ impl ImageProvider for OpenAIProvider {
 
     fn get_name(&self) -> &str {
         "openai"
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_listed_image_model_is_sent_as_itself_except_the_retired_gpt_image_1() {
+        for model in OPENAI_IMAGE_MODELS.iter().filter(|m| **m != "gpt-image-1") {
+            assert_eq!(api_model(model), *model);
+        }
+        assert_eq!(api_model("gpt-image-1"), "gpt-image-2");
+    }
+
+    #[test]
+    fn xhigh_and_max_reach_only_the_2_5_and_2_6_models() {
+        for model in ["gpt-image-2.5-sunburst", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare"] {
+            assert_eq!(quality_for(model, Some("xhigh"), None), "xhigh");
+            assert_eq!(quality_for(model, None, Some("max")), "max");
+        }
+        assert_eq!(quality_for("gpt-image-2", Some("xhigh"), None), "auto");
+        assert_eq!(quality_for("gpt-image-2.6-sunburst", Some("high"), Some("low")), "high");
     }
 }
