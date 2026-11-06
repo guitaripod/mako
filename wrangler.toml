@@ -57,11 +57,11 @@ WALLET_LINKING = "on"
 # variable and redeploying is the way back. See docs/p3.07-wallet-design.md, section 12.
 
 # P3.07 step 9. "on" opens POST /internal/wallet/grant, where midgar-ledger forwards a verified consumable credit-pack
-# transaction for a Midgar ID that is already linked, credited once under tx:<transactionId> (the key the RevenueCat
-# webhook and the validate call share). Anything else hides the route (404). Needs the WALLET_INTERNAL_SECRET secret,
+# transaction for a Midgar ID that is already linked, credited once under tx:<transactionId> (the key the validate
+# call shares). Anything else hides the route (404). Needs the WALLET_INTERNAL_SECRET secret,
 # the same value on midgar-ledger, and WALLET_LINKING = "on"; the ledger forwards only when its own LEDGER_GRANTS is on.
 # The same flag opens POST /internal/wallet/refund, where the ledger forwards an App Store refund of such a transaction;
-# it takes the pack's credits back once, under the claim the RevenueCat refund path shares.
+# it takes the pack's credits back once, from the wallet or, for a buyer with none, from the D1 balance.
 LEDGER_GRANTS = "on"
 
 # Rate-limit enforcement switch. "false" = shadow (log would-be-limits, never
@@ -150,7 +150,7 @@ service = "midgar-identity"
 
 # StoreKit 2 verification (P3.07 follow-up): mako hands a client's signed transaction to the ledger, which verifies
 # it against Apple Root CA - G3 and answers its decoded fields. Needs the LEDGER_VERIFY_SECRET secret, set to the same
-# value on midgar-ledger; without it a signed purchase answers 409 credit_pending and RevenueCat's webhook credits it.
+# value on midgar-ledger; without it a signed purchase answers 409 credit_pending and the ledger's grant credits it.
 [[services]]
 binding = "LEDGER"
 service = "midgar-ledger"

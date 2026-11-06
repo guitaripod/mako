@@ -76,7 +76,7 @@ fn a_linked_buyers_consumable_is_credited_once_under_the_transaction_key() {
     assert_eq!((app_id.as_str(), user_id.as_str(), pack_id.as_str(), credits as i64), (APP, "u1", "small", PACK_CREDITS));
     assert_eq!(world.wallets.balance(MIDGAR, APP), PACK_CREDITS);
     assert_eq!(world.entries(&format!("tx:{TX}")), 1);
-    assert_eq!(block_on(purchase::revenuecat_status(&world.d1, APP, TX)).unwrap().as_deref(), Some("completed"));
+    assert_eq!(block_on(purchase::store_status(&world.d1, APP, TX)).unwrap().as_deref(), Some("completed"));
     assert!(world.wallets.verified(MIDGAR));
 }
 
@@ -94,7 +94,7 @@ fn the_same_transaction_replayed_twice_gives_one_wallet_entry() {
 }
 
 #[test]
-fn a_transaction_the_revenuecat_webhook_credited_first_is_not_credited_again() {
+fn a_transaction_the_validate_call_credited_first_is_not_credited_again() {
     let world = World::linked();
     let id = block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap();
     let row = block_on(purchase::read(&world.d1, &id)).unwrap().unwrap();
@@ -106,7 +106,7 @@ fn a_transaction_the_revenuecat_webhook_credited_first_is_not_credited_again() {
 }
 
 #[test]
-fn the_webhook_after_the_ledger_finds_the_grant_and_adds_nothing() {
+fn the_validate_call_after_the_ledger_finds_the_grant_and_adds_nothing() {
     let world = World::linked();
     world.credit(&transaction()).unwrap();
     let id = block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap();
@@ -142,7 +142,7 @@ fn naming(token: &str) -> LedgerTransaction {
 }
 
 #[test]
-fn a_revenuecat_apps_purchase_names_its_mako_user_and_credits_the_d1_balance_once() {
+fn an_older_builds_purchase_names_its_mako_user_and_credits_the_d1_balance_once() {
     let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
     world.d1.user(APP, USER, 2);
     let outcome = world.credit(&naming(&USER.to_uppercase())).unwrap();
@@ -153,12 +153,12 @@ fn a_revenuecat_apps_purchase_names_its_mako_user_and_credits_the_d1_balance_onc
     }
     assert_eq!(world.d1.d1_balance(APP, USER), 2 + PACK_CREDITS);
     assert_eq!(world.purchases(), 1);
-    assert_eq!(block_on(purchase::revenuecat_status(&world.d1, APP, TX)).unwrap().as_deref(), Some("completed"));
+    assert_eq!(block_on(purchase::store_status(&world.d1, APP, TX)).unwrap().as_deref(), Some("completed"));
     assert_eq!(world.wallets.count("POST /grant"), 0);
 }
 
 #[test]
-fn a_revenuecat_apps_purchase_for_a_linked_user_goes_to_that_users_wallet() {
+fn an_older_builds_purchase_for_a_linked_user_goes_to_that_users_wallet() {
     let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
     world.d1.user(APP, USER, 0);
     world.link(USER, MIDGAR, "linked");
@@ -172,7 +172,8 @@ fn a_revenuecat_apps_purchase_for_a_linked_user_goes_to_that_users_wallet() {
 fn the_validate_call_crediting_the_mako_user_first_leaves_nothing_for_the_ledger() {
     let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
     world.d1.user(APP, USER, 0);
-    block_on(purchase::record_and_complete_locally(&world.d1, APP, USER, "small", PACK_CREDITS as u32, 299, TX)).unwrap();
+    let id = block_on(purchase::record_pending(&world.d1, APP, USER, "small", PACK_CREDITS as u32, 299, TX)).unwrap();
+    assert!(block_on(purchase::complete_locally(&world.d1, &id)).unwrap());
     assert!(matches!(world.credit(&naming(USER)).unwrap(), Outcome::Duplicate { .. }));
     assert_eq!(world.d1.d1_balance(APP, USER), PACK_CREDITS);
 }
@@ -285,7 +286,7 @@ fn a_crash_after_any_write_loses_and_doubles_nothing() {
         assert_eq!(world.entries(&format!("tx:{TX}")), 1, "ticks {ticks}");
         assert_eq!(world.wallets.balance(MIDGAR, APP), PACK_CREDITS, "ticks {ticks}");
         assert_eq!(world.purchases(), 1, "ticks {ticks}");
-        assert_eq!(block_on(purchase::revenuecat_status(&world.d1, APP, TX)).unwrap().as_deref(), Some("completed"), "ticks {ticks}");
+        assert_eq!(block_on(purchase::store_status(&world.d1, APP, TX)).unwrap().as_deref(), Some("completed"), "ticks {ticks}");
         assert!(world.wallets.verified(MIDGAR));
         if finished {
             break;

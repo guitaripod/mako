@@ -33,16 +33,12 @@ pub enum InstallOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurchaseKind {
     CreditPack,
-    Subscription,
-    Unknown,
 }
 
 impl PurchaseKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             PurchaseKind::CreditPack => "credit_pack",
-            PurchaseKind::Subscription => "subscription",
-            PurchaseKind::Unknown => "unknown",
         }
     }
 }
@@ -267,7 +263,7 @@ pub async fn find_install_by_user(
 
 /// Copies the buyer's campaign and keyword onto a validated purchase. A no-op
 /// for identities with no attribution row, and idempotent on `purchase_id`, so
-/// a replayed webhook cannot inflate a keyword's payer or revenue counts.
+/// a replayed credit cannot inflate a keyword's payer or revenue counts.
 pub async fn tag_purchase(
     db: &D1Database,
     app_id: &str,
@@ -359,8 +355,8 @@ pub async fn carry_attribution_across_merge(
 }
 
 /// The tenant's post-commission share of a store sale, when configured. Used to
-/// net out purchases RevenueCat reported no `takehome_percentage` for; absent, the
-/// report says net is unknown rather than guessing a commission.
+/// net out purchases recorded without a net amount; absent, the report says net
+/// is unknown rather than guessing a commission.
 pub async fn store_net_share(db: &D1Database, app_id: &str) -> Option<f64> {
     db.prepare("SELECT store_net_share FROM apps WHERE app_id = ?1")
         .bind(&[app_id.into()])
@@ -477,28 +473,8 @@ pub async fn attribution_totals(
     })
 }
 
-/// A store price in USD as integer cents. RevenueCat omits the price on some
-/// events; an unknown price contributes zero revenue rather than a guess.
-pub fn usd_to_cents(price: Option<f64>) -> i64 {
-    match price {
-        Some(p) if p.is_finite() && p > 0.0 => (p * 100.0).round() as i64,
-        _ => 0,
-    }
-}
-
-/// Net (post-store-commission) cents, using RevenueCat's `takehome_percentage`.
-/// `None` when RevenueCat did not send a share, so the report can say how much of
-/// its net figure is unknown instead of inventing a commission.
-pub fn net_cents(gross_cents: i64, takehome_percentage: Option<f64>) -> Option<i64> {
-    let share = takehome_percentage?;
-    if !share.is_finite() || share <= 0.0 || share > 1.0 {
-        return None;
-    }
-    Some((gross_cents as f64 * share).round() as i64)
-}
-
-/// Total net revenue: RevenueCat-reported net, plus the tenant's configured share
-/// of any purchase RevenueCat gave no commission for. `None` when a purchase has
+/// Total net revenue: the net recorded with purchases, plus the tenant's configured
+/// share of any purchase recorded without one. `None` when a purchase has
 /// no reported net and no `apps.store_net_share` is set — an unknown net must read
 /// as unknown, never as zero, or a profitable keyword looks like a dead one.
 pub fn effective_net_cents(
@@ -753,25 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn converts_store_prices_to_cents() {
-        assert_eq!(usd_to_cents(Some(4.99)), 499);
-        assert_eq!(usd_to_cents(Some(49.99)), 4999);
-        assert_eq!(usd_to_cents(Some(0.0)), 0);
-        assert_eq!(usd_to_cents(None), 0);
-        assert_eq!(usd_to_cents(Some(-1.0)), 0);
-        assert_eq!(usd_to_cents(Some(f64::NAN)), 0);
-    }
-
-    #[test]
-    fn nets_out_the_store_commission_only_when_known() {
-        assert_eq!(net_cents(4999, Some(0.85)), Some(4249));
-        assert_eq!(net_cents(499, Some(0.7)), Some(349));
-        assert_eq!(net_cents(4999, None), None);
-        assert_eq!(net_cents(4999, Some(0.0)), None);
-        assert_eq!(net_cents(4999, Some(1.5)), None);
-    }
-
-    #[test]
     fn per_payer_guards_against_zero_payers() {
         assert_eq!(per_payer_cents(0, 0), None);
         assert_eq!(per_payer_cents(4999, 0), None);
@@ -826,8 +783,6 @@ mod tests {
     #[test]
     fn purchase_kinds_have_stable_storage_labels() {
         assert_eq!(PurchaseKind::CreditPack.as_str(), "credit_pack");
-        assert_eq!(PurchaseKind::Subscription.as_str(), "subscription");
-        assert_eq!(PurchaseKind::Unknown.as_str(), "unknown");
     }
 
     fn rollup_row() -> serde_json::Value {

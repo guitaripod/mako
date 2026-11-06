@@ -18,7 +18,6 @@ IDENTITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mako-local-identity.XXXXXX")"
 IDENTITY_CONFIG="$IDENTITY_DIR/wrangler.toml"
 LEDGER_CONFIG="$IDENTITY_DIR/wrangler-ledger.toml"
 MINTED="$IDENTITY_DIR/minted.json"
-WEBHOOK_SECRET="local-webhook-secret"
 LOOKUP_SECRET="local-lookup-secret"
 VERIFY_SECRET="local-verify-secret"
 LIFECYCLE_SECRET="local-lifecycle-secret"
@@ -122,7 +121,6 @@ fi
 cat > "$DEV_VARS" <<EOF
 ENVIRONMENT=development
 MOCK_PROVIDERS=1
-REVENUECAT_WEBHOOK_AUTH=$WEBHOOK_SECRET
 LEDGER_VERIFY_SECRET=$VERIFY_SECRET
 EOF
 
@@ -147,6 +145,8 @@ compatibility_date = "2024-01-01"
 
 [vars]
 VERIFY_SECRET = "$VERIFY_SECRET"
+PREMIUM_IDS = "$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["ids"]["premium"].lower())' "$MINTED")"
+DOWN_IDS = "$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["ids"]["premium_down"].lower())' "$MINTED")"
 TOML
 }
 
@@ -501,8 +501,8 @@ check "follow-up without a bucket costs the flat price" 1 "$(json_get credits_ch
 check "no bucket means null free_remaining" null "$(json_get free_remaining)"
 
 call POST /v1/run/chat.completion key_premium "$READING"
-check "premium user is not charged" 0 "$(json_get credits_charged)"
-check "premium does not use the weekly bucket" 2 "$(json_get free_remaining)"
+check "a user without a Midgar ID is not premium, even with a fresh cached answer" 1 "$(json_get free_remaining)"
+check "so the reading takes a free one from the bucket" 0 "$(json_get credits_charged)"
 
 echo "== art"
 sql_json "UPDATE user_credits SET balance = 5 WHERE user_id = 'u-free'" >/dev/null
@@ -535,8 +535,7 @@ call POST /v1/images/generations key_free '{"style":"ink","scene":"MOCK_NO_IMAGE
 check "a provider that makes no image answers 422" 422 "$STATUS"
 check "a failed art request is not charged" 4 "$(balance_of key_free)"
 call POST /v1/images/generations key_premium '{"style":"gilded","scene":"A key in a door","n":2,"idempotency_key":"p1"}'
-check "premium art 200 with two images" 2 "$(python3 -I -c 'import json;print(len(json.load(open("'"$BODY"'"))["data"]))')"
-check "premium art is free" 0 "$(json_get credits_charged)"
+check "art for a user without a Midgar ID is paid, and an empty balance is refused" 402 "$STATUS"
 check "styled art stored no prompt" 0 "$(sql_value "SELECT COUNT(*) FROM usage_records WHERE app_id = 'dreameater' AND request_type = 'art' AND prompt != ''")"
 check "art wrote usage rows" 1 "$(sql_value "SELECT CASE WHEN COUNT(*) >= 2 THEN 1 ELSE 0 END FROM usage_records WHERE app_id = 'dreameater' AND request_type = 'art'")"
 
@@ -568,41 +567,24 @@ check "a paid edit costs credits_per_edit" 79 "$(balance_of key_pixie pixie)"
 check "usage rows name the model that served" 1 "$(sql_value "SELECT CASE WHEN COUNT(*) >= 6 THEN 1 ELSE 0 END FROM usage_records WHERE app_id = 'pixie' AND model = 'mock'")"
 check "the paid edit's ledger line names the tier" 1 "$(sql_value "SELECT COUNT(*) FROM credit_transactions WHERE user_id = 'u-pixie' AND type = 'spend' AND description = 'Generated 1 image(s), standard'")"
 
-echo "== purchases"
-EVENT='{"api_version":"1.0","event":{"app_user_id":"u-free","environment":"PRODUCTION","event_timestamp_ms":1,"id":"ev1","is_family_share":false,"product_id":"com.dreameater.credits.small","purchased_at_ms":1,"store":"APP_STORE","transaction_id":"tx-1","type":"NON_RENEWING_PURCHASE"}}'
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer wrong" --data "$EVENT")
-check "a wrong webhook secret is 401" 401 "$STATUS"
+echo "== purchases from builds older than MidgarStore"
 BEFORE=$(balance_of key_free)
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$EVENT")
-check "a consumable purchase event is accepted" 200 "$STATUS"
-check "the webhook credited the pack" $((BEFORE + 5)) "$(balance_of key_free)"
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$EVENT")
-check "the same event again credits nothing" $((BEFORE + 5)) "$(balance_of key_free)"
-call POST /v1/credits/purchase/revenuecat/validate key_free '{"pack_id":"small","purchase_token":"tx-1","product_id":"com.dreameater.credits.small","platform":"ios"}'
-check "the client validate call for the same transaction does not credit again" $((BEFORE + 5)) "$(balance_of key_free)"
-call POST /v1/credits/purchase/revenuecat/validate key_free '{"pack_id":"large","purchase_token":"tx-2","product_id":"com.dreameater.credits.large","platform":"ios"}'
-check "validate first credits the large pack" $((BEFORE + 20)) "$(balance_of key_free)"
-LARGE_EVENT=$(echo "$EVENT" | sed -e 's/tx-1/tx-2/' -e 's/credits.small/credits.large/')
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$LARGE_EVENT")
-check "the webhook after validate credits nothing more" $((BEFORE + 20)) "$(balance_of key_free)"
-
-REFUND=$(echo "$LARGE_EVENT" | sed -e 's/NON_RENEWING_PURCHASE/CANCELLATION/')
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$REFUND")
-check "a refund reverses the pack" $((BEFORE + 5)) "$(balance_of key_free)"
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$REFUND")
-check "a refund is reversed only once" $((BEFORE + 5)) "$(balance_of key_free)"
-check "the reversal is in the ledger under its refund reference" 1 "$(sql_value "SELECT COUNT(*) FROM credit_transactions WHERE reference_id = 'refund:tx-2'")"
-for n in $(seq 1 15); do
-  call POST /v1/run/chat.completion key_free "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}" >/dev/null
+for path in /v1/credits/purchase/validate /v1/credits/purchase/revenuecat/validate; do
+  call POST "$path" key_free '{"pack_id":"small","purchase_token":"tx-1","product_id":"com.dreameater.credits.small","platform":"ios"}'
+  check "an unsigned validate on $path is pending" 409 "$STATUS"
+  check "with the code the apps retry on" credit_pending "$(json_get error/code)"
+  check "and the text they show" yes "$(json_get error/message | grep -q 'credited shortly' && echo yes || echo no)"
+  call POST "$path" key_free '{"pack_id":"small","purchase_token":"tx-1","product_id":"com.dreameater.credits.large","platform":"ios"}'
+  check "a product that is not the pack is still refused on $path" 400 "$STATUS"
+  call POST "$path" key_free '{"pack_id":"small","purchase_token":"","product_id":"com.dreameater.credits.small","platform":"ios"}'
+  check "an empty purchase token is still refused on $path" 400 "$STATUS"
+  call POST "$path" key_free '{"pack_id":"small","purchase_token":"tx-1","product_id":"com.dreameater.credits.small","platform":"web"}'
+  check "an unknown platform is still refused on $path" 400 "$STATUS"
 done
-SMALL_REFUND=$(echo "$EVENT" | sed -e 's/NON_RENEWING_PURCHASE/CANCELLATION/')
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$SMALL_REFUND")
-check "a refund never takes the balance below zero" 0 "$(balance_of key_free)"
-
-PIXIE_EVENT=$(echo "$EVENT" | sed -e 's/u-free/u-pixie/' -e 's/com.dreameater.credits.small/com.guitaripod.pixie.credits.starter/' -e 's/tx-1/tx-pixie/')
-PIXIE_BEFORE=$(balance_of key_pixie pixie)
-STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$PIXIE_EVENT")
-check "another tenant's consumable event still only tags revenue" "$PIXIE_BEFORE" "$(balance_of key_pixie pixie)"
+check "nothing was credited" "$BEFORE" "$(balance_of key_free)"
+check "and no purchase row was written" 0 "$(sql_value "SELECT COUNT(*) FROM credit_purchases WHERE payment_id = 'tx-1'")"
+STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" --data '{}')
+check "the RevenueCat webhook route is gone" 404 "$STATUS"
 
 echo "== privacy page"
 STATUS=$(curl -s -o "$BODY" -w '%{http_code}' "$BASE/privacy/dreameater")

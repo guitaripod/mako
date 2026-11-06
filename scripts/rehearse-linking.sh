@@ -304,7 +304,7 @@ sql_file "$SEED" || { echo "FAIL  the links did not queue"; tail -5 "$STATE/wran
 check "every user has a moving link" "$USERS" "$(value "SELECT COUNT(*) FROM wallet_links WHERE state = 'moving'")"
 echo "UPDATE credit_purchases SET created_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') WHERE status = 'pending' AND payment_provider = 'revenuecat';" > "$STATE/young.sql"
 sql_file "$STATE/young.sql" || { echo "FAIL  the pending purchases could not be made young"; exit 1; }
-echo "      pending RevenueCat purchases in the copy were made young, so the cron leaves them out of the sums"
+echo "      pending App Store purchases in the copy were made young, so the cron leaves them out of the sums"
 
 echo "== starting wrangler dev --local with WALLET_LINKING on"
 if [ -f "$DEV_VARS" ]; then

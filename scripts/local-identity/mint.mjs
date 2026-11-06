@@ -6,6 +6,8 @@ const SECOND_ID = "0194F3A2-7B1C-4D2E-9A60-3C5E8F1B2D48";
 const NATIVE_ID = "0194F3A2-7B1C-4D2E-9A60-3C5E8F1B2D49";
 const DEVELOPMENT_ID = "0194F3A2-7B1C-4D2E-9A60-3C5E8F1B2D4A";
 const UNKNOWN_ID = "0194F3A2-7B1C-4D2E-9A60-3C5E8F1B2D4B";
+const PREMIUM_ID = "0194F3A2-7B1C-4D2E-9A60-3C5E8F1B2D4E";
+const PREMIUM_DOWN_ID = "0194F3A2-7B1C-4D2E-9A60-3C5E8F1B2D4F";
 
 function base64Url(bytes) {
   return Buffer.from(bytes).toString("base64url");
@@ -67,7 +69,9 @@ process.stdout.write(
       native_development: await sign(pair, KID, claims(now, { sub: DEVELOPMENT_ID, att: "development" })),
       native_wrong_app: await sign(pair, KID, claims(now, { sub: NATIVE_ID, app: "pay-day" })),
       native_expired: await sign(pair, KID, claims(now - 7200, { sub: NATIVE_ID })),
+      premium: await sign(pair, KID, claims(now, { sub: PREMIUM_ID })),
+      premium_down: await sign(pair, KID, claims(now, { sub: PREMIUM_DOWN_ID })),
     },
-    ids: { first: MIDGAR_ID, second: SECOND_ID, native: NATIVE_ID, development: DEVELOPMENT_ID, unknown: UNKNOWN_ID },
+    ids: { first: MIDGAR_ID, second: SECOND_ID, native: NATIVE_ID, development: DEVELOPMENT_ID, unknown: UNKNOWN_ID, premium: PREMIUM_ID, premium_down: PREMIUM_DOWN_ID },
   }),
 );

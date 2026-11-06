@@ -1,8 +1,7 @@
 use futures::executor::block_on;
 use serde_json::json;
 
-use super::pack_credit::{credit_pack, refund_pack};
-use super::d1::D1Exec;
+use super::pack_credit::credit_pack;
 use super::pack_refund;
 use super::purchase;
 use super::testing::{race, interleavings, Budget, FakeWallets, Flaky, LocalD1, Pick, Stepped, TestLedger};
@@ -18,15 +17,12 @@ const MIDGAR: &str = "0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d47";
 const TX: &str = "2000000123";
 const OTHER_TX: &str = "2000000124";
 
-/// The ways a store transaction gets credited. The `Local` paths are the ones that credit a D1 balance: the RevenueCat
-/// webhook, the legacy validate call and the ledger grant of a transaction naming the mako user, for a user with no wallet.
+/// The ways a store transaction gets credited. `LocalLedgerGrant` is the ledger grant of a transaction naming the mako
+/// user, which credits the D1 balance of a user with no wallet.
 #[derive(Debug, Clone, Copy)]
 enum CreditPath {
     LedgerGrant,
     SignedValidate,
-    RevenueCatPurchase,
-    LocalRevenueCatPurchase,
-    LocalLegacyValidate,
     LocalLedgerGrant,
 }
 
@@ -37,13 +33,6 @@ enum Accounts {
     Local,
 }
 
-/// The ways a store transaction gets refunded.
-#[derive(Debug, Clone, Copy)]
-enum RefundPath {
-    Ledger,
-    RevenueCat,
-}
-
 /// What the world holds before the two paths run.
 #[derive(Debug, Clone, Copy)]
 enum Start {
@@ -52,18 +41,14 @@ enum Start {
     Credited,
 }
 
-/// A credit path, a refund path and the account both act on.
-type Case = (CreditPath, RefundPath, Accounts);
+/// A credit path and the account it and the ledger's refund act on.
+type Case = (CreditPath, Accounts);
 
-const CASES: [Case; 8] = [
-    (CreditPath::LedgerGrant, RefundPath::Ledger, Accounts::Wallet),
-    (CreditPath::SignedValidate, RefundPath::Ledger, Accounts::Wallet),
-    (CreditPath::RevenueCatPurchase, RefundPath::RevenueCat, Accounts::Wallet),
-    (CreditPath::LedgerGrant, RefundPath::RevenueCat, Accounts::Wallet),
-    (CreditPath::SignedValidate, RefundPath::RevenueCat, Accounts::Local),
-    (CreditPath::LocalRevenueCatPurchase, RefundPath::RevenueCat, Accounts::Local),
-    (CreditPath::LocalLegacyValidate, RefundPath::RevenueCat, Accounts::Local),
-    (CreditPath::LocalLedgerGrant, RefundPath::RevenueCat, Accounts::Local),
+const CASES: [Case; 4] = [
+    (CreditPath::LedgerGrant, Accounts::Wallet),
+    (CreditPath::SignedValidate, Accounts::Wallet),
+    (CreditPath::SignedValidate, Accounts::Local),
+    (CreditPath::LocalLedgerGrant, Accounts::Local),
 ];
 
 /// Context switches a search that also crashes a flow after every write allows between the two flows.
@@ -188,7 +173,7 @@ impl World {
     }
 
     fn status(&self) -> Option<String> {
-        block_on(purchase::revenuecat_status(self.d1, APP, TX)).unwrap()
+        block_on(purchase::store_status(self.d1, APP, TX)).unwrap()
     }
 }
 
@@ -205,30 +190,11 @@ async fn credit(path: CreditPath, world: &World, budget: &Budget) -> Result<(), 
             if pack_refund::refunded_error(&d1, APP, TX).await?.is_some() {
                 return Ok(());
             }
-            if already_settled(purchase::revenuecat_status(&d1, APP, TX).await?.as_deref()) {
+            if already_settled(purchase::store_status(&d1, APP, TX).await?.as_deref()) {
                 return Ok(());
             }
             let ledger = TestLedger { db: &d1, wallets: &wallets };
             credit_pack(&d1, &ledger, APP, "u1", "small", PACK_CREDITS as u32, 299, TX).await?;
-        }
-        CreditPath::RevenueCatPurchase => {
-            let ledger = TestLedger { db: &d1, wallets: &wallets };
-            credit_pack(&d1, &ledger, APP, "u1", "small", PACK_CREDITS as u32, 299, TX).await?;
-        }
-        CreditPath::LocalRevenueCatPurchase => {
-            if pack_refund::is_claimed(&d1, APP, TX).await? || purchase::revenuecat_status(&d1, APP, TX).await?.is_some() {
-                return Ok(());
-            }
-            local_credit(&d1).await?;
-        }
-        CreditPath::LocalLegacyValidate => {
-            if purchase::revenuecat_status(&d1, APP, TX).await?.as_deref() == Some("completed") {
-                return Ok(());
-            }
-            if pack_refund::refunded_error(&d1, APP, TX).await?.is_some() {
-                return Ok(());
-            }
-            local_credit(&d1).await?;
         }
         CreditPath::LocalLedgerGrant => {
             let naming_the_user = LedgerTransaction { app_account_token: Some("u1".to_string()), ..transaction(TX) };
@@ -238,28 +204,11 @@ async fn credit(path: CreditPath, world: &World, budget: &Budget) -> Result<(), 
     Ok(())
 }
 
-/// What the webhook's local branch and the legacy validate call end with: the purchase row and the D1 credit, where a
-/// refund claimed in the meantime is the refusal both answer without a credit.
-async fn local_credit(d1: &impl D1Exec) -> Result<(), AppError> {
-    match purchase::record_and_complete_locally(d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX).await {
-        Ok(_) | Err(AppError::Refunded(_)) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// One refund path of the transaction, parked and budgeted like `credit`.
-async fn refund(path: RefundPath, world: &World, budget: &Budget) -> Result<(), AppError> {
+/// The ledger's refund of the transaction, parked and budgeted like `credit`.
+async fn refund(world: &World, budget: &Budget) -> Result<(), AppError> {
     let (flaky_d1, flaky_wallets) = (Flaky { inner: world.d1, budget }, Flaky { inner: &world.wallets, budget });
     let (d1, wallets) = (Stepped { inner: &flaky_d1 }, Stepped { inner: &flaky_wallets });
-    match path {
-        RefundPath::Ledger => {
-            ledger_refund::reverse(&d1, &wallets, &refunded(TX)).await?;
-        }
-        RefundPath::RevenueCat => {
-            let ledger = TestLedger { db: &d1, wallets: &wallets };
-            refund_pack(&d1, &ledger, APP, "small", TX).await?;
-        }
-    }
+    ledger_refund::reverse(&d1, &wallets, &refunded(TX)).await?;
     Ok(())
 }
 
@@ -307,10 +256,10 @@ fn budget(ticks: Option<usize>) -> Budget {
 /// Runs one interleaving of a credit and a refund with the crash budgets, retries every delivery that failed once the
 /// other one is done, checks the end state, and reports whether a crash was injected.
 fn run(pair: Case, start: Start, crash: Crash, prefix: &[usize], crashed: &mut bool) -> Vec<Pick> {
-    let world = World::new(start, pair.2);
+    let world = World::new(start, pair.1);
     let (credit_budget, refund_budget) = (budget(crash.credit), budget(crash.refund));
     let (credited, refunded, picks) =
-        race(credit(pair.0, &world, &credit_budget), refund(pair.1, &world, &refund_budget), prefix);
+        race(credit(pair.0, &world, &credit_budget), refund(&world, &refund_budget), prefix);
     let context = format!("{pair:?} {start:?} prefix {prefix:?} crash credit {:?} refund {:?}", crash.credit, crash.refund);
     if credit_budget.exhausted() || refund_budget.exhausted() {
         *crashed = true;
@@ -327,7 +276,7 @@ fn run(pair: Case, start: Start, crash: Crash, prefix: &[usize], crashed: &mut b
         block_on(credit(pair.0, &world, &credit_budget)).unwrap_or_else(|e| panic!("{context}: the credit's retry failed: {e:?}"));
     }
     if refunded.is_err() {
-        block_on(refund(pair.1, &world, &refund_budget)).unwrap_or_else(|e| panic!("{context}: the refund's retry failed: {e:?}"));
+        block_on(refund(&world, &refund_budget)).unwrap_or_else(|e| panic!("{context}: the refund's retry failed: {e:?}"));
     }
     assert_linearizable(&world, &context);
     picks
@@ -380,12 +329,12 @@ fn every_interleaving_of_a_signed_validate_and_a_ledger_refund_ends_in_an_allowe
 }
 
 #[test]
-fn every_interleaving_of_a_revenuecat_purchase_and_a_revenuecat_refund_ends_in_an_allowed_state() {
+fn every_interleaving_of_a_signed_validate_and_a_ledger_refund_for_an_unlinked_user_ends_in_an_allowed_state() {
     check_every_interleaving(CASES[2]);
 }
 
 #[test]
-fn every_interleaving_of_a_ledger_grant_and_a_revenuecat_refund_ends_in_an_allowed_state() {
+fn every_interleaving_of_a_ledger_grant_and_a_ledger_refund_for_an_unlinked_user_ends_in_an_allowed_state() {
     check_every_interleaving(CASES[3]);
 }
 
@@ -400,62 +349,22 @@ fn a_crash_in_any_interleaving_of_a_signed_validate_and_a_ledger_refund_is_finis
 }
 
 #[test]
-fn a_crash_in_any_interleaving_of_a_revenuecat_purchase_and_a_revenuecat_refund_is_finished_by_the_retry() {
+fn a_crash_in_any_interleaving_of_a_signed_validate_and_a_ledger_refund_for_an_unlinked_user_is_finished_by_the_retry() {
     check_every_interleaving_with_a_crash(CASES[2]);
 }
 
 #[test]
-fn a_crash_in_any_interleaving_of_a_ledger_grant_and_a_revenuecat_refund_is_finished_by_the_retry() {
+fn a_crash_in_any_interleaving_of_a_ledger_grant_and_a_ledger_refund_for_an_unlinked_user_is_finished_by_the_retry() {
     check_every_interleaving_with_a_crash(CASES[3]);
 }
 
-#[test]
-fn every_interleaving_of_a_signed_validate_and_a_revenuecat_refund_for_an_unlinked_user_ends_in_an_allowed_state() {
-    check_every_interleaving(CASES[4]);
-}
-
-#[test]
-fn every_interleaving_of_a_revenuecat_purchase_and_a_revenuecat_refund_for_an_unlinked_user_ends_in_an_allowed_state() {
-    check_every_interleaving(CASES[5]);
-}
-
-#[test]
-fn every_interleaving_of_a_legacy_validate_and_a_revenuecat_refund_for_an_unlinked_user_ends_in_an_allowed_state() {
-    check_every_interleaving(CASES[6]);
-}
-
-#[test]
-fn a_crash_in_any_interleaving_of_a_signed_validate_and_a_revenuecat_refund_for_an_unlinked_user_is_finished_by_the_retry() {
-    check_every_interleaving_with_a_crash(CASES[4]);
-}
-
-#[test]
-fn a_crash_in_any_interleaving_of_a_revenuecat_purchase_and_a_revenuecat_refund_for_an_unlinked_user_is_finished_by_the_retry() {
-    check_every_interleaving_with_a_crash(CASES[5]);
-}
-
-#[test]
-fn a_crash_in_any_interleaving_of_a_legacy_validate_and_a_revenuecat_refund_for_an_unlinked_user_is_finished_by_the_retry() {
-    check_every_interleaving_with_a_crash(CASES[6]);
-}
-
-#[test]
-fn every_interleaving_of_a_ledger_grant_and_a_revenuecat_refund_for_an_unlinked_user_ends_in_an_allowed_state() {
-    check_every_interleaving(CASES[7]);
-}
-
-#[test]
-fn a_crash_in_any_interleaving_of_a_ledger_grant_and_a_revenuecat_refund_for_an_unlinked_user_is_finished_by_the_retry() {
-    check_every_interleaving_with_a_crash(CASES[7]);
-}
-
-/// Every interleaving of two refund deliveries of one credited transaction, from the two paths that reverse a pack.
-fn two_refunds(first: RefundPath, second: RefundPath, accounts: Accounts) -> usize {
+/// Every interleaving of two deliveries of the ledger's refund of one credited transaction.
+fn two_refunds(accounts: Accounts) -> usize {
     interleavings(None, |prefix| {
         let world = World::new(Start::Credited, accounts);
         let (unhindered, other) = (Budget::unlimited(), Budget::unlimited());
-        let (one, two, picks) = race(refund(first, &world, &unhindered), refund(second, &world, &other), prefix);
-        let context = format!("{first:?} and {second:?} {accounts:?} prefix {prefix:?}");
+        let (one, two, picks) = race(refund(&world, &unhindered), refund(&world, &other), prefix);
+        let context = format!("two refunds {accounts:?} prefix {prefix:?}");
         one.unwrap_or_else(|e| panic!("{context}: {e:?}"));
         two.unwrap_or_else(|e| panic!("{context}: {e:?}"));
         assert_eq!((world.status().as_deref(), world.grants(), world.reversals()), (Some("refunded"), 1, 1), "{context}");
@@ -466,14 +375,9 @@ fn two_refunds(first: RefundPath, second: RefundPath, accounts: Accounts) -> usi
 
 #[test]
 fn every_interleaving_of_two_refund_deliveries_reverses_the_pack_once() {
-    for (first, second, accounts) in [
-        (RefundPath::Ledger, RefundPath::Ledger, Accounts::Wallet),
-        (RefundPath::Ledger, RefundPath::RevenueCat, Accounts::Wallet),
-        (RefundPath::RevenueCat, RefundPath::RevenueCat, Accounts::Wallet),
-        (RefundPath::RevenueCat, RefundPath::RevenueCat, Accounts::Local),
-    ] {
-        let count = two_refunds(first, second, accounts);
-        eprintln!("interleavings of two refunds {first:?} {second:?} {accounts:?}: {count}");
+    for accounts in [Accounts::Wallet, Accounts::Local] {
+        let count = two_refunds(accounts);
+        eprintln!("interleavings of two refunds {accounts:?}: {count}");
         assert!(count >= 10);
     }
 }
@@ -508,18 +412,18 @@ const ORDERS: [Order; 3] = [Order::CrashRetryThenOther, Order::CrashOtherThenRet
 /// One crash of one path, its retry, and the other path, run one after the other in the given order. Returns whether a
 /// crash was injected.
 fn crash_in_sequence(pair: Case, start: Start, credit_crashes: bool, ticks: usize, order: Order) -> bool {
-    let world = World::new(start, pair.2);
+    let world = World::new(start, pair.1);
     let context = format!("{pair:?} {start:?} {order:?} credit crashes {credit_crashes} after {ticks} ticks");
     let crashing_path = |budget: &Budget| {
         if credit_crashes {
             block_on(credit(pair.0, &world, budget))
         } else {
-            block_on(refund(pair.1, &world, budget))
+            block_on(refund(&world, budget))
         }
     };
     let other_path = || {
         let unhindered = Budget::unlimited();
-        let outcome = if credit_crashes { block_on(refund(pair.1, &world, &unhindered)) } else { block_on(credit(pair.0, &world, &unhindered)) };
+        let outcome = if credit_crashes { block_on(refund(&world, &unhindered)) } else { block_on(credit(pair.0, &world, &unhindered)) };
         outcome.unwrap_or_else(|e| panic!("{context}: the other path failed: {e:?}"));
     };
     let crash = || {

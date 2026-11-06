@@ -13,7 +13,8 @@ pub struct TenantPolicy {
     pub store_images: bool,
     pub art_credits: Option<u32>,
     pub strict_purchases: bool,
-    /// Premium needs the tenant's own premium entitlement in RevenueCat, not any entitlement (migration 036).
+    /// Premium needs the tenant's own premium entitlement, and a ledger outage falls back to the last answer from the
+    /// previous 24 hours instead of treating a paying user as free (migration 036).
     pub strict_premium: bool,
 }
 

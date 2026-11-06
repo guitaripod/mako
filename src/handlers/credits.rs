@@ -1,11 +1,9 @@
-use worker::{Request, Response, RouteContext, Result, Env, Fetch, Method, Headers};
+use worker::{Request, Response, RouteContext, Result, Env};
 use crate::error::AppError;
 use crate::auth;
-use crate::wallet::pack_credit::{credit_pack, refund_pack, Credit};
-use crate::wallet::pack_refund::{self, Settlement};
 use crate::credits::{
     get_user_transactions, get_credit_packs, get_credit_packs_for_app,
-    record_purchase, record_and_complete_purchase, estimate_image_cost
+    record_purchase, estimate_image_cost
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -920,26 +918,32 @@ pub async fn get_stripe_config(_req: Request, ctx: RouteContext<()>) -> Result<R
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidateRevenueCatPurchaseRequest {
+pub struct ValidatePurchaseRequest {
     pub pack_id: String,
     pub purchase_token: String,
     pub product_id: String,
-    pub platform: String, // "ios" or "android"
-    /// The StoreKit 2 signed transaction (JWS) of the purchase. When present, mako verifies it through the ledger
-    /// instead of asking RevenueCat.
+    pub platform: String,
+    /// The StoreKit 2 signed transaction (JWS) of the purchase, which the ledger verifies. Builds from before
+    /// MidgarStore send none; their packs are credited from Apple's notification through the ledger's grant instead.
     #[serde(default)]
     pub signed_transaction: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidateRevenueCatPurchaseResponse {
+pub struct ValidatePurchaseResponse {
     pub success: bool,
     pub purchase_id: String,
     pub credits_added: u32,
     pub new_balance: i32,
 }
 
-pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+/// `POST /v1/credits/purchase/validate` and its original path `POST /v1/credits/purchase/revenuecat/validate`, which
+/// the apps in the field call: binds the claimed product to the claimed pack of this tenant and credits the pack once
+/// the ledger has verified the StoreKit 2 transaction (`storekit::validate_signed`). A request without a signed
+/// transaction comes from a build older than MidgarStore and is answered `credit_pending` without a grant: Apple's
+/// notification reaches the ledger, whose grant credits the pack to the user named in the transaction's
+/// `appAccountToken`.
+pub async fn validate_purchase(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let env = ctx.env;
 
     let auth = {
@@ -949,30 +953,23 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
             Err(e) => return e.to_response(),
         }
     };
-    let user_id = auth.user_id.clone();
     let app_id = auth.app_id.clone();
 
-    let validate_req: ValidateRevenueCatPurchaseRequest = match req.json().await {
+    let validate_req: ValidatePurchaseRequest = match req.json().await {
         Ok(req) => req,
         Err(e) => return AppError::BadRequest(format!("Invalid request body: {}", e)).to_response(),
     };
-    
-    // Validate platform
+
     if validate_req.platform != "ios" && validate_req.platform != "android" {
         return AppError::BadRequest("Invalid platform. Must be 'ios' or 'android'".to_string()).to_response();
     }
 
-    // An empty token or product id would make the substring verification below
-    // (body.contains) trivially true. Reject before any RevenueCat call.
     if validate_req.purchase_token.trim().is_empty() || validate_req.product_id.trim().is_empty() {
         return AppError::BadRequest("Missing purchase_token or product_id".to_string()).to_response();
     }
 
     let db = env.d1("DB")?;
 
-    // The product id must be this app's pack-product prefix + the claimed pack id.
-    // This binds the price the user paid to the credits they receive, so a real
-    // cheap-pack receipt cannot be replayed to claim an expensive pack.
     let product_prefix = db
         .prepare("SELECT rc_product_prefix FROM apps WHERE app_id = ?1")
         .bind(&[app_id.clone().into()])?
@@ -985,174 +982,26 @@ pub async fn validate_revenuecat_purchase(mut req: Request, ctx: RouteContext<()
         return AppError::BadRequest("product_id does not match pack_id".to_string()).to_response();
     }
 
-    // Find the pack (per-app catalog)
     let packs = get_credit_packs_for_app(&app_id, &db).await;
     let pack = packs
         .iter()
         .find(|p| p.id == validate_req.pack_id)
         .ok_or_else(|| AppError::BadRequest("Invalid pack_id".to_string()))?;
 
-    let total_credits = pack.credits + pack.bonus_credits;
-
     if validate_req.signed_transaction.as_deref().is_some_and(|signed| !signed.trim().is_empty()) {
         return crate::handlers::storekit::validate_signed(&req, &env, &db, &auth, &validate_req, pack).await;
     }
-
-    // Check if this purchase token has already been used
-    let existing_purchase = db.prepare(
-        "SELECT id, status FROM credit_purchases WHERE app_id = ? AND payment_id = ? AND payment_provider = 'revenuecat'"
-    )
-    .bind(&[app_id.clone().into(), validate_req.purchase_token.clone().into()])?
-    .first::<serde_json::Value>(None)
-    .await?;
-    
-    if let Some(existing) = existing_purchase {
-        let status = existing.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status == "completed" {
-            return AppError::AlreadyProcessed("Purchase has already been processed".to_string()).to_response();
-        }
-    }
-    
-    if let Some(refunded) = pack_refund::refunded_error(&db, &app_id, &validate_req.purchase_token).await? {
-        return refunded.to_response();
-    }
-
-    // Verify with RevenueCat BEFORE granting anything. The authenticated webhook
-    // (revenuecat_webhook) is the authoritative, idempotent source of truth; this
-    // client path is a fast-track that must never grant on an unverified or failed check.
-    let mut answers = Vec::new();
-    for customer in revenuecat_customers(&user_id, auth.account.midgar_id()) {
-        let answer = validate_with_revenuecat(
-            &env,
-            &db,
-            &app_id,
-            &customer,
-            &validate_req.purchase_token,
-            &validate_req.product_id,
-            &validate_req.platform,
-        ).await;
-        let verified = matches!(answer, Ok(PurchaseVerification::Verified));
-        answers.push(answer);
-        if verified {
-            break;
-        }
-    }
-    let validation_result = fold_verifications(answers);
-
-    match validation_result {
-        Ok(PurchaseVerification::Verified) => {}
-        Ok(PurchaseVerification::Rejected) => {
-            return AppError::UnverifiablePurchase("Purchase could not be verified with RevenueCat".to_string()).to_response();
-        }
-        Ok(PurchaseVerification::Defer) => {
-            // Not yet visible in RevenueCat. Do NOT grant here; the authenticated
-            // webhook is the authoritative, idempotent fallback.
-            worker::console_log!("RevenueCat purchase not yet visible, deferring to webhook");
-            return AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response();
-        }
-        Err(e) => {
-            // RevenueCat unreachable: do NOT grant. The webhook will reconcile this purchase.
-            worker::console_log!("RevenueCat validation unavailable, deferring to webhook: {}", e);
-            return AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response();
-        }
-    }
-
-    let ledgers = crate::ledgers::Ledgers::new(&env, &db);
-    let purchase_id = if let crate::ledgers::Account::Wallet { .. } = &auth.account {
-        let credited = credit_pack(
-            &db,
-            &ledgers,
-            &app_id,
-            &user_id,
-            &validate_req.pack_id,
-            total_credits as u32,
-            pack.price_usd_cents as u32,
-            &validate_req.purchase_token,
-        )
-        .await;
-        match credited {
-            Ok(Credit::Credited { purchase_id }) => purchase_id,
-            Ok(Credit::Duplicate) => {
-                return AppError::AlreadyProcessed("Purchase has already been processed".to_string()).to_response();
-            }
-            Ok(Credit::Refunded) | Err(AppError::Refunded(_)) => {
-                return AppError::Refunded(crate::storekit::REFUNDED_MESSAGE.to_string()).to_response();
-            }
-            Err(e) => {
-                worker::console_log!("RevenueCat fast-track could not credit the wallet, deferring to webhook: {:?}", e);
-                return AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response();
-            }
-        }
-    } else {
-        record_and_complete_purchase(
-            &app_id,
-            &user_id,
-            &validate_req.pack_id,
-            total_credits as u32,
-            pack.price_usd_cents as u32,
-            &validate_req.purchase_token,
-            &db,
-        ).await?
-    };
-
-    let new_balance = match ledgers.get_user_balance(&auth.account).await {
-        Ok(balance) => balance,
-        Err(e) => return crate::error::wallet_outage_response(e),
-    };
-
-    Response::from_json(&ValidateRevenueCatPurchaseResponse {
-        success: true,
-        purchase_id,
-        credits_added: total_credits as u32,
-        new_balance,
-    })
+    AppError::CreditPending(crate::storekit::PENDING_MESSAGE.to_string()).to_response()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct RevenueCatSubscriber {
-    entitlements: RevenueCatEntitlements,
-    subscriber: RevenueCatSubscriberInfo,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RevenueCatEntitlements {
-    #[serde(flatten)]
-    all: std::collections::HashMap<String, RevenueCatEntitlement>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RevenueCatEntitlement {
-    expires_date: Option<String>,
-    purchase_date: String,
-    product_identifier: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RevenueCatSubscriberInfo {
-    original_app_user_id: String,
-    #[serde(default)]
-    non_subscriptions: std::collections::HashMap<String, Vec<RevenueCatNonSubscription>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RevenueCatNonSubscription {
-    id: String,
-    is_sandbox: bool,
-    purchase_date: String,
-    store: String,
-}
-
-/// True if `user_id` holds the app's configured premium entitlement, verified
-/// against the RevenueCat REST API (non-spoofable). Only apps with a non-null
-/// `premium_entitlement` incur the RC call; everyone else returns false with a
-/// single indexed D1 read.
+/// True if the caller holds the app's configured premium entitlement, as the purchase ledger lists it for the caller's
+/// Midgar ID (non-spoofable: the ledger verified every transaction with Apple). Only apps with a non-null
+/// `premium_entitlement` ask the ledger; everyone else returns false with a single indexed D1 read, and so does a
+/// caller without a Midgar ID.
 ///
-/// A tenant that is not on strict purchases keeps the original rule: any active
-/// entitlement counts, and any error/404 => false (charge normally), so a
-/// transient RC issue never silently hands out free unlimited usage. A strict
-/// tenant must hold its own configured entitlement, and when RevenueCat cannot be
-/// reached the last answer from the previous 24 hours is used instead of treating
-/// a paying user as free.
+/// A tenant that is not on strict purchases treats a ledger that cannot answer as not premium, so an outage never hands
+/// out free unlimited usage. A strict tenant remembers each answer and, while the ledger cannot answer, uses the last
+/// one from the previous 24 hours instead of treating a paying user as free.
 pub async fn is_premium_user(env: &Env, db: &worker::D1Database, auth: &auth::AuthedUser) -> bool {
     let app_id = auth.app_id.as_str();
     let user_id = auth.user_id.as_str();
@@ -1175,30 +1024,20 @@ pub async fn is_premium_user(env: &Env, db: &worker::D1Database, auth: &auth::Au
     let Some(required) = required else {
         return false;
     };
+    let Some(midgar_id) = premium_midgar_id(auth) else {
+        return false;
+    };
     let policy = crate::tenant::TenantPolicy::from_row(&row);
     let strict = policy.strict_purchases || policy.strict_premium;
-    if let Some(midgar_id) = premium_midgar_id(auth) {
-        if ledger_grants_premium(env, app_id, midgar_id, &premium_tokens(user_id, midgar_id), &required).await {
-            return true;
-        }
-    }
-    let project_id = row.get("rc_project_id").and_then(|v| v.as_str()).unwrap_or("");
-    if project_id.is_empty() {
-        return false;
-    }
-
-    let entitlements = fetch_active_entitlements(env, app_id, project_id, user_id).await;
-    if !strict {
-        return entitlements.map(|items| !items.is_empty()).unwrap_or(false);
-    }
-
-    match entitlements {
-        Some(items) => {
-            let premium = holds_required_entitlement(env, app_id, project_id, &items, &required).await;
+    let answer = ledger_grants_premium(env, app_id, midgar_id, &premium_tokens(user_id, midgar_id), &required).await;
+    match (answer, strict) {
+        (Some(premium), true) => {
             store_premium_cache(db, app_id, user_id, premium).await;
             premium
         }
-        None => read_premium_cache(db, app_id, user_id).await.unwrap_or(false),
+        (Some(premium), false) => premium,
+        (None, true) => read_premium_cache(db, app_id, user_id).await.unwrap_or(false),
+        (None, false) => false,
     }
 }
 
@@ -1207,28 +1046,31 @@ fn premium_midgar_id(auth: &auth::AuthedUser) -> Option<&str> {
     auth.midgar.as_ref().map(|caller| caller.midgar_id.as_str()).or_else(|| auth.account.midgar_id())
 }
 
-/// Whether the purchase ledger lists the tenant's premium entitlement for this Midgar ID. Apps on MidgarStore buy
-/// without RevenueCat, so RevenueCat never learns of their subscriptions; the ledger has every App Store transaction.
-/// A ledger that cannot answer grants nothing here, and RevenueCat is asked as before.
-async fn ledger_grants_premium(env: &Env, app_id: &str, midgar_id: &str, also_tokens: &[String], required: &str) -> bool {
+/// Whether the purchase ledger lists the tenant's premium entitlement for this Midgar ID, in either environment.
+/// `None` when the ledger could not answer for an environment that did not grant it, so the caller can tell an outage
+/// from a no.
+async fn ledger_grants_premium(env: &Env, app_id: &str, midgar_id: &str, also_tokens: &[String], required: &str) -> Option<bool> {
     let Ok(ledger) = crate::storekit::LedgerService::open(env) else {
-        return false;
+        return None;
     };
     let slug = crate::tenant::registry_slug(app_id);
+    let mut answered = true;
     for environment in PREMIUM_ENVIRONMENTS {
         match ledger.entitlements(midgar_id, environment, also_tokens).await {
-            Ok(held) if crate::storekit::grants_entitlement(&held, &slug, required) => return true,
+            Ok(held) if crate::storekit::grants_entitlement(&held, &slug, required) => return Some(true),
             Ok(_) => {}
-            Err(failure) => worker::console_log!("premium: the ledger could not list entitlements for {}: {:?}", app_id, failure),
+            Err(failure) => {
+                answered = false;
+                worker::console_log!("premium: the ledger could not list entitlements for {}: {:?}", app_id, failure);
+            }
         }
     }
-    false
+    answered.then_some(false)
 }
 
-/// The caller's other ids whose purchases are theirs too: the mako user id, which RevenueCat wrote into the
-/// `appAccountToken` of every purchase an app made through it before the app moved to MidgarStore. RevenueCat stops
-/// hearing of those subscriptions once the app drops its SDK, so the ledger, which gets every renewal from Apple, has to
-/// count them. Only a UUID can be a token.
+/// The caller's other ids whose purchases are theirs too: the mako user id, which app builds from before MidgarStore
+/// wrote into the `appAccountToken` of every purchase. The ledger, which gets every renewal from Apple, counts those
+/// subscriptions under that token. Only a UUID can be a token.
 fn premium_tokens(user_id: &str, midgar_id: &str) -> Vec<String> {
     if user_id.eq_ignore_ascii_case(midgar_id) || uuid::Uuid::parse_str(user_id).is_err() {
         return Vec::new();
@@ -1239,77 +1081,6 @@ fn premium_tokens(user_id: &str, midgar_id: &str) -> Vec<String> {
 /// The ledger environments whose entitlements count. Sandbox subscriptions count too, so App Review and TestFlight
 /// buyers get what they paid for.
 const PREMIUM_ENVIRONMENTS: [&str; 2] = ["Production", "Sandbox"];
-
-fn revenuecat_api_key(env: &Env, app_id: &str) -> Option<String> {
-    let key_name = format!("REVENUECAT_IOS_API_KEY_{}", app_id.to_uppercase());
-    env.secret(&key_name)
-        .or_else(|_| env.secret("REVENUECAT_IOS_API_KEY"))
-        .ok()
-        .map(|k| k.to_string())
-}
-
-/// GETs a RevenueCat v2 resource; None on any transport error, non-200 or bad JSON.
-async fn revenuecat_get(api_key: &str, url: &str) -> Option<serde_json::Value> {
-    let headers = Headers::new();
-    headers.set("Authorization", &format!("Bearer {}", api_key)).ok()?;
-    let mut init = worker::RequestInit::new();
-    init.with_method(Method::Get).with_headers(headers);
-    let request = Request::new_with_init(url, &init).ok()?;
-    let mut resp = Fetch::Request(request).send().await.ok()?;
-    if resp.status_code() != 200 {
-        return None;
-    }
-    resp.json::<serde_json::Value>().await.ok()
-}
-
-/// The customer's active entitlements, or None when they could not be fetched.
-async fn fetch_active_entitlements(
-    env: &Env,
-    app_id: &str,
-    project_id: &str,
-    user_id: &str,
-) -> Option<Vec<serde_json::Value>> {
-    let api_key = revenuecat_api_key(env, app_id)?;
-    let url = format!(
-        "https://api.revenuecat.com/v2/projects/{}/customers/{}/active_entitlements",
-        project_id, user_id
-    );
-    revenuecat_get(&api_key, &url)
-        .await?
-        .get("items")
-        .and_then(|i| i.as_array())
-        .cloned()
-}
-
-/// True when one of the active entitlements is `required`. RevenueCat's v2 list
-/// gives internal entitlement ids, so an item that does not name the entitlement
-/// is looked up once to learn its lookup key.
-async fn holds_required_entitlement(
-    env: &Env,
-    app_id: &str,
-    project_id: &str,
-    items: &[serde_json::Value],
-    required: &str,
-) -> bool {
-    use crate::purchases::{entitlement_id_to_resolve, item_names_entitlement, resolved_entitlement_matches};
-    if items.iter().any(|item| item_names_entitlement(item, required)) {
-        return true;
-    }
-    let Some(api_key) = revenuecat_api_key(env, app_id) else { return false };
-    for item in items {
-        let Some(entitlement_id) = entitlement_id_to_resolve(item, required) else { continue };
-        let url = format!(
-            "https://api.revenuecat.com/v2/projects/{}/entitlements/{}",
-            project_id, entitlement_id
-        );
-        if let Some(entitlement) = revenuecat_get(&api_key, &url).await {
-            if resolved_entitlement_matches(&entitlement, required) {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 async fn store_premium_cache(db: &worker::D1Database, app_id: &str, user_id: &str, premium: bool) {
     let stmt = db
@@ -1338,477 +1109,6 @@ async fn read_premium_cache(db: &worker::D1Database, app_id: &str, user_id: &str
     let checked_at = row.get("premium_checked_at").and_then(|v| v.as_str());
     let cached = row.get("premium_cached").and_then(|v| v.as_i64()).map(|n| n != 0);
     crate::purchases::cached_premium(checked_at, cached, chrono::Utc::now())
-}
-
-/// Outcome of verifying a client-reported purchase against RevenueCat.
-enum PurchaseVerification {
-    /// The transaction and product were both found in the customer's RevenueCat
-    /// purchases — safe to grant on the fast-track client path.
-    Verified,
-    /// RevenueCat answered, but this transaction/product is not present in the
-    /// customer's record. Never grant: the token is fake, replayed, or claims a
-    /// different product than was actually bought.
-    Rejected,
-    /// RevenueCat could not confirm right now (customer/purchase not yet
-    /// propagated, or the API was unreachable). Do not grant on this path; the
-    /// authenticated webhook is the authoritative, idempotent fallback.
-    Defer,
-}
-
-/// The RevenueCat customer ids a purchase by this caller can be filed under, most likely first. Apps in the field log
-/// RevenueCat in as their mako user (and RevenueCat copies that id into the transaction's `appAccountToken`);
-/// MidgarCommerce apps log in as the Midgar ID. A linked account can arrive with either, so both are asked.
-fn revenuecat_customers(user_id: &str, midgar_id: Option<&str>) -> Vec<String> {
-    let mut customers = vec![user_id.to_string()];
-    if let Some(midgar_id) = midgar_id.filter(|id| !id.is_empty() && *id != user_id) {
-        customers.push(midgar_id.to_string());
-    }
-    customers
-}
-
-/// One answer from the answers for each customer id. A customer holding the purchase verifies it. Otherwise an
-/// unreachable RevenueCat leaves it to the webhook, a customer that answered without it rejects it, and customers
-/// RevenueCat does not know yet defer it.
-fn fold_verifications(answers: Vec<Result<PurchaseVerification>>) -> Result<PurchaseVerification> {
-    let mut rejected = false;
-    let mut unreachable = None;
-    for answer in answers {
-        match answer {
-            Ok(PurchaseVerification::Verified) => return Ok(PurchaseVerification::Verified),
-            Ok(PurchaseVerification::Rejected) => rejected = true,
-            Ok(PurchaseVerification::Defer) => {}
-            Err(e) => unreachable = Some(e),
-        }
-    }
-    match (unreachable, rejected) {
-        (Some(e), _) => Err(e),
-        (None, true) => Ok(PurchaseVerification::Rejected),
-        (None, false) => Ok(PurchaseVerification::Defer),
-    }
-}
-
-/// Verifies that `purchase_token` and `product_id` both belong to a real purchase
-/// on this RevenueCat customer. The store transaction id is high-entropy, so its
-/// literal presence anywhere in the customer's purchases payload is proof the
-/// purchase is real and belongs to them; requiring `product_id` to also appear
-/// blocks pack-substitution (paying for a cheap pack, claiming an expensive one).
-async fn validate_with_revenuecat(
-    env: &Env,
-    db: &worker::D1Database,
-    app_id: &str,
-    user_id: &str,
-    purchase_token: &str,
-    product_id: &str,
-    platform: &str,
-) -> Result<PurchaseVerification> {
-    if crate::mock::enabled(env) {
-        return Ok(PurchaseVerification::Verified);
-    }
-    let key_name = format!("REVENUECAT_IOS_API_KEY_{}", app_id.to_uppercase());
-    let api_key = env
-        .secret(&key_name)
-        .or_else(|_| env.secret("REVENUECAT_IOS_API_KEY"))
-        .map_err(|_| format!("RevenueCat API key not configured for {}", app_id))?
-        .to_string();
-
-    let project_id = db
-        .prepare("SELECT rc_project_id FROM apps WHERE app_id = ?1")
-        .bind(&[app_id.into()])?
-        .first::<serde_json::Value>(None)
-        .await?
-        .and_then(|v| v.get("rc_project_id").and_then(|p| p.as_str()).map(|s| s.to_string()))
-        .ok_or_else(|| format!("rc_project_id not configured for {}", app_id))?;
-
-    let url = format!(
-        "https://api.revenuecat.com/v2/projects/{}/customers/{}/purchases",
-        project_id, user_id
-    );
-
-    let headers = Headers::new();
-    headers.set("Authorization", &format!("Bearer {}", api_key))?;
-    headers.set("Content-Type", "application/json")?;
-    headers.set("X-Platform", platform)?;
-
-    let mut init = worker::RequestInit::new();
-    init.with_method(Method::Get).with_headers(headers);
-
-    let request = Request::new_with_init(&url, &init)?;
-    let mut response = Fetch::Request(request).send().await?;
-
-    let status_code = response.status_code();
-    if status_code == 404 {
-        worker::console_log!("RevenueCat customer/purchases not found; deferring to webhook");
-        return Ok(PurchaseVerification::Defer);
-    }
-    if status_code < 200 || status_code >= 300 {
-        let error_text = response.text().await.unwrap_or_default();
-        worker::console_log!("RevenueCat API error: {}", crate::redact::provider_error_summary(status_code, &error_text));
-        return Err(format!("RevenueCat API error: {}", status_code).into());
-    }
-
-    let body = response.text().await?;
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-    let Some(items) = parsed.get("items").and_then(|v| v.as_array()) else {
-        worker::console_log!("RevenueCat purchases response had no items; deferring to webhook");
-        return Ok(PurchaseVerification::Defer);
-    };
-
-    let matched = items.iter().find(|item| {
-        item.get("store_purchase_identifier").and_then(|v| v.as_str()) == Some(purchase_token)
-    });
-    let Some(purchase) = matched else {
-        worker::console_log!("RevenueCat purchase token not found for customer {}; rejecting fast-track", user_id);
-        return Ok(PurchaseVerification::Rejected);
-    };
-
-    let rc_product_id = purchase.get("product_id").and_then(|v| v.as_str()).unwrap_or_default();
-    match rc_store_identifier(&api_key, &project_id, rc_product_id).await {
-        Ok(Some(store_identifier)) if store_identifier == product_id => Ok(PurchaseVerification::Verified),
-        Ok(Some(store_identifier)) => {
-            worker::console_log!(
-                "RevenueCat product mismatch for customer {}: transaction is {} but {} was claimed; rejecting",
-                user_id, store_identifier, product_id
-            );
-            Ok(PurchaseVerification::Rejected)
-        }
-        _ => {
-            worker::console_log!("RevenueCat product {} could not be resolved; deferring to webhook", rc_product_id);
-            Ok(PurchaseVerification::Defer)
-        }
-    }
-}
-
-/// Resolves a RevenueCat v2 internal product id (e.g. `proda9db…`) to its App
-/// Store SKU. The v2 `/customers/{id}/purchases` payload carries only the
-/// internal id, never the store SKU — that lives solely on the `/products/{id}`
-/// resource as `store_identifier` — so the purchased product can only be bound
-/// to the pack the client paid for by this second lookup. Returns `None` on any
-/// non-2xx so the caller defers to the webhook rather than reject a real buyer.
-async fn rc_store_identifier(
-    api_key: &str,
-    project_id: &str,
-    rc_product_id: &str,
-) -> Result<Option<String>> {
-    if rc_product_id.is_empty() {
-        return Ok(None);
-    }
-    let url = format!(
-        "https://api.revenuecat.com/v2/projects/{}/products/{}",
-        project_id, rc_product_id
-    );
-    let headers = Headers::new();
-    headers.set("Authorization", &format!("Bearer {}", api_key))?;
-    let mut init = worker::RequestInit::new();
-    init.with_method(Method::Get).with_headers(headers);
-    let request = Request::new_with_init(&url, &init)?;
-    let mut response = Fetch::Request(request).send().await?;
-    if response.status_code() < 200 || response.status_code() >= 300 {
-        return Ok(None);
-    }
-    let body = response.text().await?;
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-    Ok(parsed
-        .get("store_identifier")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RevenueCatWebhookEvent {
-    pub api_version: String,
-    pub event: RevenueCatEvent,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RevenueCatEvent {
-    pub app_user_id: String,
-    pub currency: Option<String>,
-    pub entitlement_id: Option<String>,
-    pub environment: String,
-    pub event_timestamp_ms: i64,
-    pub id: String,
-    pub is_family_share: bool,
-    pub offer_code: Option<String>,
-    pub price: Option<f64>,
-    pub price_in_purchased_currency: Option<f64>,
-    pub product_id: String,
-    pub purchased_at_ms: i64,
-    pub store: String,
-    pub takehome_percentage: Option<f64>,
-    pub transaction_id: String,
-    #[serde(rename = "type")]
-    pub event_type: String,
-}
-
-/// Resolve which tenant a RevenueCat product belongs to by matching the product
-/// id against each app's `rc_product_prefix`. Longest matching prefix wins (most
-/// specific tenant). Returns (app_id, matched_prefix).
-async fn resolve_tenant_by_product(db: &worker::D1Database, product_id: &str) -> Option<(String, String)> {
-    crate::storekit::tenant_of_product(db, product_id).await.ok().flatten()
-}
-
-/// Tags a paid RevenueCat event that the credits ledger does not itself record —
-/// a subscription, or a product that resolves to no credit pack — with the
-/// buyer's Apple Ads campaign and keyword.
-///
-/// Keyed on the store transaction id, and skipped entirely when a
-/// `credit_purchases` row already exists for that transaction, so a keyword's
-/// revenue is counted exactly once no matter which path credited the purchase.
-/// Best-effort: a webhook must still return 200 to RevenueCat.
-async fn tag_revenuecat_revenue(db: &worker::D1Database, event: &RevenueCatEvent) {
-    let app_id = match db
-        .prepare("SELECT app_id FROM users WHERE id = ?1")
-        .bind(&[event.app_user_id.clone().into()])
-    {
-        Ok(stmt) => match stmt.first::<serde_json::Value>(None).await {
-            Ok(Some(row)) => row.get("app_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            _ => String::new(),
-        },
-        Err(_) => String::new(),
-    };
-    if app_id.is_empty() {
-        worker::console_log!("No mako identity for RevenueCat user {}; not tagging", event.app_user_id);
-        return;
-    }
-
-    let already_in_ledger = match db
-        .prepare("SELECT id FROM credit_purchases WHERE app_id = ?1 AND payment_id = ?2 AND payment_provider = 'revenuecat'")
-        .bind(&[app_id.clone().into(), event.transaction_id.clone().into()])
-    {
-        Ok(stmt) => matches!(stmt.first::<serde_json::Value>(None).await, Ok(Some(_))),
-        Err(_) => false,
-    };
-    if already_in_ledger {
-        return;
-    }
-
-    let kind = if event.entitlement_id.is_some() {
-        crate::attribution::PurchaseKind::Subscription
-    } else {
-        crate::attribution::PurchaseKind::Unknown
-    };
-    let gross = crate::attribution::usd_to_cents(event.price);
-    let net = crate::attribution::net_cents(gross, event.takehome_percentage);
-    let purchase_id = format!("rc:{}", event.transaction_id);
-
-    match crate::attribution::tag_purchase(
-        db,
-        &app_id,
-        &event.app_user_id,
-        &purchase_id,
-        kind,
-        &event.product_id,
-        gross,
-        net,
-    )
-    .await
-    {
-        Ok(true) => worker::console_log!("tagged {} {} with ad attribution", kind.as_str(), purchase_id),
-        Ok(false) => {}
-        Err(e) => worker::console_log!("could not tag {} with ad attribution: {:?}", purchase_id, e),
-    }
-}
-
-pub async fn revenuecat_webhook(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let env = ctx.env;
-    
-    let auth_header = req.headers().get("Authorization")?;
-    
-    let expected_auth = env.secret("REVENUECAT_WEBHOOK_AUTH")
-        .map_err(|_| AppError::InternalError("REVENUECAT_WEBHOOK_AUTH not configured".to_string()))?
-        .to_string();
-    
-    if !crate::purchases::webhook_authorized(auth_header.as_deref(), &expected_auth) {
-        return AppError::Unauthorized("Invalid webhook authorization".to_string()).to_response();
-    }
-    
-    let webhook_event: RevenueCatWebhookEvent = match req.json().await {
-        Ok(event) => event,
-        Err(e) => return AppError::BadRequest(format!("Invalid webhook body: {}", e)).to_response(),
-    };
-    
-    let event = &webhook_event.event;
-    worker::console_log!("RevenueCat webhook: {} for user {}", event.event_type, event.app_user_id);
-
-    let db = env.d1("DB")?;
-    let tenant = resolve_tenant_by_product(&db, &event.product_id).await;
-    let strict = match &tenant {
-        Some((app_id, _)) => crate::tenant::TenantPolicy::load(&db, app_id)
-            .await
-            .map(|p| p.strict_purchases)
-            .unwrap_or(false),
-        None => false,
-    };
-
-    use crate::purchases::{classify_event, EventAction};
-    match classify_event(&event.event_type, strict) {
-        EventAction::CreditPack => {
-            let Some((app_id, prefix)) = tenant else {
-                worker::console_log!("No tenant matched product {}", event.product_id);
-                tag_revenuecat_revenue(&db, event).await;
-                return Response::ok("OK");
-            };
-            credit_pack_from_event(&env, &db, event, &app_id, &prefix).await?;
-        },
-        EventAction::TagRevenueOnly => {
-            tag_revenuecat_revenue(&db, event).await;
-        },
-        EventAction::ReversePackRefund => {
-            if let Some((app_id, prefix)) = tenant {
-                reverse_pack_refund(&env, &db, event, &app_id, &prefix).await?;
-            }
-        },
-        EventAction::LogOnly => {
-            if event.event_type == "BILLING_ISSUE" {
-                worker::console_log!("Billing issue for user {}", event.app_user_id);
-            } else {
-                worker::console_log!("Subscription event {} for user {}", event.event_type, event.app_user_id);
-            }
-        },
-        EventAction::Ignore => {
-            worker::console_log!("Unhandled RevenueCat event type: {}", event.event_type);
-        }
-    }
-    
-    Response::ok("OK")
-}
-
-/// Credits the credit pack a purchase event names, once per store transaction:
-/// the client validate call records the same `(app, "revenuecat", transaction id)`
-/// row, so whichever path arrives first credits and the other finds it.
-async fn credit_pack_from_event(
-    env: &Env,
-    db: &worker::D1Database,
-    event: &RevenueCatEvent,
-    app_id: &str,
-    prefix: &str,
-) -> Result<()> {
-    let pack_id = event
-        .product_id
-        .strip_prefix(prefix)
-        .unwrap_or(&event.product_id)
-        .to_string();
-
-    let packs = get_credit_packs_for_app(app_id, db).await;
-    let pack = match packs.iter().find(|p| p.id == pack_id) {
-        Some(p) => p,
-        None => {
-            worker::console_log!("Unknown pack {} for app {} (product {})", pack_id, app_id, event.product_id);
-            tag_revenuecat_revenue(db, event).await;
-            return Ok(());
-        }
-    };
-
-    if pack_refund::is_claimed(db, app_id, &event.transaction_id).await? {
-        worker::console_log!("Transaction {} was refunded; not credited", event.transaction_id);
-        return Ok(());
-    }
-
-    let total_credits = pack.credits + pack.bonus_credits;
-
-    let ledgers = crate::ledgers::Ledgers::new(env, db);
-    if ledgers.linking() {
-        let target = ledgers.credit_target(app_id, &event.app_user_id).await?;
-        if let crate::ledgers::Account::Wallet { user_id, .. } = &target {
-            return credit_pack_to_wallet(&ledgers, db, event, app_id, user_id, pack, &pack_id).await;
-        }
-    }
-
-    let existing = db.prepare(
-        "SELECT id FROM credit_purchases WHERE app_id = ? AND payment_id = ? AND payment_provider = 'revenuecat'"
-    )
-    .bind(&[app_id.into(), event.transaction_id.clone().into()])?
-    .first::<serde_json::Value>(None)
-    .await?;
-
-    if existing.is_some() {
-        worker::console_log!("Transaction {} already processed", event.transaction_id);
-        return Ok(());
-    }
-
-    let purchase_id = match record_and_complete_purchase(
-        app_id,
-        &event.app_user_id,
-        &pack_id,
-        total_credits as u32,
-        pack.price_usd_cents as u32,
-        &event.transaction_id,
-        db,
-    )
-    .await
-    {
-        Ok(id) => id,
-        Err(e) if crate::error::is_refunded(&e) => {
-            worker::console_log!("Transaction {} was refunded; not credited", event.transaction_id);
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-
-    worker::console_log!("Processed RevenueCat purchase {} for app {} user {}", purchase_id, app_id, event.app_user_id);
-    Ok(())
-}
-
-/// Credits a pack to a wallet account. A purchase already settled, whatever its final status, is not credited again;
-/// one left `pending` by a crash is finished here, and the wallet grant is idempotent by the store transaction id. A
-/// transaction whose refund was claimed, before the row or while it was being completed, is not credited.
-async fn credit_pack_to_wallet(
-    ledgers: &crate::ledgers::Ledgers<'_>,
-    db: &worker::D1Database,
-    event: &RevenueCatEvent,
-    app_id: &str,
-    user_id: &str,
-    pack: &crate::credits::CreditPack,
-    pack_id: &str,
-) -> Result<()> {
-    let credits = (pack.credits + pack.bonus_credits) as u32;
-    match credit_pack(db, ledgers, app_id, user_id, pack_id, credits, pack.price_usd_cents as u32, &event.transaction_id).await? {
-        Credit::Credited { purchase_id } => {
-            worker::console_log!("Processed RevenueCat purchase {} for app {} wallet user {}", purchase_id, app_id, user_id);
-        }
-        Credit::Duplicate => worker::console_log!("Transaction {} already processed", event.transaction_id),
-        Credit::Refunded => worker::console_log!("Transaction {} was refunded; not credited", event.transaction_id),
-    }
-    Ok(())
-}
-
-/// Takes back the credits of a refunded credit-pack purchase, down to a zero
-/// balance, once per transaction. A product that is not a credit pack is left
-/// alone, so subscriptions are never touched. The claim row in
-/// `purchase_refunds` is written first and the purchase read after
-/// (`pack_refund::claim_and_settle`), so no credit can slip in between, and
-/// it is released again if the reversal fails so RevenueCat's retry can finish
-/// the job. The claim, the reversal key and the purchase lookup are shared with
-/// the ledger's refund route (`wallet::ledger_refund`), so a refund that reaches
-/// both is reversed once. A refund for a transaction no purchase was recorded
-/// for stays claimed, so the credit paths refuse that transaction when it
-/// arrives later; a purchase still `pending` is finished first, then reversed.
-async fn reverse_pack_refund(
-    env: &Env,
-    db: &worker::D1Database,
-    event: &RevenueCatEvent,
-    app_id: &str,
-    prefix: &str,
-) -> Result<()> {
-    let pack_id = event.product_id.strip_prefix(prefix).unwrap_or(&event.product_id);
-    let packs = get_credit_packs_for_app(app_id, db).await;
-    if !packs.iter().any(|p| p.id == pack_id) {
-        worker::console_log!("Refund for {} is not a credit pack; ignored", event.product_id);
-        return Ok(());
-    }
-
-    let ledgers = crate::ledgers::Ledgers::new(env, db);
-    match refund_pack(db, &ledgers, app_id, pack_id, &event.transaction_id).await? {
-        Settlement::Tombstone => {
-            worker::console_log!("Refund for transaction {} has no credited purchase; recorded so it is never credited", event.transaction_id);
-        }
-        Settlement::Settled(_) => worker::console_log!("Refund for transaction {} already reversed", event.transaction_id),
-        Settlement::Reversed { purchase, taken } => {
-            worker::console_log!("Reversed {} of {} credits for refunded transaction {}", taken, purchase.credits, event.transaction_id);
-        }
-        Settlement::Declined(_) => worker::console_log!("Refund for transaction {} is in no account this path reverses", event.transaction_id),
-    }
-    Ok(())
 }
 
 /// The pack a card purchase sells: the app's own pack with this id, when its price equals the price of the Stripe
@@ -1857,40 +1157,11 @@ mod tests {
     }
 
     #[test]
-    fn a_premium_check_also_counts_purchases_revenuecat_tagged_with_the_mako_user_id() {
+    fn a_premium_check_also_counts_purchases_tagged_with_the_mako_user_id() {
         let user = "6ED586B2-0000-4000-8000-000000000001";
         assert_eq!(premium_tokens(user, "4c49d445-0000-4000-8000-000000000002"), vec![user.to_lowercase()]);
         assert!(premium_tokens(user, &user.to_lowercase()).is_empty());
         assert!(premium_tokens("u-1", "4c49d445-0000-4000-8000-000000000002").is_empty());
-    }
-
-    #[test]
-    fn a_linked_account_asks_revenuecat_for_its_mako_user_first_and_then_its_midgar_id() {
-        assert_eq!(revenuecat_customers("u-1", Some("m-1")), vec!["u-1", "m-1"]);
-        assert_eq!(revenuecat_customers("u-1", None), vec!["u-1"]);
-        assert_eq!(revenuecat_customers("m-1", Some("m-1")), vec!["m-1"]);
-        assert_eq!(revenuecat_customers("u-1", Some("")), vec!["u-1"]);
-    }
-
-    fn unreachable() -> Result<PurchaseVerification> {
-        Err(worker::Error::RustError("RevenueCat API error: 503".into()))
-    }
-
-    #[test]
-    fn any_customer_holding_the_purchase_verifies_it() {
-        use PurchaseVerification::*;
-        assert!(matches!(fold_verifications(vec![Ok(Rejected), Ok(Verified)]), Ok(Verified)));
-        assert!(matches!(fold_verifications(vec![Ok(Defer), Ok(Verified)]), Ok(Verified)));
-        assert!(matches!(fold_verifications(vec![unreachable(), Ok(Verified)]), Ok(Verified)));
-    }
-
-    #[test]
-    fn without_a_customer_holding_it_unreachable_beats_rejected_beats_deferred() {
-        use PurchaseVerification::*;
-        assert!(fold_verifications(vec![Ok(Rejected), unreachable()]).is_err());
-        assert!(matches!(fold_verifications(vec![Ok(Defer), Ok(Rejected)]), Ok(Rejected)));
-        assert!(matches!(fold_verifications(vec![Ok(Defer), Ok(Defer)]), Ok(Defer)));
-        assert!(matches!(fold_verifications(vec![]), Ok(Defer)));
     }
 
     #[test]

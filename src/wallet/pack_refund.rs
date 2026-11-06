@@ -27,8 +27,7 @@ impl CreditedPurchase {
     }
 }
 
-/// The purchase row the RevenueCat webhook, the client's validate call and the ledger's grant share for a store
-/// transaction, when it was started (`pending`), credited (`completed`) or already reversed (`refunded`). A transaction
+/// The purchase row the client's validate call and the ledger's grant share for a store transaction, when it was started (`pending`), credited (`completed`) or already reversed (`refunded`). A transaction
 /// that no credit path ever saw has no such row, which is what keeps a refund of anything else from touching a balance.
 pub async fn refundable_purchase(db: &impl D1Exec, app_id: &str, transaction_id: &str) -> Result<Option<CreditedPurchase>, AppError> {
     let rows = db
@@ -117,13 +116,11 @@ pub fn reversal<'a>(transaction_id: &str, source: &'static str, credits: u32, de
 pub enum Step {
     /// The credits were taken back, down to a zero balance: `Taken` is at most the purchase's credits.
     Taken(u32),
-    /// Another path already took the credits back: nothing was done.
+    /// Another delivery already took the credits back: nothing was done.
     Settled,
-    /// The purchase is not in an account this path can reverse; another path owns it.
-    Declined,
 }
 
-/// The part of a refund that differs per path: finishing a purchase a crash left `pending` and taking its credits back
+/// The part of a refund that reverses: finishing a purchase a crash left `pending` and taking its credits back
 /// from the account it landed in. Both reversals are idempotent: a wallet by its key `reverse:<transactionId>`, a local
 /// balance by the batch that reverses it and flips the purchase to `refunded` together (`purchase::reverse_locally`).
 #[allow(async_fn_in_trait)]
@@ -140,8 +137,6 @@ pub enum Settlement {
     Settled(CreditedPurchase),
     /// This call took the credits back and marked the purchase `refunded`.
     Reversed { purchase: CreditedPurchase, taken: u32 },
-    /// The purchase belongs to an account this path does not reverse; the claim this call wrote was released.
-    Declined(CreditedPurchase),
 }
 
 /// Records the refund of a store transaction and settles it, the one function every refund path calls. The claim is
@@ -149,7 +144,7 @@ pub enum Settlement {
 /// a row that exists by the time of the claim is read here, finished if it is `pending`, and reversed; a row that does
 /// not exist can no longer appear, because the statement that creates one only runs while no claim exists
 /// (`purchase::record_pending`). A claim a crash left behind is finished by the retry, since the row is read again
-/// whatever the claim says. A claim whose reversal failed or was declined is released when this call wrote it.
+/// whatever the claim says. A claim whose reversal failed is released when this call wrote it.
 pub async fn claim_and_settle<D: D1Exec, R: Reverser>(
     db: &D,
     app_id: &str,
@@ -170,12 +165,6 @@ pub async fn claim_and_settle<D: D1Exec, R: Reverser>(
             Ok(Settlement::Reversed { purchase, taken })
         }
         Ok(Step::Settled) => Ok(Settlement::Settled(purchase)),
-        Ok(Step::Declined) => {
-            if first_claim {
-                release(db, app_id, transaction_id).await?;
-            }
-            Ok(Settlement::Declined(purchase))
-        }
         Err(error) => {
             if first_claim {
                 let _ = release(db, app_id, transaction_id).await;

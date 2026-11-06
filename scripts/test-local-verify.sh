@@ -6,7 +6,8 @@
 VERIFY_MIDGAR="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d47"
 VERIFY_OTHER_MIDGAR="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d99"
 VERIFY_NATIVE_MIDGAR="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d49"
-VERIFY_PATH="/v1/credits/purchase/revenuecat/validate"
+VERIFY_PATH="/v1/credits/purchase/validate"
+VERIFY_OLD_PATH="/v1/credits/purchase/revenuecat/validate"
 
 stub_transaction() {
   python3 -I -c '
@@ -28,18 +29,12 @@ validate_body() {
 }
 
 signed_validate() {
-  local key="$1" token="$2" body="$3"
-  local args=(-s -o "$BODY" -w '%{http_code}' -X POST "$BASE$VERIFY_PATH" -H "X-App-ID: dreameater" -H "Authorization: Bearer $key" -H "Content-Type: application/json" --data "$body")
+  local key="$1" token="$2" body="$3" path="${4:-$VERIFY_PATH}"
+  local args=(-s -o "$BODY" -w '%{http_code}' -X POST "$BASE$path" -H "X-App-ID: dreameater" -H "Authorization: Bearer $key" -H "Content-Type: application/json" --data "$body")
   if [ -n "$token" ]; then
     args+=(-H "X-Midgar-Token: $token")
   fi
   STATUS=$(curl "${args[@]}")
-}
-
-verify_webhook() {
-  local user="$1" tx="$2"
-  STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" \
-    --data "{\"api_version\":\"1.0\",\"event\":{\"app_user_id\":\"$user\",\"environment\":\"PRODUCTION\",\"event_timestamp_ms\":1,\"id\":\"ev-$tx\",\"is_family_share\":false,\"product_id\":\"com.dreameater.credits.small\",\"purchased_at_ms\":1,\"store\":\"APP_STORE\",\"transaction_id\":\"$tx\",\"type\":\"NON_RENEWING_PURCHASE\"}}")
 }
 
 refused_leaves_balance() {
@@ -67,16 +62,16 @@ verify_with_linking_off() {
   check "a replay has its own code" already_processed "$(json_get error/code)"
   check "a replay keeps the text old clients match" yes "$(json_get error/message | grep -q 'already been processed' && echo yes || echo no)"
   check "a replay credits nothing" $((before + 5)) "$(balance_of key_free)"
-
-  verify_webhook u-free sk-1
-  check "the RevenueCat webhook for the same transaction is accepted" 200 "$STATUS"
-  check "and credits nothing, the key is shared" $((before + 5)) "$(balance_of key_free)"
+  signed_validate key_free "$token" "$(validate_body sk-1 "$VERIFY_MIDGAR")" "$VERIFY_OLD_PATH"
+  check "the path builds in the field call answers a replay the same" already_processed "$(json_get error/code)"
   check "one purchase row exists for the transaction" 1 "$(sql_value "SELECT COUNT(*) FROM credit_purchases WHERE payment_id = 'sk-1'")"
 
-  verify_webhook u-free sk-2
-  check "a webhook first credits the pack" $((before + 10)) "$(balance_of key_free)"
+  signed_validate key_free "$token" "$(validate_body sk-2 "$VERIFY_MIDGAR")" "$VERIFY_OLD_PATH"
+  check "the path builds in the field call credits a signed purchase too" 200 "$STATUS"
+  check "with the same answer" 5 "$(json_get credits_added)"
+  check "and the same balance" $((before + 10)) "$(balance_of key_free)"
   signed_validate key_free "$token" "$(validate_body sk-2 "$VERIFY_MIDGAR")"
-  check "the signed call after the webhook is already processed" already_processed "$(json_get error/code)"
+  check "the new path after it is already processed" already_processed "$(json_get error/code)"
   check "and credits nothing more" $((before + 10)) "$(balance_of key_free)"
 
   local now_balance=$((before + 10))
@@ -101,6 +96,7 @@ verify_with_linking_off() {
   signed_validate key_free "$token" "$(validate_body sk-3 "$VERIFY_MIDGAR" small '{"quantity":2}')"
   refused_leaves_balance "a purchase of two packs" 400 bad_request "$now_balance" key_free
   signed_validate key_free "$token" "{\"pack_id\":\"small\",\"purchase_token\":\"sk-3\",\"product_id\":\"com.dreameater.credits.small\",\"platform\":\"ios\",\"signed_transaction\":\"not-a-signed-transaction\"}"
+  check "a payload the ledger does not verify keeps the text clients retry on" yes "$(json_get error/message | grep -q 'could not be verified' && echo yes || echo no)"
   refused_leaves_balance "a payload the ledger does not verify" 400 unverifiable_purchase "$now_balance" key_free
   signed_validate key_free "$token" "{\"pack_id\":\"small\",\"purchase_token\":\"sk-3\",\"product_id\":\"com.dreameater.credits.small\",\"platform\":\"ios\",\"signed_transaction\":\"stub-down\"}"
   check "a pending answer says the credit follows" yes "$(json_get error/message | grep -q 'credited shortly' && echo yes || echo no)"
@@ -111,10 +107,10 @@ verify_with_linking_off() {
   check "a sandbox purchase is credited where the worker is not production" 200 "$STATUS"
   check "and credits the pack" $((now_balance + 5)) "$(balance_of key_free)"
 
-  call POST "$VERIFY_PATH" key_free '{"pack_id":"small","purchase_token":"rc-after","product_id":"com.dreameater.credits.small","platform":"ios","signed_transaction":""}'
-  check "an empty signed_transaction takes the RevenueCat path unchanged" 200 "$STATUS"
-  call POST "$VERIFY_PATH" key_free '{"pack_id":"small","purchase_token":"rc-after","product_id":"com.dreameater.credits.small","platform":"ios"}'
-  check "the RevenueCat path answers a replay with the same code" already_processed "$(json_get error/code)"
+  local sandbox_balance=$((now_balance + 5))
+  call POST "$VERIFY_PATH" key_free '{"pack_id":"small","purchase_token":"unsigned-1","product_id":"com.dreameater.credits.small","platform":"ios","signed_transaction":""}'
+  check "an empty signed_transaction is pending: the ledger's grant credits such a pack" credit_pending "$(json_get error/code)"
+  check "and credits nothing here" "$sandbox_balance" "$(balance_of key_free)"
 
   call POST /v1/run/chat.completion key_broke '{"messages":[{"role":"user","content":"x"}],"response_json":true}'
   check "an empty wallet is 402" 402 "$STATUS"
@@ -136,11 +132,12 @@ verify_with_linking_on() {
   check "the D1 balance did not move" 0 "$(sql_value "SELECT balance FROM user_credits WHERE user_id = 'u-link'")"
   signed_validate key_link "$token" "$(validate_body sk-w1 "$VERIFY_MIDGAR")"
   check "a replay is already processed" already_processed "$(json_get error/code)"
-  verify_webhook u-link sk-w1
-  check "the webhook for the same transaction credits nothing more" $((before + 5)) "$(balance_of key_link)"
+  internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body sk-w1 "$VERIFY_MIDGAR")"
+  check "the ledger's grant of the same transaction is a duplicate" duplicate "$(json_get status)"
+  check "and credits nothing more" $((before + 5)) "$(balance_of key_link)"
 
-  verify_webhook "$(upper "$VERIFY_MIDGAR")" sk-w2
-  check "a webhook addressed to the Midgar ID credits the wallet" $((before + 10)) "$(balance_of key_link)"
+  internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body sk-w2 "$(upper "$VERIFY_MIDGAR")")"
+  check "a grant addressed to the Midgar ID credits the wallet" $((before + 10)) "$(balance_of key_link)"
   signed_validate key_link "$token" "$(validate_body sk-w2 "$VERIFY_MIDGAR")"
   check "the signed call after it is already processed" already_processed "$(json_get error/code)"
   check "and credits nothing more" $((before + 10)) "$(balance_of key_link)"

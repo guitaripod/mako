@@ -14,15 +14,12 @@ use serde_json::{Map, Value};
 use super::client::WalletTransport;
 use super::d1::{D1Exec, Stmt};
 use super::link::account_of;
-use super::ops::{Reversal, WalletOps};
 use super::pack_credit::PurchaseLedger;
-use super::pack_refund::CreditedPurchase;
 use super::{links, purchase};
 use super::route::handle;
 use super::sql::{self, SqlBooks, SqlExec, Val};
 use super::types::WalletError;
 use crate::error::AppError;
-use crate::ledgers::Account;
 
 /// The clock every host test uses for the wallet objects.
 pub const NOW: i64 = 1_760_000_000;
@@ -468,27 +465,10 @@ pub struct TestLedger<'a, D: D1Exec, W: WalletTransport> {
 impl<D: D1Exec, W: WalletTransport> PurchaseLedger for TestLedger<'_, D, W> {
     async fn complete(&self, purchase_id: &str) -> Result<(), AppError> {
         let row = purchase::read(self.db, purchase_id).await?.ok_or_else(|| AppError::NotFound("Purchase not found".to_string()))?;
-        match self.account_for(&row.app_id, &row.user_id).await? {
-            account @ Account::Wallet { .. } => purchase::complete_in_wallet(self.db, self.wallets, &account, &row).await?,
-            Account::Local { .. } => purchase::complete_locally(self.db, purchase_id).await?,
+        match links::read(self.db, &row.app_id, &row.user_id).await? {
+            Some(link) => purchase::complete_in_wallet(self.db, self.wallets, &account_of(&link), &row).await?,
+            None => purchase::complete_locally(self.db, purchase_id).await?,
         };
         Ok(())
-    }
-
-    async fn account_for(&self, app_id: &str, user_id: &str) -> Result<Account, AppError> {
-        Ok(match links::read(self.db, app_id, user_id).await? {
-            Some(link) => account_of(&link),
-            None => Account::local(app_id, user_id),
-        })
-    }
-
-    async fn reverse(&self, account: &Account, purchase: &CreditedPurchase, reversal: &Reversal<'_>) -> Result<Option<u32>, AppError> {
-        match account {
-            Account::Wallet { midgar_id, app_id, .. } => {
-                let (_, taken) = WalletOps { wallets: self.wallets, db: self.db }.reverse(midgar_id, app_id, reversal).await?;
-                Ok(Some(taken))
-            }
-            Account::Local { app_id, user_id } => purchase::reverse_locally(self.db, app_id, user_id, &purchase.id, reversal).await,
-        }
     }
 }

@@ -64,8 +64,8 @@ pub fn is_midgar_id(id: &str) -> bool {
     id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
 }
 
-/// Where a grant addressed to `id` goes. The id is whatever the sender knows the buyer as: a RevenueCat
-/// `app_user_id`.
+/// Where a grant addressed to `id` goes. The id is whatever the caller knows the buyer as: a mako user id or a
+/// Midgar ID.
 ///
 /// 1. A user with a link, in any state: that Midgar ID's wallet.
 /// 2. A user without one: local, the never-upgraded case.

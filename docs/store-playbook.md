@@ -35,8 +35,7 @@ Explicitly rejected: a "Pixie Pro" monthly-credits subscription (RevenueCat Virt
 ## 3. Release facts
 
 - **Release with `midgar ship pixiepocket`** (see `ops/runbooks/ship-parity.md`). It archives locally on a stable or point-beta macOS host and in the buildvm guest (stable macOS 27, Xcode 27.1) during a major macOS beta; the GitHub Actions release workflows were removed on 2026-10-23.
-- Signing: manual signing lives ONLY on the app + widget targets' Release configs (global overrides break RevenueCat SPM targets). Two profiles needed: app + `PixieWidgetExtension`.
-- RevenueCat ≥5.78.0 + `appStoreReceiptURL` main-thread pre-warm in AppDelegate (purchases-ios#6886; DreamEater was rejected for this exact crash).
+- Signing: manual signing lives ONLY on the app + widget targets' Release configs (global overrides break SPM package targets). Two profiles needed: app + `PixieWidgetExtension`.
 - Screenshot rig: DEBUG env `PX_DEMO` = `create` | `edit` | `gallery` | `store` (store added in 1.3.0). Devices: iPhone 17 Pro Max sim (1320×2868, required 6.9" slot, API name `APP_IPHONE_67`) + iPad Pro 13" M5 (2064×2752). `xcrun simctl status_bar <udid> override --time "9:41"` before capture.
 - The five consumables are already APPROVED → IAP display-name updates ride their own `inAppPurchaseSubmissions` track; version submissions work fully via the API (no first-product web-UI trap).
 - Credits catalog is served from D1 `credit_packs` (60s edge cache); the hardcoded catalog in `src/credits.rs` is the fallback and must be kept in sync.

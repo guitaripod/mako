@@ -1,28 +1,15 @@
 use super::d1::D1Exec;
-use super::ops::Reversal;
-use super::pack_refund::{self, CreditedPurchase, Reverser, Settlement, Step};
-use super::purchase;
+use super::{pack_refund, purchase};
 use crate::error::AppError;
-use crate::ledgers::Account;
 use crate::storekit::already_settled;
 
-/// What the RevenueCat webhook and the validate calls do with a purchase row once it exists: finish it, find the
-/// account its user has now, and take credits back from that account. `Ledgers` is the production implementation; the
-/// host tests run the same code over SQLite and the wallet fakes.
+/// What the validate call does with a purchase row once it exists: finish it into whichever account its user has now.
+/// `Ledgers` is the production implementation; the host tests run the same code over SQLite and the wallet fakes.
 #[allow(async_fn_in_trait)]
 pub trait PurchaseLedger {
     /// Completes a purchase into whichever account its user has now.
     async fn complete(&self, purchase_id: &str) -> Result<(), AppError>;
-
-    /// The account a stored user has right now.
-    async fn account_for(&self, app_id: &str, user_id: &str) -> Result<Account, AppError>;
-
-    /// Takes back at most `reversal.amount` from an account and returns what was taken. A wallet reverses once per
-    /// key. A local balance reverses and flips the purchase to `refunded` in one batch that only applies to a
-    /// `completed` purchase, and answers `None` when it was not (nothing changed).
-    async fn reverse(&self, account: &Account, purchase: &CreditedPurchase, reversal: &Reversal<'_>) -> Result<Option<u32>, AppError>;
 }
-
 /// What a credit of a pack purchase came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credit {
@@ -35,11 +22,11 @@ pub enum Credit {
     Refunded,
 }
 
-/// Credits the pack of a RevenueCat transaction, once per store transaction: the webhook, the validate calls and the
-/// ledger's grant all land here or in `ledger_grant`. A claimed refund is refused and a row that is no longer `pending` is
-/// a duplicate; both checks are only shortcuts, because the row is created unless the refund was claimed in the same
-/// statement (`purchase::record_pending`, the linearization point) and completed through the ledger, whose wallet grant
-/// is idempotent by the transaction key and whose flip never overwrites `refunded`.
+/// Credits the pack of a store transaction, once per transaction: the validate call lands here and the ledger's grant in
+/// `ledger_grant`. A claimed refund is refused and a row that is no longer `pending` is a duplicate; both checks are only
+/// shortcuts, because the row is created unless the refund was claimed in the same statement (`purchase::record_pending`,
+/// the linearization point) and completed through the ledger, whose wallet grant is idempotent by the transaction key and
+/// whose flip never overwrites `refunded`.
 #[allow(clippy::too_many_arguments)]
 pub async fn credit_pack<D: D1Exec, L: PurchaseLedger>(
     db: &D,
@@ -54,7 +41,7 @@ pub async fn credit_pack<D: D1Exec, L: PurchaseLedger>(
     if pack_refund::is_claimed(db, app_id, transaction_id).await? {
         return Ok(Credit::Refunded);
     }
-    let status = purchase::revenuecat_status(db, app_id, transaction_id).await?;
+    let status = purchase::store_status(db, app_id, transaction_id).await?;
     if already_settled(status.as_deref()) {
         return Ok(Credit::Duplicate);
     }
@@ -68,47 +55,4 @@ pub async fn credit_pack<D: D1Exec, L: PurchaseLedger>(
         Err(AppError::Refunded(_)) => Ok(Credit::Refunded),
         Err(error) => Err(error),
     }
-}
-
-/// The RevenueCat refund's half of a reversal: a purchase still `pending` is finished, and the credits are taken back
-/// from the account the purchase's user has now.
-struct RevenueCatReverser<'a, L: PurchaseLedger> {
-    ledger: &'a L,
-    app_id: &'a str,
-    pack_id: &'a str,
-    transaction_id: &'a str,
-}
-
-impl<L: PurchaseLedger> Reverser for RevenueCatReverser<'_, L> {
-    async fn reverse(&self, purchase: &CreditedPurchase) -> Result<Step, AppError> {
-        if purchase.is_pending() {
-            match self.ledger.complete(&purchase.id).await {
-                Ok(()) => {}
-                Err(AppError::Refunded(_)) => return Ok(Step::Settled),
-                Err(error) => return Err(error),
-            }
-        }
-        let account = self.ledger.account_for(self.app_id, &purchase.user_id).await?;
-        let description = pack_refund::description(self.pack_id);
-        let reference = crate::purchases::refund_reference(self.transaction_id);
-        let reversal = pack_refund::reversal(self.transaction_id, "revenuecat", purchase.credits, &description, &reference);
-        Ok(match self.ledger.reverse(&account, purchase, &reversal).await? {
-            Some(taken) => Step::Taken(taken),
-            None => Step::Settled,
-        })
-    }
-}
-
-/// Takes back the credits of a refunded RevenueCat pack purchase, once per transaction: the claim, the purchase read, the
-/// finishing of a `pending` purchase, the reversal and the `refunded` flip are `pack_refund::claim_and_settle`, shared
-/// with the ledger's refund route.
-pub async fn refund_pack<D: D1Exec, L: PurchaseLedger>(
-    db: &D,
-    ledger: &L,
-    app_id: &str,
-    pack_id: &str,
-    transaction_id: &str,
-) -> Result<Settlement, AppError> {
-    let reverser = RevenueCatReverser { ledger, app_id, pack_id, transaction_id };
-    pack_refund::claim_and_settle(db, app_id, transaction_id, &reverser).await
 }

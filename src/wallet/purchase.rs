@@ -12,10 +12,10 @@ use crate::error::AppError;
 use crate::ledgers::Account;
 use crate::storekit::REFUNDED_MESSAGE;
 
-/// A stored RevenueCat purchase waits this long as `pending` before the cron finishes it.
+/// A stored App Store pack purchase waits this long as `pending` before the cron finishes it.
 const PENDING_AFTER_MINUTES: i64 = 5;
 
-/// Pending RevenueCat purchases one cron run completes.
+/// Pending App Store pack purchases one cron run completes.
 pub const SWEEP_LIMIT: i64 = 50;
 
 /// One `credit_purchases` row, as the completion needs it.
@@ -50,8 +50,8 @@ impl PurchaseRow {
 
 const COLUMNS: &str = "id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status";
 
-/// The idempotency key a purchase grants under: the store transaction id for RevenueCat, which the purchase ledger
-/// and the fast-track share, and the purchase id for Stripe and crypto, whose payment ids are not minted by us.
+/// The idempotency key a purchase grants under: the store transaction id for an App Store pack, which the ledger's grant
+/// and the validate call share, and the purchase id for Stripe and crypto, whose payment ids are not minted by us.
 pub fn grant_key(row: &PurchaseRow) -> String {
     match row.provider.as_str() {
         "revenuecat" => format!("tx:{}", row.payment_id),
@@ -77,19 +77,19 @@ pub async fn read(db: &impl D1Exec, purchase_id: &str) -> Result<Option<Purchase
     Ok(db.rows(&sql, &[purchase_id.into()]).await?.first().and_then(PurchaseRow::parse))
 }
 
-/// The status of the RevenueCat purchase of a store transaction, if one was recorded.
-pub async fn revenuecat_status(db: &impl D1Exec, app_id: &str, payment_id: &str) -> Result<Option<String>, AppError> {
+/// The status of the App Store pack purchase of a store transaction, if one was recorded.
+pub async fn store_status(db: &impl D1Exec, app_id: &str, payment_id: &str) -> Result<Option<String>, AppError> {
     let sql = "SELECT status FROM credit_purchases WHERE app_id = ?1 AND payment_id = ?2 AND payment_provider = 'revenuecat'
         ORDER BY created_at LIMIT 1";
     Ok(db.rows(sql, &[app_id.into(), payment_id.into()]).await?.first().and_then(|r| text(r, "status")).map(str::to_string))
 }
 
-/// Records a RevenueCat purchase as `pending` unless the transaction already has a row or its refund was claimed, and
+/// Records an App Store pack purchase as `pending` unless the transaction already has a row or its refund was claimed, and
 /// returns the id of the row there is. This is the one place a pack purchase row is born, and the statement is the
 /// linearization point against a refund: D1 applies one statement at a time, and the insert only happens while no
 /// `purchase_refunds` claim exists, so a refund that claims first leaves no row for a credit to create
-/// (`AppError::Refunded`), and a refund that claims after finds the row this statement made. The webhook, the
-/// fast-track and the ledger's grant race on one transaction; at most one row ever exists for it.
+/// (`AppError::Refunded`), and a refund that claims after finds the row this statement made. The validate call and the
+/// ledger's grant race on one transaction; at most one row ever exists for it.
 pub async fn record_pending(
     db: &impl D1Exec,
     app_id: &str,
@@ -320,26 +320,9 @@ pub async fn reverse_locally(
     Ok(Some(taken.max(0) as u32))
 }
 
-/// Records a RevenueCat purchase and completes it into the D1 balance, the local-balance counterpart of the wallet
-/// path: `record_pending` (which refuses a refunded transaction) and `complete_locally`. Returns the purchase id and
-/// whether this call completed it.
-pub async fn record_and_complete_locally(
-    db: &impl D1Exec,
-    app_id: &str,
-    user_id: &str,
-    pack_id: &str,
-    credits: u32,
-    amount_usd_cents: u32,
-    payment_id: &str,
-) -> Result<(String, bool), AppError> {
-    let id = record_pending(db, app_id, user_id, pack_id, credits, amount_usd_cents, payment_id).await?;
-    let completed = complete_locally(db, &id).await?;
-    Ok((id, completed))
-}
-
-/// Ids of RevenueCat purchases that have been `pending` for more than five minutes: the request that recorded them
+/// Ids of App Store pack purchases that have been `pending` for more than five minutes: the request that recorded them
 /// is gone and nobody finished the grant. Stripe and crypto rows wait for a payment and are never listed.
-pub async fn stale_revenuecat(db: &impl D1Exec, limit: i64) -> Result<Vec<String>, AppError> {
+pub async fn stale_store_purchases(db: &impl D1Exec, limit: i64) -> Result<Vec<String>, AppError> {
     let cutoff = (Utc::now() - Duration::minutes(PENDING_AFTER_MINUTES)).to_rfc3339();
     let rows = db
         .rows(

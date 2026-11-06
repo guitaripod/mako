@@ -3,9 +3,7 @@ use serde_json::json;
 
 use super::ledger_grant::{self, Reason as GrantReason};
 use super::ledger_refund::{reverse, Outcome, Reason};
-use super::pack_credit::refund_pack;
-use super::pack_refund::Settlement;
-use super::testing::{Budget, FakeWallets, Flaky, LocalD1, TestLedger};
+use super::testing::{Budget, FakeWallets, Flaky, LocalD1};
 use super::{pack_refund, purchase};
 use crate::error::AppError;
 use crate::storekit::{LedgerTransaction, REFUNDED_MESSAGE};
@@ -84,16 +82,11 @@ impl World {
     }
 
     fn status(&self, id: &str) -> Option<String> {
-        block_on(purchase::revenuecat_status(&self.d1, APP, id)).unwrap()
+        block_on(purchase::store_status(&self.d1, APP, id)).unwrap()
     }
 
     fn d1_status(&self, id: &str) -> String {
         block_on(purchase::read(&self.d1, id)).unwrap().unwrap().status
-    }
-
-    fn revenuecat_refund(&self, id: &str) -> bool {
-        let ledger = TestLedger { db: &self.d1, wallets: &self.wallets };
-        matches!(block_on(refund_pack(&self.d1, &ledger, APP, "small", id)).unwrap(), Settlement::Reversed { .. })
     }
 }
 
@@ -138,31 +131,7 @@ fn a_repeated_refund_is_a_no_op() {
 }
 
 #[test]
-fn a_refund_after_the_revenuecat_path_reversed_it_is_a_no_op() {
-    let world = World::linked();
-    world.bought(TX);
-    world.bought(SECOND_TX);
-    assert!(world.revenuecat_refund(TX));
-    assert_eq!(world.balance(), PACK_CREDITS);
-    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Duplicate { .. }));
-    assert_eq!(world.balance(), PACK_CREDITS);
-    assert_eq!(world.reversals(TX), 1);
-    assert_eq!(world.claims(), 1);
-}
-
-#[test]
-fn a_refund_the_revenuecat_path_sees_after_the_ledger_reversed_it_is_a_no_op() {
-    let world = World::linked();
-    world.bought(TX);
-    world.bought(SECOND_TX);
-    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { .. }));
-    assert!(!world.revenuecat_refund(TX), "the claim is already written");
-    assert_eq!(world.balance(), PACK_CREDITS);
-    assert_eq!(world.reversals(TX), 1);
-}
-
-#[test]
-fn a_claim_left_by_a_crashed_revenuecat_reversal_is_finished_once_by_the_ledger() {
+fn a_claim_left_by_a_crashed_reversal_is_finished_once_by_the_retry() {
     let world = World::linked();
     world.bought(TX);
     world.bought(SECOND_TX);
@@ -264,15 +233,6 @@ fn a_refund_first_means_the_validate_call_answers_refunded_and_final() {
 }
 
 #[test]
-fn a_refund_first_means_the_revenuecat_purchase_event_finds_the_claim() {
-    let world = World::linked();
-    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Recorded);
-    assert!(block_on(pack_refund::is_claimed(&world.d1, APP, TX)).unwrap(), "credit_pack_from_event stops here");
-    assert!(block_on(pack_refund::refundable_purchase(&world.d1, APP, TX)).unwrap().is_none());
-    assert_eq!(world.balance(), 0);
-}
-
-#[test]
 fn a_refund_after_a_pending_purchase_finishes_it_then_reverses_it() {
     let world = World::linked();
     block_on(purchase::record_pending(&world.d1, APP, "u1", "small", PACK_CREDITS as u32, 299, TX)).unwrap();
@@ -283,19 +243,50 @@ fn a_refund_after_a_pending_purchase_finishes_it_then_reverses_it() {
     assert_eq!(world.reversals(TX), 1);
 }
 
-#[test]
-fn a_purchase_that_belongs_to_an_unlinked_user_is_left_to_the_revenuecat_path() {
-    let world = World::linked();
-    world.d1.user(APP, "local", 7);
+/// A completed purchase of `credits` in the D1 balance of a user with no wallet, the way an older build's pack was
+/// credited, with `balance` left in that balance.
+fn local_purchase(world: &World, balance: i64, status: &str) {
+    world.d1.user(APP, "local", balance);
     world.d1.run(
         "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at)
-         VALUES ('p-local', ?1, 'local', 'small', 5, 299, 'revenuecat', ?2, 'completed', '2026-10-01T00:00:00+00:00')",
-        &[APP.into(), TX.into()],
+         VALUES ('p-local', ?1, 'local', 'small', 5, 299, 'revenuecat', ?2, ?3, '2026-10-01T00:00:00+00:00')",
+        &[APP.into(), TX.into(), status.into()],
     );
-    assert_eq!(world.refund(&refunded(TX)).unwrap(), Outcome::Refused(Reason::NotLinked));
-    assert_eq!(world.claims(), 0);
-    assert_eq!(world.d1_status("p-local"), "completed");
-    assert_eq!(world.d1.d1_balance(APP, "local"), 7);
+}
+
+#[test]
+fn a_purchase_in_an_unlinked_users_d1_balance_is_reversed_there_once() {
+    let world = World::linked();
+    local_purchase(&world, 7, "completed");
+    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { credits: 5, taken: 5, .. }));
+    assert_eq!(world.claims(), 1);
+    assert_eq!(world.d1_status("p-local"), "refunded");
+    assert_eq!(world.d1.d1_balance(APP, "local"), 2);
+    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Duplicate { .. }));
+    assert_eq!(world.d1.d1_balance(APP, "local"), 2);
+    assert_eq!(world.wallets.count("POST /reverse"), 0, "no wallet is touched for a local balance");
+    let rows = world.d1.int("SELECT COUNT(*) FROM credit_transactions WHERE reference_id = ?1", &[crate::purchases::refund_reference(TX).into()]);
+    assert_eq!(rows, 1, "one ledger row for the reversal");
+}
+
+#[test]
+fn an_unlinked_users_spent_balance_is_reversed_down_to_zero() {
+    let world = World::linked();
+    local_purchase(&world, 3, "completed");
+    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { credits: 5, taken: 3, .. }));
+    assert_eq!(world.d1.d1_balance(APP, "local"), 0);
+    assert_eq!(world.d1_status("p-local"), "refunded");
+}
+
+#[test]
+fn an_unlinked_users_pending_purchase_is_finished_then_reversed() {
+    let world = World::linked();
+    local_purchase(&world, 0, "pending");
+    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { credits: 5, taken: 5, .. }));
+    assert_eq!(world.d1.d1_balance(APP, "local"), 0);
+    assert_eq!(world.d1_status("p-local"), "refunded");
+    assert_eq!(world.d1.int("SELECT lifetime_purchased FROM user_credits WHERE user_id = 'local'", &[]), 5);
+    assert_eq!(world.d1.int("SELECT lifetime_spent FROM user_credits WHERE user_id = 'local'", &[]), 5);
 }
 
 #[test]

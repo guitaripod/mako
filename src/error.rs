@@ -21,13 +21,13 @@ pub enum AppError {
     Truncated,
     ContentBlocked,
     WalletUnavailable,
-    /// 409 `credit_pending`: the purchase is accepted but not credited yet, and the same request (or the
-    /// RevenueCat webhook) will credit it. Replaces the masked 500 the fast-track used to answer.
+    /// 409 `credit_pending`: the purchase is accepted but not credited yet, and the same request (or the ledger's
+    /// grant, from Apple's notification) will credit it.
     CreditPending(String),
     /// 400 `already_processed`: the store transaction was credited before. Clients treat it as success.
     AlreadyProcessed(String),
-    /// 400 `unverifiable_purchase`: the purchase could not be verified as it stands. A client may retry it for a
-    /// while, because RevenueCat can lag the App Store.
+    /// 400 `unverifiable_purchase`: the purchase could not be verified as it stands. Clients that match the message
+    /// ("could not be verified") retry it for a while.
     UnverifiablePurchase(String),
     /// 400 `refunded`: the store transaction was refunded, so it is never credited. Final for a client: it is neither
     /// pending nor a success.
@@ -99,11 +99,6 @@ impl AppError {
 /// True when a worker error carries `AppError::WalletUnavailable`, which every wallet failure is mapped to.
 pub fn is_wallet_unavailable(error: &worker::Error) -> bool {
     error.to_string().starts_with("AppError::WalletUnavailable::")
-}
-
-/// True when a ledger call failed because the purchase's refund was claimed.
-pub fn is_refunded(error: &worker::Error) -> bool {
-    error.to_string().starts_with("AppError::Refunded::")
 }
 
 /// Answers a wallet outage with its 503, and hands any other error back untouched, for handlers that let a ledger
@@ -234,8 +229,8 @@ mod tests {
     fn the_messages_old_clients_match_are_kept() {
         assert_eq!(AppError::AlreadyProcessed("Purchase has already been processed".into()).parts().message, "Purchase has already been processed");
         assert_eq!(
-            AppError::UnverifiablePurchase("Purchase could not be verified with RevenueCat".into()).parts().message,
-            "Purchase could not be verified with RevenueCat"
+            AppError::UnverifiablePurchase("Purchase could not be verified.".into()).parts().message,
+            "Purchase could not be verified."
         );
         assert_eq!(AppError::AlreadyProcessed("x".into()).parts().error_type, "invalid_request_error");
         assert_eq!(AppError::UnverifiablePurchase("x".into()).parts().error_type, "invalid_request_error");

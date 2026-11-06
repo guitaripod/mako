@@ -6,7 +6,6 @@ use crate::wallet::client::DoWallets;
 use crate::wallet::link::{self, Linker};
 use crate::wallet::ops::{Charge, Grant, GrantResult, Reversal, WalletOps};
 use crate::wallet::pack_credit::PurchaseLedger;
-use crate::wallet::pack_refund::CreditedPurchase;
 use crate::wallet::purchase;
 use crate::wallet::{resolve, target};
 
@@ -232,7 +231,7 @@ impl<'a> Ledgers<'a> {
         credits::record_paywall_event(self.db, account.app_id(), account.user_id(), capability, balance).await
     }
 
-    /// The account a grant addressed to a RevenueCat `app_user_id` goes to (design section 5). Only meaningful with
+    /// The account a grant addressed to a Midgar ID or a mako user id goes to (design section 5). Only meaningful with
     /// linking on; off, the id is a local user as before.
     pub async fn credit_target(&self, app_id: &str, id: &str) -> Result<Account> {
         if !self.linking {
@@ -272,11 +271,11 @@ impl<'a> Ledgers<'a> {
         Ok(())
     }
 
-    /// Cron: finishes RevenueCat purchases that stayed `pending` for more than five minutes. Returns how many it
+    /// Cron: finishes App Store pack purchases that stayed `pending` for more than five minutes. Returns how many it
     /// completed; one that fails is logged and left for the next run.
     pub async fn sweep_pending_purchases(&self) -> Result<u32> {
         let mut completed = 0;
-        for id in purchase::stale_revenuecat(self.db, purchase::SWEEP_LIMIT).await? {
+        for id in purchase::stale_store_purchases(self.db, purchase::SWEEP_LIMIT).await? {
             match self.complete_purchase(&id).await {
                 Ok(()) => completed += 1,
                 Err(e) => crate::wallet::log::error(&format!("pending purchase {id} could not be completed: {e:?}")),
@@ -354,26 +353,6 @@ impl<'a> Ledgers<'a> {
 impl PurchaseLedger for Ledgers<'_> {
     async fn complete(&self, purchase_id: &str) -> std::result::Result<(), AppError> {
         Ok(self.complete_purchase(purchase_id).await?)
-    }
-
-    async fn account_for(&self, app_id: &str, user_id: &str) -> std::result::Result<Account, AppError> {
-        Ok(self.account_for_user(app_id, user_id).await?)
-    }
-
-    async fn reverse(&self, account: &Account, purchase: &CreditedPurchase, reversal: &Reversal<'_>) -> std::result::Result<Option<u32>, AppError> {
-        match account {
-            Account::Local { app_id, user_id } => {
-                let Some(taken) = purchase::reverse_locally(self.db, app_id, user_id, &purchase.id, reversal).await? else { return Ok(None) };
-                if taken >= reversal.amount {
-                    return Ok(Some(taken));
-                }
-                let Some(wallet) = self.relinked(app_id, user_id).await? else { return Ok(Some(taken)) };
-                let rest = Reversal { key: format!("{}:late", reversal.key), amount: reversal.amount - taken, ..reversal.clone() };
-                let (_, also_taken) = Box::pin(Ledgers::reverse(self, &wallet, &rest, "admin_adjustment")).await?;
-                Ok(Some(taken + also_taken))
-            }
-            Account::Wallet { .. } => Ok(Some(Ledgers::reverse(self, account, reversal, "admin_adjustment").await?.1)),
-        }
     }
 }
 

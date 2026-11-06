@@ -1,7 +1,7 @@
 # Sourced by scripts/test-local.sh after the whole existing suite has run with WALLET_LINKING off (the local config
 # turns it off whatever wrangler.toml ships). It restarts the server with WALLET_LINKING on against the same local
 # database and Durable Object storage and runs the wallet flow of P3.07 steps 5 and 6: linking, spends, purchases,
-# residue, native requests and deletion.
+# residue, native requests, premium and deletion.
 
 M1="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d47"
 M_SECOND="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d48"
@@ -9,6 +9,7 @@ M_NATIVE="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d49"
 M_DEVELOPMENT="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d4a"
 M_UNKNOWN="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d4b"
 M_MOVING="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d4c"
+M_PREMIUM_DOWN="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d4f"
 
 upper() {
   printf %s "$1" | tr a-f A-F
@@ -32,13 +33,18 @@ call_native() {
   STATUS=$(curl "${args[@]}")
 }
 
-webhook() {
-  STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/revenuecat/webhook" -H "Authorization: Bearer $WEBHOOK_SECRET" --data "$1")
+grant_body() {
+  local tx="$1" token="$2" pack="${3:-small}" extra="${4:-}"
+  printf '{"transactionId":"%s","originalTransactionId":"%s","bundleId":"com.marcusziade.DreamEater","productId":"com.dreameater.credits.%s","type":"Consumable","appAccountToken":"%s","environment":"Production","purchaseDate":1760000000000,"revocationDate":%s,"inAppOwnershipType":"PURCHASED","quantity":1,"registrySlug":"dream-eater"}' \
+    "$tx" "$tx" "$pack" "$token" "${extra:-null}"
 }
 
-purchase_event() {
-  local user="$1" tx="$2" kind="${3:-NON_RENEWING_PURCHASE}" product="${4:-small}"
-  printf '{"api_version":"1.0","event":{"app_user_id":"%s","environment":"PRODUCTION","event_timestamp_ms":1,"id":"ev-%s","is_family_share":false,"product_id":"com.dreameater.credits.%s","purchased_at_ms":1,"store":"APP_STORE","transaction_id":"%s","type":"%s"}}' "$user" "$tx" "$product" "$tx" "$kind"
+grant() {
+  internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body "$@")"
+}
+
+refund() {
+  internal_call /internal/wallet/refund "$GRANT_SECRET" "$(grant_body "$1" "$2" "${3:-small}" 1760000100000)"
 }
 
 internal_call() {
@@ -172,26 +178,29 @@ check "the mirror counted the spend" 1 "$(summary_of spent "$M1")"
 call GET /v1/credits/transactions key_link
 check "the spend heads the list" "spend migrate bonus" "$(transaction_types)"
 
-echo "== purchases: a replayed webhook grants once"
-webhook "$(purchase_event u-link tx-w1)"
-check "a purchase event for a linked user is accepted" 200 "$STATUS"
+echo "== purchases: the ledger's grant and the signed validate call credit once between them"
+grant tx-w1 u-link
+check "a grant naming a linked user is credited" credited "$(json_get status)"
 check "the pack went to the wallet" 44 "$(balance_of key_link)"
-webhook "$(purchase_event u-link tx-w1)"
-check "the same event again" 200 "$STATUS"
-check "grants nothing more" 44 "$(balance_of key_link)"
+grant tx-w1 u-link
+check "the same transaction again is a duplicate" duplicate "$(json_get status)"
+check "and grants nothing more" 44 "$(balance_of key_link)"
 check "one purchase row, completed" "1 completed" "$(sql_value "SELECT COUNT(*) || ' ' || MAX(status) FROM credit_purchases WHERE payment_id = 'tx-w1'")"
 check "the D1 balance still did not move" 0 "$(sql_value "SELECT balance FROM user_credits WHERE user_id = 'u-link'")"
 check "the mirror counted the purchase" 5 "$(summary_of purchased "$M1")"
-webhook "$(purchase_event "$(upper "$M1")" tx-w2)"
-check "a purchase addressed to the Midgar ID in capitals is accepted" 200 "$STATUS"
+grant tx-w2 "$(upper "$M1")"
+check "a grant naming the Midgar ID in capitals is credited" credited "$(json_get status)"
 check "it reached the wallet of the user linked to that Midgar ID" 49 "$(balance_of key_link)"
-call POST /v1/credits/purchase/revenuecat/validate key_link '{"pack_id":"large","purchase_token":"tx-w3","product_id":"com.dreameater.credits.large","platform":"ios"}'
-check "the client fast-track is accepted" 200 "$STATUS"
+signed_validate key_link "$(minted_token valid)" "$(validate_body tx-w3 "$M1" large)"
+check "the signed validate call is accepted" 200 "$STATUS"
 check "and credits the wallet" 64 "$(balance_of key_link)"
-webhook "$(purchase_event u-link tx-w3 NON_RENEWING_PURCHASE large)"
-check "the webhook for the same transaction credits nothing more" 64 "$(balance_of key_link)"
-call POST /v1/credits/purchase/revenuecat/validate key_link '{"pack_id":"large","purchase_token":"tx-w3","product_id":"com.dreameater.credits.large","platform":"ios"}'
-check "the fast-track for a completed transaction is refused" 400 "$STATUS"
+grant tx-w3 u-link large
+check "the ledger's grant of the same transaction is a duplicate" duplicate "$(json_get status)"
+check "and credits nothing more" 64 "$(balance_of key_link)"
+signed_validate key_link "$(minted_token valid)" "$(validate_body tx-w3 "$M1" large)"
+check "the signed call for a completed transaction is refused" already_processed "$(json_get error/code)"
+call POST /v1/credits/purchase/validate key_link '{"pack_id":"large","purchase_token":"tx-w4","product_id":"com.dreameater.credits.large","platform":"ios"}'
+check "an unsigned call from an older build is pending" credit_pending "$(json_get error/code)"
 check "that left the balance alone" 64 "$(balance_of key_link)"
 
 echo "== a reinstall counts the welcome bonus once"
@@ -219,10 +228,11 @@ trigger_cron
 check "a second cron moves nothing more" 71 "$(balance_of key_link)"
 
 echo "== refunds and admin adjustments"
-webhook "$(purchase_event u-link tx-w1 CANCELLATION)"
-check "a refund event is accepted" 200 "$STATUS"
+refund tx-w1 "$M1"
+check "a refund is reversed" reversed "$(json_get status)"
 check "the refund took the pack back out of the wallet" 66 "$(balance_of key_link)"
-webhook "$(purchase_event u-link tx-w1 CANCELLATION)"
+refund tx-w1 "$M1"
+check "a second delivery of the refund is a duplicate" duplicate "$(json_get status)"
 check "a refund is reversed only once" 66 "$(balance_of key_link)"
 call POST /v1/admin/credits/adjust key_admin '{"user_id":"u-link","amount":3,"reason":"local test"}'
 check "an admin credit is accepted" 200 "$STATUS"
@@ -242,7 +252,7 @@ sql_json "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, a
 sql_json "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at) VALUES ('p-stripe', 'dreameater', 'u-link2', 'small', 5, 299, 'stripe', 'cs_waiting', 'pending', '$OLD')" >/dev/null
 sql_json "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, linked_at) VALUES ('dreameater', 'u-move', '$M_MOVING', 'moving', '$OLD')" >/dev/null
 trigger_cron
-check "the stale RevenueCat purchase was completed" completed "$(sql_value "SELECT status FROM credit_purchases WHERE id = 'p-stale'")"
+check "the stale App Store purchase was completed" completed "$(sql_value "SELECT status FROM credit_purchases WHERE id = 'p-stale'")"
 check "and credited once" 70 "$(balance_of key_link2)"
 check "a Stripe purchase waiting for its payment was left alone" pending "$(sql_value "SELECT status FROM credit_purchases WHERE id = 'p-stripe'")"
 check "the stale moving link was finished" linked "$(sql_value "SELECT state FROM wallet_links WHERE user_id = 'u-move'")"
@@ -251,19 +261,22 @@ check "and left D1" 0 "$(sql_value "SELECT balance FROM user_credits WHERE user_
 trigger_cron
 check "a second cron credits nothing twice" 70 "$(balance_of key_link2)"
 
-echo "== grants addressed to a Midgar ID with no user yet"
-webhook "$(purchase_event "$M_UNKNOWN" tx-unknown)"
-check "a Midgar ID identity does not hold is refused so the sender retries" 500 "$STATUS"
+echo "== a grant for a Midgar ID that only ever used its token"
+grant tx-unknown "$M_UNKNOWN"
+check "a Midgar ID nobody uses here is refused for good" "refused not_linked" "$(json_get status) $(json_get reason)"
 check "and creates no user" 0 "$(sql_value "SELECT COUNT(*) FROM users WHERE provider_id = '$M_UNKNOWN'")"
-webhook "$(purchase_event "not-a-user-or-a-uuid" tx-garbage)"
-check "an id that is neither a user nor a Midgar ID is refused" 500 "$STATUS"
-webhook "$(purchase_event "$(upper "$M_SECOND")" tx-second)"
-check "a Midgar ID identity holds is accepted" 200 "$STATUS"
+grant tx-garbage not-a-user-or-a-uuid
+check "an id that is neither a user nor a Midgar ID is refused for good" "refused not_a_midgar_id" "$(json_get status) $(json_get reason)"
+call_native GET /v1/credits/balance "$(minted_token second)"
+check "the buyer's first request with only its token opens its wallet" 200 "$STATUS"
+SECOND_START="$(json_get balance)"
+grant tx-second "$(upper "$M_SECOND")"
+check "a grant naming that Midgar ID is credited" credited "$(json_get status)"
 check "it got a Midgar user" 1 "$(sql_value "SELECT COUNT(*) FROM users WHERE provider = 'midgar' AND provider_id = '$M_SECOND'")"
 check "and a linked wallet with nothing to move" "linked 0" "$(sql_value "SELECT state || ' ' || moved_credits FROM wallet_links WHERE midgar_id = '$M_SECOND'")"
-check "holding the purchase" 5 "$(summary_of balance "$M_SECOND")"
+check "holding the purchase" $((SECOND_START + 5)) "$(summary_of balance "$M_SECOND")"
 call_native GET /v1/credits/balance "$(minted_token second)"
-check "the buyer's first request with only its token finds the wallet" 5 "$(json_get balance)"
+check "the buyer reads it" $((SECOND_START + 5)) "$(json_get balance)"
 
 echo "== Midgar-ID-native requests"
 call_native GET /v1/credits/balance "$(minted_token native)"
@@ -303,7 +316,7 @@ check "and one with the other route's secret" 401 "$STATUS"
 internal_call /internal/wallet/erase_all "$LIFECYCLE_SECRET" '{"id":"not-a-midgar-id"}'
 check "an id that cannot be a Midgar ID is ignored, not retried for ever" 200 "$STATUS"
 check "and says so" ignored "$(json_get status)"
-check "before the erasure the wallet holds the purchase" 5 "$(summary_of balance "$M_SECOND")"
+check "before the erasure the wallet holds the purchase" $((SECOND_START + 5)) "$(summary_of balance "$M_SECOND")"
 M1_BEFORE="$(summary_of balance "$M1")"
 internal_call /internal/wallet/erase_all "$LIFECYCLE_SECRET" "{\"id\":\"$(upper "$M_SECOND")\"}"
 check "the erasure is accepted for the ID in capitals" 200 "$STATUS"
@@ -313,8 +326,8 @@ check "its link row is gone" 0 "$(sql_value "SELECT COUNT(*) FROM wallet_links W
 internal_call /internal/wallet/erase_all "$LIFECYCLE_SECRET" "{\"id\":\"$M_SECOND\"}"
 check "erasing again is a no-op" no_wallet "$(json_get status)"
 check "another Midgar ID's wallet is untouched" "$M1_BEFORE" "$(summary_of balance "$M1")"
-webhook "$(purchase_event "$M_SECOND" tx-after-erase)"
-check "a purchase addressed to the erased ID is refused so the sender retries" 500 "$STATUS"
+grant tx-after-erase "$M_SECOND"
+check "a purchase addressed to the erased ID is refused for good" "refused not_linked" "$(json_get status) $(json_get reason)"
 check "and credits nothing" 0 "$(sql_value "SELECT COALESCE(SUM(balance), 0) FROM wallet_summary WHERE midgar_id = '$M_SECOND'")"
 
 echo "== identity merged a Midgar ID away: its wallet moves into the survivor's"
@@ -323,8 +336,8 @@ MNOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sql_json "INSERT INTO users (id, provider, provider_id, name, api_key_hash, created_at, updated_at, app_id) VALUES ('u-merge', 'anonymous', 'merge', 'Merge', '$(key_hash key_merge)', '$MNOW', '$MNOW', 'dreameater')" >/dev/null
 sql_json "INSERT INTO user_credits (app_id, user_id, balance, created_at, updated_at) VALUES ('dreameater', 'u-merge', 0, '$MNOW', '$MNOW')" >/dev/null
 sql_json "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, moved_credits, welcome_part, linked_at) VALUES ('dreameater', 'u-merge', '$M_MERGED', 'linked', 0, 0, '$MNOW')" >/dev/null
-webhook "$(purchase_event u-merge tx-merge-1)"
-check "a purchase reaches the wallet that is about to be merged away" 200 "$STATUS"
+grant tx-merge-1 u-merge
+check "a purchase reaches the wallet that is about to be merged away" credited "$(json_get status)"
 check "which holds it" 5 "$(summary_of balance "$M_MERGED")"
 call GET /v1/credits/balance key_merge
 check "and the user reads it" 5 "$(json_get balance)"
@@ -354,9 +367,6 @@ check "which paid for it" $((M1_BEFORE_MERGE + 4)) "$(balance_of key_link)"
 
 echo "== the ledger forwards a verified consumable: credited once, shared with the other paths"
 M1_BEFORE_GRANT="$(balance_of key_link)"
-grant_body() {
-  printf '{"transactionId":"%s","originalTransactionId":"%s","bundleId":"com.marcusziade.DreamEater","productId":"com.dreameater.credits.small","type":"Consumable","appAccountToken":"%s","environment":"Production","purchaseDate":1760000000000,"revocationDate":null,"inAppOwnershipType":"PURCHASED","quantity":1,"registrySlug":"dream-eater"}' "$1" "$1" "$2"
-}
 internal_call /internal/wallet/grant "" "$(grant_body tx-led-1 "$M1")"
 check "the grant route refuses a request without the secret" 401 "$STATUS"
 internal_call /internal/wallet/grant "$LIFECYCLE_SECRET" "$(grant_body tx-led-1 "$M1")"
@@ -369,8 +379,9 @@ internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body tx-led-1 "$M1
 check "the same transaction again" duplicate "$(json_get status)"
 check "gives one wallet entry" $((M1_BEFORE_GRANT + 5)) "$(balance_of key_link)"
 check "and one purchase row" 1 "$(sql_value "SELECT COUNT(*) FROM credit_purchases WHERE payment_id = 'tx-led-1'")"
-webhook "$(purchase_event u-link tx-led-1)"
-check "the RevenueCat webhook for the same transaction credits nothing more" $((M1_BEFORE_GRANT + 5)) "$(balance_of key_link)"
+signed_validate key_link "$(minted_token valid)" "$(validate_body tx-led-1 "$M1")"
+check "the signed validate call for the same transaction is already processed" already_processed "$(json_get error/code)"
+check "and credits nothing more" $((M1_BEFORE_GRANT + 5)) "$(balance_of key_link)"
 internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body tx-led-2 "$M_UNKNOWN")"
 check "a Midgar ID nobody is linked to is refused for good, not retried" "refused not_linked" "$(json_get status) $(json_get reason)"
 check "and credits nothing" 0 "$(sql_value "SELECT COUNT(*) FROM credit_purchases WHERE payment_id = 'tx-led-2'")"
@@ -378,6 +389,50 @@ internal_call /internal/wallet/grant "$GRANT_SECRET" "$(grant_body tx-led-3 "$M1
 check "a non-consumable is refused" "refused not_consumable" "$(json_get status) $(json_get reason)"
 internal_call /internal/wallet/grant "$GRANT_SECRET" '{"nope":1}'
 check "a body that is no transaction is a 400 the ledger logs" 400 "$STATUS"
+
+echo "== an older build's pack lands in the D1 balance of a user with no wallet, and its refund comes back out of it"
+FREE_BEFORE="$(balance_of key_free)"
+grant tx-local-1 u-free
+check "a grant naming a user with no wallet is credited" credited "$(json_get status)"
+check "to its D1 balance" $((FREE_BEFORE + 5)) "$(balance_of key_free)"
+check "no link was made" 0 "$(sql_value "SELECT COUNT(*) FROM wallet_links WHERE user_id = 'u-free'")"
+grant tx-local-2 u-free large
+check "a second pack" $((FREE_BEFORE + 20)) "$(balance_of key_free)"
+refund tx-local-2 u-free large
+check "its refund is reversed in full" "reversed 15" "$(json_get status) $(json_get taken)"
+check "out of the D1 balance" $((FREE_BEFORE + 5)) "$(balance_of key_free)"
+check "the purchase reads refunded" refunded "$(sql_value "SELECT status FROM credit_purchases WHERE payment_id = 'tx-local-2'")"
+refund tx-local-2 u-free large
+check "a second delivery is a duplicate" duplicate "$(json_get status)"
+check "the reversal is in the D1 ledger once" 1 "$(sql_value "SELECT COUNT(*) FROM credit_transactions WHERE reference_id = 'refund:tx-local-2'")"
+sql_json "UPDATE user_credits SET balance = 2 WHERE user_id = 'u-free'" >/dev/null
+refund tx-local-1 u-free
+check "a refund larger than what is left takes the rest" "reversed 2" "$(json_get status) $(json_get taken)"
+check "and never goes below zero" 0 "$(balance_of key_free)"
+refund tx-local-3 u-free
+check "a refund of a pack nothing credited yet is recorded" recorded "$(json_get status)"
+grant tx-local-3 u-free
+check "and the grant that follows credits nothing" "refused refunded" "$(json_get status) $(json_get reason)"
+check "the balance stays empty" 0 "$(balance_of key_free)"
+
+echo "== premium comes from the ledger's entitlements for the caller's Midgar ID"
+PREMIUM_READING='{"alias":"test.reading","input":"{\"dream\":\"a pier\"}","idempotency_key":"pk1","language":"Finnish"}'
+call_token POST /v1/run/chat.completion key_premium "$(minted_token premium)" "$PREMIUM_READING"
+check "a caller whose Midgar ID holds premium reads for free" 0 "$(json_get credits_charged)"
+check "without touching the weekly bucket" 1 "$(json_get free_remaining)"
+check "the strict tenant remembers the answer" 1 "$(sql_value "SELECT premium_cached FROM users WHERE id = 'u-premium'")"
+call_token POST /v1/images/generations key_premium "$(minted_token premium)" '{"style":"gilded","scene":"A key in a door","n":2,"idempotency_key":"p2"}'
+check "premium art 200 with two images" 2 "$(python3 -I -c 'import json;print(len(json.load(open("'"$BODY"'"))["data"]))')"
+check "premium art is free" 0 "$(json_get credits_charged)"
+call_native POST /v1/run/chat.completion "$(minted_token premium_down)" '{"alias":"test.reading","input":"{}","idempotency_key":"pd1"}'
+check "while the ledger cannot answer and nothing is remembered, the caller is not premium" 1 "$(json_get free_remaining)"
+sql_json "UPDATE users SET premium_cached = 1, premium_checked_at = '$(date -u +%Y-%m-%dT%H:%M:%S+00:00)' WHERE provider_id = '$M_PREMIUM_DOWN'" >/dev/null
+call_native POST /v1/run/chat.completion "$(minted_token premium_down)" '{"alias":"test.reading","input":"{}","idempotency_key":"pd2"}'
+check "a premium answer from the last 24 hours carries the strict tenant through the outage" 1 "$(json_get free_remaining)"
+check "for free" 0 "$(json_get credits_charged)"
+sql_json "UPDATE users SET premium_checked_at = '2025-01-01T00:00:00+00:00' WHERE provider_id = '$M_PREMIUM_DOWN'" >/dev/null
+call_native POST /v1/run/chat.completion "$(minted_token premium_down)" '{"alias":"test.reading","input":"{}","idempotency_key":"pd3"}'
+check "an older answer does not" 0 "$(json_get free_remaining)"
 
 echo "== deleting an account erases its wallet partition"
 call_native DELETE /v1/identity "$(minted_token native)"

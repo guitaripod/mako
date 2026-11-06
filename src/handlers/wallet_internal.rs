@@ -74,8 +74,8 @@ fn refund_answer(outcome: &RefundOutcome) -> Value {
 
 /// `POST /internal/wallet/refund`: the ledger forwards a verified consumable transaction that Apple refunded. Needs
 /// `WALLET_INTERNAL_SECRET` in `X-Midgar-Internal` and `LEDGER_GRANTS = "on"`; either missing is 404. Takes the pack's
-/// credits back from the buyer's wallet, down to a zero balance, once per store transaction and under the claim the
-/// RevenueCat webhook shares. With `WALLET_LINKING` off nothing is reversed, because no wallet exists. A wallet that
+/// credits back from the buyer's wallet or, for a buyer with none, from the D1 balance, down to zero, once per store
+/// transaction under one claim. With `WALLET_LINKING` off nothing is reversed. A wallet that
 /// cannot answer is a 503 the ledger retries.
 pub async fn refund(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     match refund_inner(&mut req, &ctx.env).await {

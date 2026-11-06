@@ -222,7 +222,7 @@ fn linked_wallet(d1: &LocalD1) -> Account {
 }
 
 fn credit(d1: &LocalD1, wallets: &FakeWallets, account: &Account) -> Option<bool> {
-    let status = block_on(purchase::revenuecat_status(d1, APP, TX)).unwrap();
+    let status = block_on(purchase::store_status(d1, APP, TX)).unwrap();
     if already_settled(status.as_deref()) {
         return None;
     }
@@ -239,7 +239,7 @@ fn a_signed_purchase_grants_under_the_transaction_key_and_a_replay_credits_nothi
     assert_eq!(credit(&d1, &wallets, &account), Some(true));
     assert_eq!(wallets.balance(MIDGAR, APP), 5);
     let (status, entry) = wallets.call(MIDGAR, "GET", &format!("/entry?tenant={APP}&key=tx:{TX}"), None);
-    assert_eq!(status, 200, "the grant is stored under the key the RevenueCat webhook uses");
+    assert_eq!(status, 200, "the grant is stored under the key the ledger's grant uses");
     assert_eq!(entry["amount"], 5);
     assert_eq!(credit(&d1, &wallets, &account), None);
     assert_eq!(wallets.balance(MIDGAR, APP), 5);
@@ -247,21 +247,21 @@ fn a_signed_purchase_grants_under_the_transaction_key_and_a_replay_credits_nothi
 }
 
 #[test]
-fn the_webhook_after_a_signed_purchase_and_before_it_credit_one_pack_between_them() {
+fn the_ledger_grant_after_a_signed_purchase_and_before_it_credit_one_pack_between_them() {
     let d1 = LocalD1::migrated();
     let wallets = FakeWallets::new();
     let account = linked_wallet(&d1);
     assert_eq!(credit(&d1, &wallets, &account), Some(true));
-    assert_eq!(block_on(purchase::revenuecat_status(&d1, APP, TX)).unwrap().as_deref(), Some("completed"));
-    let webhook = block_on(purchase::record_pending(&d1, APP, "u1", "small", 5, 299, TX)).unwrap();
-    let row = block_on(purchase::read(&d1, &webhook)).unwrap().unwrap();
-    assert!(!block_on(purchase::complete_in_wallet(&d1, &wallets, &account, &row)).unwrap(), "the webhook finds the purchase completed");
+    assert_eq!(block_on(purchase::store_status(&d1, APP, TX)).unwrap().as_deref(), Some("completed"));
+    let grant = block_on(purchase::record_pending(&d1, APP, "u1", "small", 5, 299, TX)).unwrap();
+    let row = block_on(purchase::read(&d1, &grant)).unwrap().unwrap();
+    assert!(!block_on(purchase::complete_in_wallet(&d1, &wallets, &account, &row)).unwrap(), "the grant finds the purchase completed");
     assert_eq!(wallets.balance(MIDGAR, APP), 5);
     assert_eq!(d1.int("SELECT COUNT(*) FROM credit_purchases WHERE payment_id = ?1", &[TX.into()]), 1);
 }
 
 #[test]
-fn a_signed_purchase_after_the_webhook_is_already_processed() {
+fn a_signed_purchase_after_the_ledger_grant_is_already_processed() {
     let d1 = LocalD1::migrated();
     let wallets = FakeWallets::new();
     let account = linked_wallet(&d1);

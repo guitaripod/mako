@@ -235,8 +235,8 @@ pub fn check(transaction: &LedgerTransaction, expected: &Expected<'_>) -> Result
 }
 
 /// Verifies a signed transaction through the ledger and checks it against what the request claims. A payload that
-/// does not verify is `unverifiable_purchase`; a ledger that cannot be asked is `credit_pending`, because the
-/// RevenueCat webhook credits the same transaction under the same key; a refusal is its own error.
+/// does not verify is `unverifiable_purchase`; a ledger that cannot be asked is `credit_pending`, because the ledger's
+/// grant credits the same transaction under the same key from Apple's notification; a refusal is its own error.
 pub async fn vet<V: TransactionVerifier>(verifier: &V, signed_transaction: &str, expected: &Expected<'_>) -> Result<LedgerTransaction, AppError> {
     let transaction = match verifier.verify(signed_transaction).await {
         Ok(transaction) => transaction,
@@ -256,8 +256,8 @@ pub async fn tenant_bundle(db: &impl D1Exec, app_id: &str) -> Result<Option<Stri
     Ok(rows.first().and_then(|row| text(row, "apple_app_bundle_id")).filter(|bundle| !bundle.is_empty()).map(str::to_string))
 }
 
-/// The tenant a product belongs to and the `rc_product_prefix` that claims it: the longest prefix wins, as in the
-/// RevenueCat webhook. `None` when no tenant's prefix starts the product id.
+/// The tenant a product belongs to and the `rc_product_prefix` that claims it: the longest prefix wins, so the most
+/// specific tenant does. `None` when no tenant's prefix starts the product id.
 pub async fn tenant_of_product(db: &impl D1Exec, product_id: &str) -> Result<Option<(String, String)>, AppError> {
     let rows = db
         .rows(
@@ -273,8 +273,8 @@ pub async fn tenant_of_product(db: &impl D1Exec, product_id: &str) -> Result<Opt
 }
 
 /// The pack id a product resolves to for a tenant: the product must start with the tenant's own `rc_product_prefix`
-/// and no other tenant's longer prefix may claim it (the longest prefix wins, as in the RevenueCat webhook). `None`
-/// when the product is no pack of this tenant.
+/// and no other tenant's longer prefix may claim it (the longest prefix wins). `None` when the product is no pack of
+/// this tenant.
 pub async fn pack_of_product(db: &impl D1Exec, app_id: &str, product_id: &str) -> Result<Option<String>, AppError> {
     let Some((owner, prefix)) = tenant_of_product(db, product_id).await? else { return Ok(None) };
     if owner != app_id {
@@ -301,8 +301,8 @@ pub async fn tenant_facts(db: &impl D1Exec, app_id: &str) -> Result<Option<Tenan
     }))
 }
 
-/// True when the RevenueCat-keyed purchase row of a transaction exists and is no longer `pending`: it was credited
-/// (by the webhook or an earlier call) or settled some other way, and is never credited again. A `pending` row is
+/// True when the App Store pack purchase row of a transaction exists and is no longer `pending`: it was credited
+/// (by the ledger's grant or an earlier call) or settled some other way, and is never credited again. A `pending` row is
 /// finished by the next call, since the grant under its key is idempotent.
 pub fn already_settled(status: Option<&str>) -> bool {
     matches!(status, Some(status) if status != "pending")
@@ -312,8 +312,7 @@ pub fn already_settled(status: Option<&str>) -> bool {
 /// been processed") or as a retry ("could not be verified"), so that such a client treats it as final.
 pub const REFUNDED_MESSAGE: &str = "This purchase was refunded, so it is not credited.";
 
-/// The text of every `credit_pending` answer of the validate route. It is the sentence the fast-track always
-/// meant, now visible instead of masked behind a 500.
+/// The text of every `credit_pending` answer of the validate route, which clients show while the credit follows.
 pub const PENDING_MESSAGE: &str = "Could not verify the purchase right now; it will be credited shortly.";
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

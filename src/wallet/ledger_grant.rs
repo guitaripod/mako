@@ -49,16 +49,16 @@ impl Reason {
 pub enum Outcome {
     /// This call credited the pack; the caller tags the purchase with its ad attribution.
     Credited { app_id: String, user_id: String, purchase_id: String, pack_id: String, credits: u32, amount_usd_cents: i64 },
-    /// The transaction was credited before, by this route, the RevenueCat webhook or the client's validate call.
+    /// The transaction was credited before, by this route or the client's validate call.
     Duplicate { purchase_id: String },
     Refused(Reason),
 }
 
 /// Credits the consumable a verified StoreKit 2 transaction describes to the buyer its `appAccountToken` names, once per
 /// store transaction: the wallet of a Midgar ID some user is linked to (MidgarStore apps), or the user whose mako id it
-/// is (RevenueCat apps), in that user's wallet when linked and in the D1 balance otherwise. The grant key is
-/// `tx:<transactionId>` and the purchase row is the RevenueCat one, which the RevenueCat webhook and the client's
-/// validate call share, so no two paths credit one purchase twice. The tenant comes from the product id, and the
+/// is (builds from before MidgarStore), in that user's wallet when linked and in the D1 balance otherwise. The grant
+/// key is `tx:<transactionId>` and the purchase row is the one the client's validate call shares, so no two paths
+/// credit one purchase twice. The tenant comes from the product id, and the
 /// transaction is held to the rules of the validate call (bundle, product, consumable, not revoked, purchased, quantity
 /// one). A Midgar ID no user is linked to is refused: identity may not know it, and the client's
 /// validate call credits it. A purchase row left `pending` by a crash is finished, and one that belongs to another
@@ -140,8 +140,8 @@ pub async fn credit<D: D1Exec, W: WalletTransport>(
 }
 
 /// The user of the tenant the transaction's `appAccountToken` names: the oldest user linked to it as a Midgar ID, else
-/// the tenant's user with that id. Apps on the RevenueCat SDK log RevenueCat in as their mako user and RevenueCat copies
-/// that UUID into `appAccountToken`, so their purchases name the user directly, linked to a wallet or not.
+/// the tenant's user with that id. Builds from before MidgarStore put the mako user's UUID into `appAccountToken`, so
+/// their purchases name the user directly, linked to a wallet or not.
 async fn buyer_of<D: D1Exec>(db: &D, app_id: &str, token: &str) -> Result<Option<String>, AppError> {
     if let Some(link) = links::oldest_for_midgar(db, app_id, token).await? {
         return Ok(Some(link.user_id));

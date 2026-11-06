@@ -506,34 +506,6 @@ pub async fn record_purchase(
     Ok(purchase_id)
 }
 
-/// Records a RevenueCat purchase and completes it into the D1 balance, guarding against a second
-/// `credit_purchases` row ever being created for the same
-/// `(app_id, payment_provider, payment_id)` — the webhook and the client
-/// fast-track both reach this for the same external transaction and can race
-/// each other, unlike Stripe/crypto where the caller already holds a single
-/// `purchase_id` minted up front. The row comes from `wallet::purchase::record_pending`, the
-/// one guarded statement that also refuses a transaction whose refund was claimed
-/// (`AppError::Refunded`), and the credit is `wallet::purchase::complete_locally`, one D1
-/// batch that flips the status and adds the balance together. D1 serializes writes, so a
-/// second identical attempt always sees the first one's committed row, and at most one row
-/// — and one credit — can ever exist per transaction, however many callers race.
-pub async fn record_and_complete_purchase(
-    app_id: &str,
-    user_id: &str,
-    pack_id: &str,
-    credits: u32,
-    amount_usd_cents: u32,
-    payment_id: &str,
-    db: &D1Database,
-) -> Result<String> {
-    let (purchase_id, completed) =
-        crate::wallet::purchase::record_and_complete_locally(db, app_id, user_id, pack_id, credits, amount_usd_cents, payment_id).await?;
-    if completed {
-        tag_purchase_attribution(db, app_id, user_id, &purchase_id, pack_id, amount_usd_cents as i64).await;
-    }
-    Ok(purchase_id)
-}
-
 /// Copies the buyer's Apple Ads campaign/keyword onto a completed credit-pack
 /// purchase. Best-effort by design: ad measurement must never be able to fail a
 /// purchase that has already been credited.

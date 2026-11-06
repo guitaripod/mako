@@ -224,7 +224,7 @@ fn complete<W: WalletTransport>(d1: &impl D1Exec, wallets: &W, id: &str, account
 }
 
 #[test]
-fn a_replayed_revenuecat_webhook_grants_once() {
+fn a_replayed_grant_of_one_transaction_grants_once() {
     let d1 = LocalD1::migrated();
     let wallets = FakeWallets::new();
     d1.user(APP, "u1", 0);
@@ -236,12 +236,12 @@ fn a_replayed_revenuecat_webhook_grants_once() {
     }
     assert_eq!(wallets.balance(MIDGAR, APP), 100);
     assert_eq!(d1.int("SELECT COUNT(*) FROM credit_purchases", &[]), 1);
-    assert_eq!(block_on(purchase::revenuecat_status(&d1, APP, "2000000123")).unwrap().as_deref(), Some("completed"));
+    assert_eq!(block_on(purchase::store_status(&d1, APP, "2000000123")).unwrap().as_deref(), Some("completed"));
     assert!(wallets.verified(MIDGAR));
 }
 
 #[test]
-fn the_fast_track_and_the_webhook_share_one_grant() {
+fn the_validate_call_and_the_ledger_grant_share_one_grant() {
     let d1 = LocalD1::migrated();
     let wallets = FakeWallets::new();
     d1.user(APP, "u1", 0);
@@ -326,7 +326,7 @@ fn a_purchase_in_a_terminal_state_cannot_be_completed() {
 }
 
 #[test]
-fn the_cron_lists_only_stale_pending_revenuecat_purchases() {
+fn the_cron_lists_only_stale_pending_store_purchases() {
     let d1 = LocalD1::migrated();
     d1.user(APP, "u1", 0);
     pending(&d1, "old-rc", "u1", "revenuecat", "t1", 10);
@@ -335,8 +335,8 @@ fn the_cron_lists_only_stale_pending_revenuecat_purchases() {
     d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'done-rc'", &[]);
     pending(&d1, "fresh-rc", "u1", "revenuecat", "t3", 10);
     d1.run("UPDATE credit_purchases SET created_at = '2099-01-01T00:00:00+00:00' WHERE id = 'fresh-rc'", &[]);
-    assert_eq!(block_on(purchase::stale_revenuecat(&d1, 50)).unwrap(), ["old-rc"]);
-    assert_eq!(block_on(purchase::stale_revenuecat(&d1, 0)).unwrap().len(), 0);
+    assert_eq!(block_on(purchase::stale_store_purchases(&d1, 50)).unwrap(), ["old-rc"]);
+    assert_eq!(block_on(purchase::stale_store_purchases(&d1, 0)).unwrap().len(), 0);
 }
 
 #[test]
