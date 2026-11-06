@@ -84,7 +84,8 @@ async fn credit_play(env: &Env, db: &D1Database, auth: &AuthedUser, request: &Va
     }
     let ledgers = Ledgers::new(env, db);
     let credits = (pack.credits + pack.bonus_credits) as u32;
-    let credited = credit_pack(db, &ledgers, app_id, auth.account.user_id(), &pack.id, credits, pack.price_usd_cents as u32, &payment_id).await;
+    let charged = bought.charged_cents(pack.price_usd_cents as u32);
+    let credited = credit_pack(db, &ledgers, app_id, auth.account.user_id(), &pack.id, credits, charged, &payment_id).await;
     let purchase_id = match credited {
         Ok(Credit::Credited { purchase_id }) => purchase_id,
         Ok(Credit::Duplicate) => {

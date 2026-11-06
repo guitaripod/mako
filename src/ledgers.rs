@@ -265,7 +265,7 @@ impl<'a> Ledgers<'a> {
             }
             Account::Local { .. } => purchase::complete_locally(self.db, purchase_id).await?,
         };
-        if completed {
+        if completed && purchase::is_sale(&row) {
             credits::tag_purchase_attribution(self.db, &row.app_id, &row.user_id, &row.id, &row.pack_id, row.amount_usd_cents).await;
         }
         Ok(())

@@ -72,6 +72,12 @@ impl PurchaseRow {
 
 const COLUMNS: &str = "id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status";
 
+/// True when the purchase cost the buyer something. A Google Play license-test or promo purchase is recorded at no
+/// price: it is credited but is no sale, so it is never attributed to an ad.
+pub fn is_sale(row: &PurchaseRow) -> bool {
+    row.amount_usd_cents > 0
+}
+
 /// The idempotency key a purchase grants under: the store transaction id for a store pack (for the App Store the key the
 /// ledger's grant and the validate call share, for Google Play `tx:gp:<orderId>`), and the purchase id for Stripe and
 /// crypto, whose payment ids are not minted by us.

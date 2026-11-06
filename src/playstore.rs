@@ -118,6 +118,22 @@ impl ProductPurchase {
     pub fn acknowledged(&self) -> bool {
         self.acknowledgement_state == Some(ACKNOWLEDGED)
     }
+
+    /// True when the buyer paid through the standard billing flow. Google sets `purchaseType` only for the others: a
+    /// license tester's purchase (0), a redeemed promo code (1) and a rewarded ad (2), none of which charged anyone.
+    pub fn paid(&self) -> bool {
+        self.purchase_type.is_none()
+    }
+
+    /// What the purchase is recorded as having cost: the pack's price when it was paid, nothing otherwise, so a test or
+    /// promo purchase is credited like an App Store sandbox one but never counted as revenue or attributed to an ad.
+    pub fn charged_cents(&self, pack_price_usd_cents: u32) -> u32 {
+        if self.paid() {
+            pack_price_usd_cents
+        } else {
+            0
+        }
+    }
 }
 
 /// The access token of one isolate and the service account it was issued to.

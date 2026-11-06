@@ -431,6 +431,38 @@ fn refusals_answer_with_the_credit_codes_the_app_reads() {
 }
 
 #[test]
+fn only_a_purchase_through_the_billing_flow_is_charged() {
+    assert!(purchase().paid());
+    assert_eq!(purchase().charged_cents(299), 299);
+    for kind in [0, 1, 2] {
+        let free = ProductPurchase { purchase_type: Some(kind), ..purchase() };
+        assert!(!free.paid(), "{kind}");
+        assert_eq!(free.charged_cents(299), 0, "{kind}");
+        assert_eq!(check(&free, &expected()), Ok(()), "a test or promo purchase is still credited");
+    }
+}
+
+#[test]
+fn a_test_purchase_is_credited_at_no_price_and_is_no_sale() {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    d1.user("pixie", "u1", 0);
+    let tester = ProductPurchase { purchase_type: Some(0), ..purchase() };
+    let credited = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, tester.charged_cents(299), &payment_id(&tester, TOKEN))).unwrap();
+    let Credit::Credited { purchase_id } = credited else { panic!("{credited:?}") };
+    let row = block_on(purchase::read(&d1, &purchase_id)).unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.amount_usd_cents), ("completed", 0));
+    assert!(!purchase::is_sale(&row));
+    assert_eq!(d1.int("SELECT balance FROM user_credits WHERE app_id = 'pixie' AND user_id = 'u1'", &[]), 150);
+    assert_eq!(d1.int("SELECT COALESCE(SUM(amount_usd_cents), 0) FROM credit_purchases WHERE app_id = 'pixie' AND status = 'completed'", &[]), 0);
+
+    let paid = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, purchase().charged_cents(299), "gp:GPA.paid")).unwrap();
+    let Credit::Credited { purchase_id } = paid else { panic!("{paid:?}") };
+    assert!(purchase::is_sale(&block_on(purchase::read(&d1, &purchase_id)).unwrap().unwrap()));
+}
+
+#[test]
 fn a_purchase_is_keyed_by_its_order_or_else_by_a_hash_of_its_token() {
     assert_eq!(payment_id(&purchase(), TOKEN), format!("gp:{ORDER}"));
     let promo = ProductPurchase { order_id: None, ..purchase() };
