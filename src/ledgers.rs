@@ -271,7 +271,7 @@ impl<'a> Ledgers<'a> {
         Ok(())
     }
 
-    /// Cron: finishes App Store pack purchases that stayed `pending` for more than five minutes. Returns how many it
+    /// Cron: finishes store pack purchases that stayed `pending` for more than five minutes. Returns how many it
     /// completed; one that fails is logged and left for the next run.
     pub async fn sweep_pending_purchases(&self) -> Result<u32> {
         let mut completed = 0;

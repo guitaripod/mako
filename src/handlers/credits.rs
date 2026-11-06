@@ -927,6 +927,9 @@ pub struct ValidatePurchaseRequest {
     /// MidgarStore send none; their packs are credited from Apple's notification through the ledger's grant instead.
     #[serde(default)]
     pub signed_transaction: Option<String>,
+    /// The Google Play order id the Android app saw (`Purchase.getOrderId`), checked against Google's answer when sent.
+    #[serde(default)]
+    pub play_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -939,7 +942,8 @@ pub struct ValidatePurchaseResponse {
 
 /// `POST /v1/credits/purchase/validate` and its original path `POST /v1/credits/purchase/revenuecat/validate`, which
 /// the apps in the field call: binds the claimed product to the claimed pack of this tenant and credits the pack once
-/// the ledger has verified the StoreKit 2 transaction (`storekit::validate_signed`). A request without a signed
+/// its store confirms it. An Android purchase is confirmed by Google Play (`playstore::validate_play`); an iOS one once
+/// the ledger has verified the StoreKit 2 transaction (`storekit::validate_signed`). An iOS request without a signed
 /// transaction comes from a build older than MidgarStore and is answered `credit_pending` without a grant: Apple's
 /// notification reaches the ledger, whose grant credits the pack to the user named in the transaction's
 /// `appAccountToken`.
@@ -988,6 +992,9 @@ pub async fn validate_purchase(mut req: Request, ctx: RouteContext<()>) -> Resul
         .find(|p| p.id == validate_req.pack_id)
         .ok_or_else(|| AppError::BadRequest("Invalid pack_id".to_string()))?;
 
+    if validate_req.platform == "android" {
+        return crate::handlers::playstore::validate_play(&env, &db, &auth, &validate_req, pack).await;
+    }
     if validate_req.signed_transaction.as_deref().is_some_and(|signed| !signed.trim().is_empty()) {
         return crate::handlers::storekit::validate_signed(&req, &env, &db, &auth, &validate_req, pack).await;
     }

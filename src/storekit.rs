@@ -301,7 +301,7 @@ pub async fn tenant_facts(db: &impl D1Exec, app_id: &str) -> Result<Option<Tenan
     }))
 }
 
-/// True when the App Store pack purchase row of a transaction exists and is no longer `pending`: it was credited
+/// True when the store pack purchase row of a transaction exists and is no longer `pending`: it was credited
 /// (by the ledger's grant or an earlier call) or settled some other way, and is never credited again. A `pending` row is
 /// finished by the next call, since the grant under its key is idempotent.
 pub fn already_settled(status: Option<&str>) -> bool {

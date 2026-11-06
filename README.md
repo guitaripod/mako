@@ -7,7 +7,7 @@ Midgar's shared AI backend: a Rust Cloudflare Worker that puts OpenAI, Gemini an
 ## What it does
 
 - **Tenants** by the `X-App-ID` header: each app has its own credit packs, capability costs and premium entitlement in D1.
-- **Credits** reserve, then settle, with a scheduled sweep for orphaned reservations. Packs are App Store purchases whose signed transactions the app posts to the validate route; the wallet is credited once.
+- **Credits** reserve, then settle, with a scheduled sweep for orphaned reservations. Packs are App Store purchases whose signed transactions the app posts to the validate route, or Google Play purchases whose tokens mako checks with the Google Play Developer API; the wallet is credited once per store transaction.
 - **Premium** users are not charged credits (`credits_charged: 0`). The purchase ledger lists the entitlements of the caller's Midgar ID; a strict tenant keeps the last answer for 24 hours in case the ledger cannot answer.
 - **Capabilities** under `/v1/run/<capability>`: `chat.completion` (text and vision, routed by model id), `image` generation and editing (OpenAI, Gemini) and `realtime.translate` (short-lived tokens for metered realtime sessions).
 - **Apple Ads attribution**: `POST /v1/attribution` exchanges an AdServices token with Apple and records the campaign, ad group and keyword behind an install; `GET /v1/attribution/keywords` reports installs, payers and revenue per keyword. No advertising identifier, no ATT prompt, and only a SHA-256 fingerprint of the token is stored.

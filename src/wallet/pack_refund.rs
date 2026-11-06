@@ -36,7 +36,7 @@ pub async fn refundable_purchase(db: &impl D1Exec, app_id: &str, transaction_id:
                 "SELECT id, user_id, credits, status FROM credit_purchases
                  WHERE app_id = ?1 AND {} AND payment_id = ?2 AND status IN ('pending', 'completed', 'refunded')
                  ORDER BY created_at LIMIT 1",
-                super::purchase::IS_APP_STORE
+                super::purchase::IS_STORE_PACK
             ),
             &[app_id.into(), transaction_id.into()],
         )

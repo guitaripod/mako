@@ -12,17 +12,33 @@ use crate::error::AppError;
 use crate::ledgers::Account;
 use crate::storekit::REFUNDED_MESSAGE;
 
-/// A stored App Store pack purchase waits this long as `pending` before the cron finishes it.
+/// A stored store pack purchase waits this long as `pending` before the cron finishes it.
 const PENDING_AFTER_MINUTES: i64 = 5;
 
-/// Pending App Store pack purchases one cron run completes.
+/// Pending store pack purchases one cron run completes.
 pub const SWEEP_LIMIT: i64 = 50;
 
 /// The `payment_provider` of an App Store pack purchase.
 pub const APP_STORE: &str = "app_store";
 
-/// Matches App Store pack purchases.
-pub const IS_APP_STORE: &str = "payment_provider = 'app_store'";
+/// The `payment_provider` of a Google Play pack purchase.
+pub const PLAY_STORE: &str = "play_store";
+
+/// The prefix of a Google Play purchase's payment id, which keeps Google's order ids apart from App Store transaction ids
+/// in every table keyed by a store transaction (`credit_purchases.payment_id`, `purchase_refunds`, the wallet's `tx:` key).
+pub const PLAY_PAYMENT_PREFIX: &str = "gp:";
+
+/// Matches pack purchases made through a store: the App Store and Google Play.
+pub const IS_STORE_PACK: &str = "payment_provider IN ('app_store', 'play_store')";
+
+/// The store a pack purchase's payment id belongs to.
+pub fn store_provider(payment_id: &str) -> &'static str {
+    if payment_id.starts_with(PLAY_PAYMENT_PREFIX) {
+        PLAY_STORE
+    } else {
+        APP_STORE
+    }
+}
 
 /// One `credit_purchases` row, as the completion needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,11 +72,12 @@ impl PurchaseRow {
 
 const COLUMNS: &str = "id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status";
 
-/// The idempotency key a purchase grants under: the store transaction id for an App Store pack, which the ledger's grant
-/// and the validate call share, and the purchase id for Stripe and crypto, whose payment ids are not minted by us.
+/// The idempotency key a purchase grants under: the store transaction id for a store pack (for the App Store the key the
+/// ledger's grant and the validate call share, for Google Play `tx:gp:<orderId>`), and the purchase id for Stripe and
+/// crypto, whose payment ids are not minted by us.
 pub fn grant_key(row: &PurchaseRow) -> String {
     match row.provider.as_str() {
-        APP_STORE => format!("tx:{}", row.payment_id),
+        APP_STORE | PLAY_STORE => format!("tx:{}", row.payment_id),
         "stripe" => format!("stripe:{}", row.id),
         "nowpayments" => format!("crypto:{}", row.id),
         _ => format!("purchase:{}", row.id),
@@ -71,6 +88,7 @@ pub fn grant_key(row: &PurchaseRow) -> String {
 fn source_and_description(row: &PurchaseRow) -> (&'static str, String) {
     match row.provider.as_str() {
         APP_STORE => (APP_STORE, format!("App Store purchase: {} pack", row.pack_id)),
+        PLAY_STORE => (PLAY_STORE, format!("Google Play purchase: {} pack", row.pack_id)),
         "stripe" => ("stripe", format!("Card purchase: {} pack", row.pack_id)),
         "nowpayments" => ("crypto", format!("Crypto purchase: {} pack", row.pack_id)),
         _ => ("stripe", format!("Purchased {} pack", row.pack_id)),
@@ -83,18 +101,19 @@ pub async fn read(db: &impl D1Exec, purchase_id: &str) -> Result<Option<Purchase
     Ok(db.rows(&sql, &[purchase_id.into()]).await?.first().and_then(PurchaseRow::parse))
 }
 
-/// The status of the App Store pack purchase of a store transaction, if one was recorded.
+/// The status of the store pack purchase of a store transaction, if one was recorded.
 pub async fn store_status(db: &impl D1Exec, app_id: &str, payment_id: &str) -> Result<Option<String>, AppError> {
-    let sql = format!("SELECT status FROM credit_purchases WHERE app_id = ?1 AND payment_id = ?2 AND {IS_APP_STORE} ORDER BY created_at LIMIT 1");
+    let sql = format!("SELECT status FROM credit_purchases WHERE app_id = ?1 AND payment_id = ?2 AND {IS_STORE_PACK} ORDER BY created_at LIMIT 1");
     Ok(db.rows(&sql, &[app_id.into(), payment_id.into()]).await?.first().and_then(|r| text(r, "status")).map(str::to_string))
 }
 
-/// Records an App Store pack purchase as `pending` unless the transaction already has a row or its refund was claimed, and
+/// Records a store pack purchase as `pending` unless the transaction already has a row or its refund was claimed, and
 /// returns the id of the row there is. This is the one place a pack purchase row is born, and the statement is the
 /// linearization point against a refund: D1 applies one statement at a time, and the insert only happens while no
 /// `purchase_refunds` claim exists, so a refund that claims first leaves no row for a credit to create
 /// (`AppError::Refunded`), and a refund that claims after finds the row this statement made. The validate call and the
-/// ledger's grant race on one transaction; at most one row ever exists for it.
+/// ledger's grant race on one transaction; at most one row ever exists for it. The payment id names the store
+/// (`store_provider`), so a Google Play order and an App Store transaction can never share a row.
 pub async fn record_pending(
     db: &impl D1Exec,
     app_id: &str,
@@ -108,8 +127,8 @@ pub async fn record_pending(
     db.exec(
         &format!(
             "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, '{APP_STORE}', ?7, 'pending', ?8
-             WHERE NOT EXISTS (SELECT 1 FROM credit_purchases WHERE app_id = ?2 AND {IS_APP_STORE} AND payment_id = ?7)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?9, ?7, 'pending', ?8
+             WHERE NOT EXISTS (SELECT 1 FROM credit_purchases WHERE app_id = ?2 AND {IS_STORE_PACK} AND payment_id = ?7)
                AND NOT EXISTS (SELECT 1 FROM purchase_refunds WHERE app_id = ?2 AND transaction_id = ?7)"
         ),
         &[
@@ -121,12 +140,13 @@ pub async fn record_pending(
             (amount_usd_cents as i64).into(),
             payment_id.into(),
             now.into(),
+            store_provider(payment_id).into(),
         ],
     )
     .await?;
     let rows = db
         .rows(
-            &format!("SELECT id FROM credit_purchases WHERE app_id = ?1 AND {IS_APP_STORE} AND payment_id = ?2 ORDER BY created_at LIMIT 1"),
+            &format!("SELECT id FROM credit_purchases WHERE app_id = ?1 AND {IS_STORE_PACK} AND payment_id = ?2 ORDER BY created_at LIMIT 1"),
             &[app_id.into(), payment_id.into()],
         )
         .await?;
@@ -327,13 +347,13 @@ pub async fn reverse_locally(
     Ok(Some(taken.max(0) as u32))
 }
 
-/// Ids of App Store pack purchases that have been `pending` for more than five minutes: the request that recorded them
+/// Ids of store pack purchases that have been `pending` for more than five minutes: the request that recorded them
 /// is gone and nobody finished the grant. Stripe and crypto rows wait for a payment and are never listed.
 pub async fn stale_store_purchases(db: &impl D1Exec, limit: i64) -> Result<Vec<String>, AppError> {
     let cutoff = (Utc::now() - Duration::minutes(PENDING_AFTER_MINUTES)).to_rfc3339();
     let rows = db
         .rows(
-            &format!("SELECT id FROM credit_purchases WHERE status = 'pending' AND {IS_APP_STORE} AND created_at < ?1 ORDER BY created_at LIMIT ?2"),
+            &format!("SELECT id FROM credit_purchases WHERE status = 'pending' AND {IS_STORE_PACK} AND created_at < ?1 ORDER BY created_at LIMIT ?2"),
             &[cutoff.into(), limit.into()],
         )
         .await?;

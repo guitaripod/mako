@@ -1505,11 +1505,19 @@ paths:
   /v1/credits/purchase/validate:
     post:
       operationId: validatePurchase
-      summary: Credit an App Store credit pack
+      summary: Credit an App Store or Google Play credit pack
       description: |
-        Credits the pack of a StoreKit 2 purchase once the Midgar purchase ledger has verified its signed transaction.
-        The pack is credited once per store transaction, the key the ledger's own grant from Apple's notification
-        also uses, so the two never credit one purchase twice.
+        `platform: ios` credits the pack of a StoreKit 2 purchase once the Midgar purchase ledger has verified its
+        signed transaction. The pack is credited once per store transaction, the key the ledger's own grant from
+        Apple's notification also uses, so the two never credit one purchase twice.
+
+        `platform: android` credits the pack of a Google Play purchase once the Google Play Developer API
+        (`purchases.products.get`, as the service account in the `GOOGLE_PLAY_SERVICE_ACCOUNT` secret) reports it
+        paid (`purchaseState` 0, not refunded), for `product_id` in the tenant's Play package (`apps.play_package_name`),
+        one pack, and made for the caller when the app set the obfuscated account id. It is credited once per Google
+        order, under `tx:gp:<orderId>`, and mako then acknowledges it so Google does not refund it while the app has
+        not consumed it yet. Consume the purchase only after a 200 or `already_processed`. Refunds made in Google Play
+        are not reversed yet (that needs Real-time developer notifications).
       tags: [Credits]
       requestBody: &validate_request
         required: true
@@ -1524,7 +1532,7 @@ paths:
                   description: The credit pack ID being purchased
                 purchase_token:
                   type: string
-                  description: The App Store transaction id of the purchase
+                  description: The App Store transaction id of the purchase, or the Google Play purchase token
                 product_id:
                   type: string
                   description: The product ID from the app store
@@ -1540,6 +1548,11 @@ paths:
                     `appAccountToken` equal to the caller's Midgar ID (`X-Midgar-Token` or a Midgar bearer). A request
                     without it comes from a build older than MidgarStore and answers 409 `credit_pending`: the ledger's
                     grant credits that pack from Apple's notification.
+                play_order_id:
+                  type: string
+                  description: |
+                    Android only: the Google Play order id the app saw (`Purchase.getOrderId`). When sent it must be the
+                    order Google reports for the token (`bad_request` otherwise).
       responses: &validate_responses
         '200':
           description: Purchase validated successfully
@@ -1559,9 +1572,11 @@ paths:
         '400':
           description: |
             Not credited. `error.code` is `already_processed` (the transaction was credited before; treat it as success),
-            `unverifiable_purchase` (the ledger could not verify the purchase; the message keeps "could not be verified",
-            which clients without codes retry on) or `bad_request` (verified but not a creditable pack purchase: wrong product, not a
-            consumable, revoked, family-shared, quantity other than 1, or a sandbox purchase where the tenant refuses them).
+            `unverifiable_purchase` (the ledger could not verify the purchase, or Google does not know the token; the
+            message keeps "could not be verified", which iOS clients without codes retry on), `refunded` (refunded,
+            canceled or voided; final) or `bad_request` (verified but not a creditable pack purchase: wrong product, not a
+            consumable, revoked, family-shared, quantity other than 1, an order id that is not Google's, or a sandbox
+            purchase where the tenant refuses them).
           content:
             application/json:
               schema:
@@ -1569,16 +1584,28 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          description: A signed transaction made in another app or by another Midgar ID (`forbidden`).
+          description: |
+            A signed transaction made in another app or by another Midgar ID, or a Google Play purchase made for another
+            account (`forbidden`).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
           description: |
-            `credit_pending`: the purchase is not credited yet (the ledger could not be asked, the wallet could not take
-            the grant, or the request carried no signed transaction). Send the same request again; the ledger's grant
-            credits it from Apple's notification too. The answer has `Retry-After: 5`.
+            `credit_pending`: the purchase is not credited yet (the ledger or Google could not be asked, the wallet
+            could not take the grant, a Google Play payment is still pending, or an iOS request carried no signed
+            transaction). Send the same request again; for iOS the ledger's grant credits it from Apple's notification
+            too. The answer has `Retry-After: 5`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: |
+            `not_configured`: Google Play purchases cannot be verified for this app (no `play_package_name`, or the
+            server has no `GOOGLE_PLAY_SERVICE_ACCOUNT`); nothing is credited. Keep the purchase unconsumed and ask
+            again later. `wallet_unavailable`: the balance could not be reached; send the request again.
           content:
             application/json:
               schema:
@@ -2442,6 +2469,7 @@ components:
                 - insufficient_credits
                 - internal_error
                 - rate_limit_exceeded
+                - service_unavailable
             param:
               type: string
               nullable: true
@@ -2461,6 +2489,8 @@ components:
                 - credit_pending
                 - already_processed
                 - unverifiable_purchase
+                - refunded
+                - not_configured
             balance:
               type: integer
               description: On a 402 `insufficient_credits`, the credits the caller holds right now (absent when the failing check did not know it).

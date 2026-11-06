@@ -23,6 +23,7 @@ VERIFY_SECRET="local-verify-secret"
 LIFECYCLE_SECRET="local-lifecycle-secret"
 GRANT_SECRET="local-grant-secret"
 SERVER_PID=""
+GOOGLE_PID=""
 FAILURES=0
 STEPS=0
 
@@ -30,6 +31,10 @@ cleanup() {
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
+  fi
+  if [ -n "$GOOGLE_PID" ]; then
+    kill "$GOOGLE_PID" 2>/dev/null
+    wait "$GOOGLE_PID" 2>/dev/null
   fi
   rm -rf "$CONFIG" "$BODY" "$IDENTITY_DIR"
   if [ -f "$DEV_VARS_BACKUP" ]; then
@@ -236,6 +241,11 @@ done
 echo "== starting wrangler dev --local with mock providers"
 if ! prepare_local_identity; then
   echo "FAIL  could not mint the throwaway identity key and tokens"
+  exit 1
+fi
+. "$ROOT/scripts/test-local-play.sh"
+if ! prepare_local_google; then
+  echo "FAIL  could not make the throwaway Google service account"
   exit 1
 fi
 npx wrangler dev --local --test-scheduled --config "$CONFIG" --config "$IDENTITY_CONFIG" --config "$LEDGER_CONFIG" --persist-to "$STATE" --port "$PORT" >"$LOG" 2>&1 &
@@ -633,6 +643,7 @@ fi
 
 . "$ROOT/scripts/test-local-verify.sh"
 verify_with_linking_off
+play_with_linking_off
 
 . "$ROOT/scripts/test-local-wallet.sh"
 

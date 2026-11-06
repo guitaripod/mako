@@ -11,7 +11,7 @@ use crate::wallet::pack_credit::{credit_pack, Credit};
 use crate::wallet::{log, pack_refund, purchase};
 
 /// The text of an `already_processed` answer, worded as the apps in the field have always received it.
-const ALREADY_PROCESSED_MESSAGE: &str = "Purchase has already been processed";
+pub(crate) const ALREADY_PROCESSED_MESSAGE: &str = "Purchase has already been processed";
 
 /// A pending answer for any failure that a retry of the same request can fix.
 fn pending(reason: impl std::fmt::Debug) -> AppError {

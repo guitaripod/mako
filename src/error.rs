@@ -32,6 +32,9 @@ pub enum AppError {
     /// 400 `refunded`: the store transaction was refunded, so it is never credited. Final for a client: it is neither
     /// pending nor a success.
     Refunded(String),
+    /// 503 `not_configured`: this server cannot verify the purchase's store for this app (Google Play without its
+    /// service account), so nothing is granted. A client keeps the purchase and asks again later.
+    NotConfigured(String),
 }
 
 /// What an error answers with, before it becomes a response.
@@ -63,6 +66,7 @@ impl AppError {
             AppError::AlreadyProcessed(msg) => (400, "invalid_request_error", msg.clone(), "already_processed", None),
             AppError::UnverifiablePurchase(msg) => (400, "invalid_request_error", msg.clone(), "unverifiable_purchase", None),
             AppError::Refunded(msg) => (400, "invalid_request_error", msg.clone(), "refunded", None),
+            AppError::NotConfigured(msg) => (503, "service_unavailable", msg.clone(), "not_configured", None),
         };
         ErrorParts { status, error_type, message, code, balance }
     }
@@ -163,6 +167,9 @@ impl From<worker::Error> for AppError {
         if let Some(msg) = error_str.strip_prefix("AppError::Refunded::") {
             return AppError::Refunded(msg.to_string());
         }
+        if let Some(msg) = error_str.strip_prefix("AppError::NotConfigured::") {
+            return AppError::NotConfigured(msg.to_string());
+        }
         if let Some(msg) = error_str.strip_prefix("AppError::InternalError::") {
             return AppError::InternalError(msg.to_string());
         }
@@ -185,6 +192,7 @@ impl From<AppError> for worker::Error {
             AppError::AlreadyProcessed(msg) => format!("AppError::AlreadyProcessed::{}", msg),
             AppError::UnverifiablePurchase(msg) => format!("AppError::UnverifiablePurchase::{}", msg),
             AppError::Refunded(msg) => format!("AppError::Refunded::{}", msg),
+            AppError::NotConfigured(msg) => format!("AppError::NotConfigured::{}", msg),
             AppError::InternalError(msg) => format!("AppError::InternalError::{}", msg),
             AppError::RateLimitExceeded => "AppError::RateLimitExceeded::".to_string(),
             AppError::Truncated => "AppError::Truncated::".to_string(),
@@ -217,6 +225,7 @@ mod tests {
             (AppError::Refunded("r".into()), 400, "refunded"),
             (AppError::PaymentRequired("i".into(), Some(5)), 402, "insufficient_credits"),
             (AppError::WalletUnavailable, 503, "wallet_unavailable"),
+            (AppError::NotConfigured("n".into()), 503, "not_configured"),
         ];
         for (error, status, code) in cases {
             let parts = error.parts();
@@ -265,6 +274,7 @@ mod tests {
         assert!(matches!(round_trip(AppError::AlreadyProcessed("a".into())), AppError::AlreadyProcessed(m) if m == "a"));
         assert!(matches!(round_trip(AppError::UnverifiablePurchase("u".into())), AppError::UnverifiablePurchase(m) if m == "u"));
         assert!(matches!(round_trip(AppError::Refunded("r".into())), AppError::Refunded(m) if m == "r"));
+        assert!(matches!(round_trip(AppError::NotConfigured("n".into())), AppError::NotConfigured(m) if m == "n"));
     }
 
     #[test]
