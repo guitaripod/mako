@@ -442,7 +442,7 @@ pub fn render_page(id: &str, playlist: &SharedPlaylist, language: PageLanguage) 
     };
 
     format!(
-        r#"<!DOCTYPE html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} · Psywave</title><meta name="robots" content="noindex"><meta name="description" content="{summary}"><meta name="apple-itunes-app" content="app-id={app_id}, app-argument=psywave://p/{id}"><meta property="og:type" content="music.playlist"><meta property="og:title" content="{title}"><meta property="og:description" content="{summary}"><meta property="og:image" content="{image}"><meta property="og:url" content="{url}"><meta name="twitter:card" content="summary"><style>{style}</style></head><body><div class="glow"><div class="wrap"><a class="brand" href="{store}">PSYWAVE</a><h1>{title}</h1>{description}<div class="chips">{chips}</div><div class="cta"><a class="btn primary" href="psywave://p/{id}">{open}</a><a class="btn secondary" href="{store}">{get}</a></div><ol>{rows}</ol><p class="foot">{pitch}<br><a href="{store}">{made_with}</a><br><a class="report" href="mailto:support@midgarcorp.cc?subject=Report%20playlist%20{id}">{report}</a></p></div></div></body></html>"#,
+        r#"<!DOCTYPE html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} · Psywave</title><meta name="robots" content="noindex"><meta name="description" content="{summary}"><meta name="apple-itunes-app" content="app-id={app_id}, app-argument=psywave://p/{id}"><meta property="og:type" content="music.playlist"><meta property="og:title" content="{title}"><meta property="og:description" content="{summary}"><meta property="og:image" content="{image}"><meta property="og:url" content="{url}"><meta name="twitter:card" content="summary"><style>{style}</style></head><body><div class="glow"><div class="wrap"><a class="brand" href="{store}">PSYWAVE</a><h1>{title}</h1>{description}<div class="chips">{chips}</div><div class="cta"><a class="btn primary" href="psywave://p/{id}">{open}</a><a class="btn secondary" href="{store}">{get}</a></div><ol>{rows}</ol><p class="foot">{pitch}<br><a href="{store}">{made_with}</a><br><a class="report" href="mailto:marcus@midgarcorp.cc?subject=Report%20playlist%20{id}">{report}</a></p></div></div></body></html>"#,
         lang = html_lang(language),
         title = escape(&playlist.name),
         summary = escape(&summary),
@@ -541,7 +541,7 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("https://music.apple.com/jp/song/828259377"));
         assert!(html.contains("app-argument=psywave://p/AbCdEf2345"));
-        assert!(html.contains("mailto:support@midgarcorp.cc?subject=Report%20playlist%20AbCdEf2345"));
+        assert!(html.contains("mailto:marcus@midgarcorp.cc?subject=Report%20playlist%20AbCdEf2345"));
     }
 
     #[test]

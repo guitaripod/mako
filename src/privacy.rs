@@ -46,7 +46,7 @@ fn no_policy_page() -> String {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Privacy Policy not found</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1c1c1e}a{color:#06c}@media(prefers-color-scheme:dark){body{background:#000;color:#e5e5ea}a{color:#4da3ff}}</style>
-</head><body><h1>Privacy Policy not found</h1><p>There is no privacy policy at this address. Privacy policies are published at <a href="https://midgarcorp.cc/legal/">midgarcorp.cc/legal</a>, or write to <a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>.</p></body></html>"#
+</head><body><h1>Privacy Policy not found</h1><p>There is no privacy policy at this address. Privacy policies are published at <a href="https://midgarcorp.cc/legal/">midgarcorp.cc/legal</a>, or write to <a href="mailto:marcus@midgarcorp.cc">marcus@midgarcorp.cc</a>.</p></body></html>"#
         .to_string()
 }
 
@@ -80,15 +80,8 @@ fn app_name(app: &str) -> &'static str {
     }
 }
 
-fn contact_link(app: &str) -> &'static str {
-    if app == "payday" || app == "psywave" || app == "dreameater" {
-        r#"<a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>"#
-    } else if app == "livingdex" {
-        r#"<a href="mailto:guitaripod@gmail.com">guitaripod@gmail.com</a> (or <a href="https://x.com/prblemslver">@prblemslver</a> on X)"#
-    } else {
-        r#"<a href="https://x.com/prblemslver">@prblemslver</a>"#
-    }
-}
+/// The support address every app's support page gives, the same one the apps and midgarcorp.cc show.
+const SUPPORT_CONTACT: &str = r#"<a href="mailto:marcus@midgarcorp.cc">marcus@midgarcorp.cc</a>"#;
 
 pub fn payday_landing(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
     let html = r###"<!DOCTYPE html>
@@ -747,7 +740,7 @@ fn render_support(app: &str) -> String {
 <h2>Legal</h2>
 <p>See our <a href="/privacy/{app}">Privacy Policy</a> and <a href="/terms/{app}">Terms of Use</a>.</p>"#,
         name = name,
-        contact = contact_link(app),
+        contact = SUPPORT_CONTACT,
         app = link_slug(app),
     );
     page(name, "Support", &body)
@@ -860,6 +853,15 @@ mod tests {
             assert!(!render_support(app).contains("Invoices"), "{} shows Pay Day topics", app);
         }
         assert!(render_support("payday").contains("Invoices"));
+    }
+
+    #[test]
+    fn every_support_page_gives_the_one_support_address() {
+        for app in ["pixie", "dreameater", "doublekick", "psywave", "psybeam", "payday", "livingdex", "unknown"] {
+            let support = render_support(app);
+            assert!(support.contains(r#"href="mailto:marcus@midgarcorp.cc""#), "{} lacks the support address", app);
+            assert!(!support.contains("x.com") && !support.contains("gmail.com"), "{} points somewhere else", app);
+        }
     }
 
     #[test]
