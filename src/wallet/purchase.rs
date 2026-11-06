@@ -384,7 +384,7 @@ pub async fn reverse_locally(
             vec![purchase_id.into(), "completed".into(), amount.into(), now.as_str().into(), app_id.into(), user_id.into()],
         ),
         Stmt::new(
-            "UPDATE credit_purchases SET status = 'refunded' WHERE id = ?1 AND status = ?2",
+            "UPDATE credit_purchases SET status = 'refunded', store_token = NULL WHERE id = ?1 AND status = ?2",
             vec![purchase_id.into(), "completed".into()],
         ),
     ];

@@ -95,9 +95,10 @@ pub async fn release(db: &impl D1Exec, app_id: &str, transaction_id: &str) -> Re
     Ok(())
 }
 
-/// Marks a purchase `refunded` once its credits were taken back.
+/// Marks a purchase `refunded` once its credits were taken back, and drops a store token it kept for an acknowledgement
+/// that no longer matters.
 pub async fn mark_refunded(db: &impl D1Exec, purchase_id: &str) -> Result<(), AppError> {
-    db.exec("UPDATE credit_purchases SET status = 'refunded' WHERE id = ?1", &[purchase_id.into()]).await?;
+    db.exec("UPDATE credit_purchases SET status = 'refunded', store_token = NULL WHERE id = ?1", &[purchase_id.into()]).await?;
     Ok(())
 }
 

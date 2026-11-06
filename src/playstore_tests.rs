@@ -541,6 +541,29 @@ fn an_acknowledgement_google_refuses_drops_the_token_and_one_it_cannot_take_keep
 }
 
 #[test]
+fn every_refund_drops_the_token_of_the_purchase_it_reverses() {
+    let (d1, _) = credited_world(&[]);
+    let wallets = FakeWallets::new();
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, "gp:GPA.local", Some("token-local"))).unwrap();
+    assert_eq!(token_of(&d1, "gp:GPA.local"), 1);
+    let reversed = block_on(crate::wallet::ledger_refund::reverse_play_order(&d1, None::<&FakeWallets>, "pixie", "gp:GPA.local")).unwrap();
+    assert!(matches!(reversed, crate::wallet::ledger_refund::Outcome::Reversed { .. }), "{reversed:?}");
+    assert_eq!(token_of(&d1, "gp:GPA.local"), 0, "the local flip to refunded drops it");
+
+    d1.run(
+        "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, linked_at) VALUES ('pixie', 'u1', ?1, 'linked', '2026-10-01T00:00:00+00:00')",
+        &[MIDGAR.into()],
+    );
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, "gp:GPA.wallet", Some("token-wallet"))).unwrap();
+    assert_eq!(token_of(&d1, "gp:GPA.wallet"), 1);
+    block_on(crate::wallet::ledger_refund::reverse_play_order(&d1, Some(&wallets), "pixie", "gp:GPA.wallet")).unwrap();
+    assert_eq!(block_on(purchase::store_status(&d1, "pixie", "gp:GPA.wallet")).unwrap().as_deref(), Some("refunded"));
+    assert_eq!(token_of(&d1, "gp:GPA.wallet"), 0, "the wallet path's mark_refunded drops it");
+}
+
+#[test]
 fn a_refunded_purchase_is_not_acknowledged() {
     let d1 = LocalD1::migrated();
     let wallets = FakeWallets::new();
