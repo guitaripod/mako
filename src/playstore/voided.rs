@@ -6,7 +6,7 @@ use super::{encode, google_reason, payment_id_of, unavailable, Call, PlayApi, Pl
 use crate::error::AppError;
 use crate::storekit::VerifyFailure;
 use crate::wallet::client::WalletTransport;
-use crate::wallet::d1::{int, D1Exec};
+use crate::wallet::d1::{int, text, D1Exec};
 use crate::wallet::ledger_refund::{self, Outcome};
 use crate::wallet::log;
 
@@ -24,7 +24,7 @@ const END_LAG_MS: i64 = 60_000;
 const PAGE_SIZE: u32 = 1000;
 
 /// Pages one run reads per package. The cron runs every 30 minutes, so this stays far inside the 6000 queries a day
-/// and 30 queries per 30 seconds Google allows each package.
+/// and 30 queries per 30 seconds Google allows each package. A window with more pages goes on in the next run.
 const PAGES_PER_RUN: u32 = 10;
 
 /// One voided one-time purchase as `purchases.voidedpurchases.list` answers it.
@@ -72,9 +72,26 @@ pub fn voided_window(swept_until_ms: Option<i64>, now_ms: i64) -> VoidedWindow {
     VoidedWindow { start_ms, end_ms }
 }
 
+/// A window read across runs: the page to go on from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resume {
+    pub window: VoidedWindow,
+    pub page_token: String,
+}
+
+/// Where the sweep of one package stands, as `play_voided_sweeps` keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepState {
+    /// The end of the last window read completely, `None` before the first.
+    pub swept_until_ms: Option<i64>,
+    /// A window whose later pages the next run reads.
+    pub resume: Option<Resume>,
+}
+
 impl<T: Transport, S: Signer> PlayApi<'_, T, S> {
     /// One page of `purchases.voidedpurchases.list` for one-time products (`type=0`) voided in `window`, or the page
-    /// `page_token` names. Anything but a readable 200 is `Unavailable`.
+    /// `page_token` names. A page token Google refuses (400, an expired token) is `Rejected`; anything else but a
+    /// readable 200 is `Unavailable`.
     pub async fn voided_page(&self, package: &str, window: &VoidedWindow, page_token: Option<&str>) -> Result<VoidedPage, VerifyFailure> {
         let mut url = format!(
             "{APPLICATIONS_URL}/{}/purchases/voidedpurchases?type=0&maxResults={PAGE_SIZE}&startTime={}&endTime={}",
@@ -86,8 +103,10 @@ impl<T: Transport, S: Signer> PlayApi<'_, T, S> {
             url.push_str(&format!("&token={}", encode(token)));
         }
         let answer = self.authorized(&Call::get(url)).await?;
-        if answer.status != 200 {
-            return Err(unavailable(format!("Google answered {} for the voided purchases{}", answer.status, google_reason(&answer.body))));
+        match answer.status {
+            200 => {}
+            400 if page_token.is_some() => return Err(VerifyFailure::Rejected),
+            status => return Err(unavailable(format!("Google answered {status} for the voided purchases{}", google_reason(&answer.body)))),
         }
         let purchases = match answer.body.get("voidedPurchases") {
             Some(list) => serde_json::from_value(list.clone()).map_err(|_| unavailable("Google answered unreadable voided purchases"))?,
@@ -116,15 +135,16 @@ pub struct VoidedSweep {
     pub settled: u32,
     /// Orders whose reversal failed; they are asked about again by the next run.
     pub failed: u32,
-    /// True when every page was read and every order settled, so the next run starts from this one's end.
+    /// True when every page was read and every order settled, so the next run starts from this one.
     pub finished: bool,
 }
 
-/// Takes back the credits of every pack a voided Google Play order of the tenant bought: Google lists the one-time
-/// purchases refunded, charged back or canceled in the run's window, page by page, and each order goes through the
-/// refund path an App Store refund takes (`ledger_refund::reverse_play_order`, the `purchase_refunds` claim under
-/// `gp:<orderId>`), which makes a repeat harmless and refuses a later credit of the same order. The window only moves on
-/// once a run read every page and settled every order.
+/// Takes back the credits of every pack a voided Google Play order of the tenant bought. Google lists the one-time
+/// purchases refunded, charged back or canceled in the run's window, page by page; each order goes through the refund
+/// path an App Store refund takes (`ledger_refund::reverse_play_order`, the `purchase_refunds` claim under
+/// `gp:<orderId>`), which makes a repeat harmless and refuses a later credit of the same order. A window with more pages
+/// than one run reads, or a page with an order that could not be settled, goes on from that page in the next run; the
+/// window only moves on once it was read through.
 pub async fn sweep_voided<T: Transport, S: Signer, D: D1Exec, W: WalletTransport>(
     api: &PlayApi<'_, T, S>,
     db: &D,
@@ -132,34 +152,49 @@ pub async fn sweep_voided<T: Transport, S: Signer, D: D1Exec, W: WalletTransport
     tenant: &PlayTenant,
     now_ms: i64,
 ) -> Result<VoidedSweep, AppError> {
-    let window = voided_window(swept_until(db, &tenant.package).await?, now_ms);
+    let state = load_state(db, &tenant.package).await?;
     let mut report = VoidedSweep::default();
-    let mut page_token: Option<String> = None;
+    let (window, mut page_token) = match &state.resume {
+        Some(resume) => (resume.window, Some(resume.page_token.clone())),
+        None => (voided_window(state.swept_until_ms, now_ms), None),
+    };
     loop {
         if report.pages == PAGES_PER_RUN {
-            log::error(&format!("google play voided sweep of {} stopped after {PAGES_PER_RUN} pages", tenant.package));
+            log::info(&format!("google play voided sweep of {} goes on from page {PAGES_PER_RUN} in the next run", tenant.package));
             return Ok(report);
         }
         let page = match api.voided_page(&tenant.package, &window, page_token.as_deref()).await {
             Ok(page) => page,
+            Err(VerifyFailure::Rejected) => {
+                log::error(&format!("google play refused the saved page of {}'s voided purchases; the window starts over", tenant.package));
+                save_resume(db, &tenant.package, None).await?;
+                return Ok(report);
+            }
             Err(failure) => {
                 log::error(&format!("google play voided sweep of {} postponed: {failure:?}", tenant.package));
                 return Ok(report);
             }
         };
         report.pages += 1;
+        let failed_before = report.failed;
         for voided in &page.purchases {
             settle_one(db, wallets, tenant, voided, &mut report).await;
         }
+        if report.failed > failed_before {
+            let again = page_token.map(|token| Resume { window, page_token: token });
+            save_resume(db, &tenant.package, again.as_ref()).await?;
+            return Ok(report);
+        }
         match page.next_page_token {
-            Some(next) => page_token = Some(next),
+            Some(next) => {
+                save_resume(db, &tenant.package, Some(&Resume { window, page_token: next.clone() })).await?;
+                page_token = Some(next);
+            }
             None => break,
         }
     }
-    if report.failed == 0 {
-        record_swept(db, &tenant.package, window.end_ms).await?;
-        report.finished = true;
-    }
+    finish_window(db, &tenant.package, window.end_ms).await?;
+    report.finished = true;
     Ok(report)
 }
 
@@ -177,17 +212,49 @@ async fn settle_one<D: D1Exec, W: WalletTransport>(db: &D, wallets: Option<&W>, 
     }
 }
 
-/// Where the last finished sweep of a package ended, if one did.
-async fn swept_until(db: &impl D1Exec, package: &str) -> Result<Option<i64>, AppError> {
-    let rows = db.rows("SELECT swept_until_ms FROM play_voided_sweeps WHERE package_name = ?1", &[package.into()]).await?;
-    Ok(rows.first().and_then(|row| int(row, "swept_until_ms")))
+/// Where the sweep of a package stands; the default for one never swept.
+pub async fn load_state(db: &impl D1Exec, package: &str) -> Result<SweepState, AppError> {
+    let rows = db.rows("SELECT * FROM play_voided_sweeps WHERE package_name = ?1", &[package.into()]).await?;
+    let Some(row) = rows.first() else { return Ok(SweepState::default()) };
+    let resume = match (int(row, "window_start_ms"), int(row, "window_end_ms"), text(row, "page_token").filter(|token| !token.is_empty())) {
+        (Some(start_ms), Some(end_ms), Some(token)) => Some(Resume { window: VoidedWindow { start_ms, end_ms }, page_token: token.to_string() }),
+        _ => None,
+    };
+    Ok(SweepState { swept_until_ms: int(row, "swept_until_ms"), resume })
 }
 
-/// Records where a finished sweep ended. It never moves back, so an older run finishing late cannot undo a newer one.
-async fn record_swept(db: &impl D1Exec, package: &str, end_ms: i64) -> Result<(), AppError> {
+async fn ensure_row(db: &impl D1Exec, package: &str) -> Result<(), AppError> {
     db.exec(
-        "INSERT INTO play_voided_sweeps (package_name, swept_until_ms, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(package_name) DO UPDATE SET swept_until_ms = MAX(swept_until_ms, excluded.swept_until_ms), updated_at = excluded.updated_at",
+        "INSERT OR IGNORE INTO play_voided_sweeps (package_name, updated_at) VALUES (?1, ?2)",
+        &[package.into(), Utc::now().to_rfc3339().into()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Keeps the page the next run goes on from, or forgets it.
+async fn save_resume(db: &impl D1Exec, package: &str, resume: Option<&Resume>) -> Result<(), AppError> {
+    ensure_row(db, package).await?;
+    let (start, end, token) = match resume {
+        Some(resume) => (Some(resume.window.start_ms), Some(resume.window.end_ms), Some(resume.page_token.as_str())),
+        None => (None, None, None),
+    };
+    db.exec(
+        "UPDATE play_voided_sweeps SET window_start_ms = ?2, window_end_ms = ?3, page_token = ?4, updated_at = ?5 WHERE package_name = ?1",
+        &[package.into(), start.into(), end.into(), token.into(), Utc::now().to_rfc3339().into()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Records that a window was read through to `end_ms`. It never moves back, so an older
+/// run finishing late cannot undo a newer one.
+async fn finish_window(db: &impl D1Exec, package: &str, end_ms: i64) -> Result<(), AppError> {
+    ensure_row(db, package).await?;
+    db.exec(
+        "UPDATE play_voided_sweeps SET swept_until_ms = MAX(COALESCE(swept_until_ms, 0), ?2), window_start_ms = NULL, window_end_ms = NULL,
+             page_token = NULL, updated_at = ?3
+         WHERE package_name = ?1",
         &[package.into(), end_ms.into(), Utc::now().to_rfc3339().into()],
     )
     .await?;

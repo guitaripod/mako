@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use futures::executor::block_on;
 use serde_json::json;
 
-use super::voided::{voided_window, VoidedPage, VoidedSweep, VoidedWindow};
+use super::voided::{load_state, voided_window, Resume, VoidedPage, VoidedSweep, VoidedWindow};
 use super::*;
 use crate::wallet::pack_credit::{credit_pack, Credit, PurchaseLedger};
 use crate::wallet::pack_refund;
@@ -696,18 +696,95 @@ fn the_next_sweep_starts_before_the_last_one_ended_and_settles_repeats_without_t
 }
 
 #[test]
-fn a_sweep_google_cannot_finish_keeps_its_window_for_the_next_run() {
+fn a_sweep_google_cannot_finish_keeps_its_window_and_page_for_the_next_run() {
     let (d1, _wallets) = credited_world(&["GPA.1"]);
     let world = World::new(vec![token_answer("a"), voided_answer(&["GPA.1"], Some("p2")), answer(503, json!({}))]);
     let report = sweep(&world, &d1, None, NOW_MS);
     assert_eq!((report.reversed, report.finished), (1, false));
     assert_eq!(swept_until(&d1), -1, "the window does not move on");
+    let window = voided_window(None, NOW_MS);
+    assert_eq!(block_on(load_state(&d1, PACKAGE)).unwrap().resume, Some(Resume { window, page_token: "p2".to_string() }));
 
+    world.script.then(voided_answer(&[], None));
+    let resumed = sweep(&world, &d1, None, NOW_MS + 1_800_000);
+    assert!(resumed.finished);
+    let url = &world.script.calls()[3].url;
+    assert!(url.contains("token=p2") && url.contains(&format!("startTime={}", window.start_ms)), "{url}");
+    assert_eq!(swept_until(&d1), window.end_ms, "the window read through is the one recorded");
+    assert_eq!(block_on(load_state(&d1, PACKAGE)).unwrap().resume, None);
+}
+
+#[test]
+fn a_window_longer_than_one_run_goes_on_from_its_saved_page() {
+    let (d1, _wallets) = credited_world(&["GPA.late"]);
     let busy = World::new(std::iter::once(token_answer("a")).chain((0..10).map(|i| voided_answer(&[], Some(&format!("p{i}"))))).collect());
     let capped = sweep(&busy, &d1, None, NOW_MS);
     assert_eq!((capped.pages, capped.finished), (10, false), "one run reads at most ten pages");
     assert_eq!(busy.script.calls().len(), 11);
     assert_eq!(swept_until(&d1), -1);
+
+    busy.script.then(voided_answer(&["GPA.late"], None));
+    let next = sweep(&busy, &d1, None, NOW_MS + 1_800_000);
+    assert_eq!((next.pages, next.reversed, next.finished), (1, 1, true), "page 11 is read, not page 1 again");
+    assert!(busy.script.calls()[11].url.ends_with("&token=p9"));
+    assert_eq!(swept_until(&d1), NOW_MS - 60_000);
+}
+
+/// Wallets that can be switched off, as an outage of the wallet objects.
+struct Switchable<'a> {
+    wallets: &'a FakeWallets,
+    down: std::cell::Cell<bool>,
+}
+
+impl crate::wallet::client::WalletTransport for Switchable<'_> {
+    async fn send(&self, midgar_id: &str, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), AppError> {
+        if self.down.get() {
+            return Err(AppError::WalletUnavailable);
+        }
+        self.wallets.send(midgar_id, method, path, body).await
+    }
+}
+
+#[test]
+fn a_page_with_an_order_that_could_not_be_settled_is_read_again() {
+    let d1 = LocalD1::migrated();
+    let fake = FakeWallets::new();
+    d1.user("pixie", "u1", 0);
+    d1.run(
+        "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, linked_at) VALUES ('pixie', 'u1', ?1, 'linked', '2026-10-01T00:00:00+00:00')",
+        &[MIDGAR.into()],
+    );
+    block_on(credit_pack(&d1, &TestLedger { db: &d1, wallets: &fake }, "pixie", "u1", "starter", 150, 299, "gp:GPA.w", None)).unwrap();
+    let wallets = Switchable { wallets: &fake, down: std::cell::Cell::new(true) };
+    let world = World::new(vec![token_answer("a"), voided_answer(&[], Some("p2")), voided_answer(&["GPA.w"], None)]);
+
+    let failed = block_on(sweep_voided(&world.api(NOW), &d1, Some(&wallets), &pixie_tenant(), NOW_MS)).unwrap();
+
+    assert_eq!((failed.failed, failed.finished), (1, false));
+    assert_eq!(block_on(load_state(&d1, PACKAGE)).unwrap().resume.map(|resume| resume.page_token), Some("p2".to_string()));
+    wallets.down.set(false);
+    world.script.then(voided_answer(&["GPA.w"], None));
+    let retried = block_on(sweep_voided(&world.api(NOW), &d1, Some(&wallets), &pixie_tenant(), NOW_MS + 1_800_000)).unwrap();
+    assert_eq!((retried.reversed, retried.finished), (1, true));
+    assert!(world.script.calls()[3].url.ends_with("&token=p2"), "the failed page is read again");
+    assert_eq!(fake.balance(MIDGAR, "pixie"), 0);
+}
+
+#[test]
+fn a_page_token_google_refuses_starts_the_window_over() {
+    let (d1, _wallets) = credited_world(&[]);
+    let world = World::new(vec![token_answer("a"), voided_answer(&[], Some("p2")), answer(503, json!({}))]);
+    sweep(&world, &d1, None, NOW_MS);
+    assert!(block_on(load_state(&d1, PACKAGE)).unwrap().resume.is_some());
+
+    world.script.then(answer(400, json!({ "error": { "status": "INVALID_ARGUMENT" } })));
+    let refused = sweep(&world, &d1, None, NOW_MS + 1_800_000);
+    assert!(!refused.finished);
+    assert_eq!(block_on(load_state(&d1, PACKAGE)).unwrap().resume, None);
+
+    world.script.then(voided_answer(&[], None));
+    assert!(sweep(&world, &d1, None, NOW_MS + 3_600_000).finished);
+    assert!(!world.script.calls()[4].url.contains("token="), "the window starts over without a page token");
 }
 
 #[test]

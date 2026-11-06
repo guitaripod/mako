@@ -33,6 +33,13 @@ impl From<&str> for Val {
     }
 }
 
+/// A value that may be absent, bound as SQL `NULL` when it is.
+impl<T: Into<Val>> From<Option<T>> for Val {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Val::Null, Into::into)
+    }
+}
+
 impl From<&Option<String>> for Val {
     fn from(value: &Option<String>) -> Self {
         value.as_deref().map_or(Val::Null, Val::from)
