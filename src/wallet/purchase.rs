@@ -21,9 +21,8 @@ pub const SWEEP_LIMIT: i64 = 50;
 /// The `payment_provider` of an App Store pack purchase.
 pub const APP_STORE: &str = "app_store";
 
-/// Matches App Store pack purchases: `'app_store'`, and `'revenuecat'`, the label of rows written before migration 039
-/// relabels them.
-pub const IS_APP_STORE: &str = "payment_provider IN ('app_store', 'revenuecat')";
+/// Matches App Store pack purchases.
+pub const IS_APP_STORE: &str = "payment_provider = 'app_store'";
 
 /// One `credit_purchases` row, as the completion needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +60,7 @@ const COLUMNS: &str = "id, app_id, user_id, pack_id, credits, amount_usd_cents, 
 /// and the validate call share, and the purchase id for Stripe and crypto, whose payment ids are not minted by us.
 pub fn grant_key(row: &PurchaseRow) -> String {
     match row.provider.as_str() {
-        "app_store" | "revenuecat" => format!("tx:{}", row.payment_id),
+        APP_STORE => format!("tx:{}", row.payment_id),
         "stripe" => format!("stripe:{}", row.id),
         "nowpayments" => format!("crypto:{}", row.id),
         _ => format!("purchase:{}", row.id),
@@ -71,7 +70,7 @@ pub fn grant_key(row: &PurchaseRow) -> String {
 /// The ledger source and the description a purchase is shown with.
 fn source_and_description(row: &PurchaseRow) -> (&'static str, String) {
     match row.provider.as_str() {
-        "app_store" | "revenuecat" => (APP_STORE, format!("App Store purchase: {} pack", row.pack_id)),
+        APP_STORE => (APP_STORE, format!("App Store purchase: {} pack", row.pack_id)),
         "stripe" => ("stripe", format!("Card purchase: {} pack", row.pack_id)),
         "nowpayments" => ("crypto", format!("Crypto purchase: {} pack", row.pack_id)),
         _ => ("stripe", format!("Purchased {} pack", row.pack_id)),

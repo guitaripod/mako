@@ -319,17 +319,3 @@ fn the_answer_body_the_ledger_forwards_deserialises_into_a_transaction() {
     let parsed: LedgerTransaction = serde_json::from_value(body).unwrap();
     assert_eq!(parsed, transaction());
 }
-
-#[test]
-fn a_purchase_still_labelled_as_before_migration_039_is_not_credited_again() {
-    let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
-    world.d1.user(APP, USER, 0);
-    world.d1.run(
-        "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at)
-         VALUES ('p-legacy', ?1, ?2, 'small', 5, 299, 'revenuecat', ?3, 'completed', '2026-10-01T00:00:00+00:00')",
-        &[APP.into(), USER.into(), TX.into()],
-    );
-    assert!(matches!(world.credit(&naming(USER)).unwrap(), Outcome::Duplicate { purchase_id } if purchase_id == "p-legacy"));
-    assert_eq!(world.purchases(), 1);
-    assert_eq!(world.d1.d1_balance(APP, USER), 0);
-}

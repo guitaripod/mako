@@ -248,7 +248,7 @@ call GET /v1/admin/credits/stats key_admin
 check "the admin statistics include the wallet balances" yes "$(python3 -I -c 'import json,sys;print("yes" if json.load(open(sys.argv[1]))["credits"]["total_balance"] >= 65 else "no")' "$BODY")"
 
 echo "== a purchase left pending and a link left moving are finished by the cron"
-sql_json "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at) VALUES ('p-stale', 'dreameater', 'u-link2', 'small', 5, 299, 'revenuecat', 'tx-stale', 'pending', '$OLD')" >/dev/null
+sql_json "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at) VALUES ('p-stale', 'dreameater', 'u-link2', 'small', 5, 299, 'app_store', 'tx-stale', 'pending', '$OLD')" >/dev/null
 sql_json "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at) VALUES ('p-stripe', 'dreameater', 'u-link2', 'small', 5, 299, 'stripe', 'cs_waiting', 'pending', '$OLD')" >/dev/null
 sql_json "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, linked_at) VALUES ('dreameater', 'u-move', '$M_MOVING', 'moving', '$OLD')" >/dev/null
 trigger_cron

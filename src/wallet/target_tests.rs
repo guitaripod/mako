@@ -330,15 +330,12 @@ fn the_cron_lists_only_stale_pending_store_purchases() {
     let d1 = LocalD1::migrated();
     d1.user(APP, "u1", 0);
     pending(&d1, "old-store", "u1", "app_store", "t1", 10);
-    pending(&d1, "old-legacy", "u1", "revenuecat", "t4", 10);
     pending(&d1, "old-stripe", "u1", "stripe", "s1", 10);
     pending(&d1, "done-store", "u1", "app_store", "t2", 10);
     d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'done-store'", &[]);
     pending(&d1, "fresh-store", "u1", "app_store", "t3", 10);
     d1.run("UPDATE credit_purchases SET created_at = '2099-01-01T00:00:00+00:00' WHERE id = 'fresh-store'", &[]);
-    let mut stale = block_on(purchase::stale_store_purchases(&d1, 50)).unwrap();
-    stale.sort();
-    assert_eq!(stale, ["old-legacy", "old-store"], "a row still labelled as before migration 039 is swept too");
+    assert_eq!(block_on(purchase::stale_store_purchases(&d1, 50)).unwrap(), ["old-store"]);
     assert_eq!(block_on(purchase::stale_store_purchases(&d1, 0)).unwrap().len(), 0);
 }
 

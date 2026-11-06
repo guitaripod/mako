@@ -353,13 +353,3 @@ fn a_credit_that_finishes_after_the_refund_reversed_the_purchase_changes_nothing
     assert_eq!(world.balance(), PACK_CREDITS);
     assert_eq!(world.reversals(TX), 1);
 }
-
-#[test]
-fn a_purchase_still_labelled_as_before_migration_039_is_reversed_once() {
-    let world = World::linked();
-    local_purchase(&world, 7, "completed");
-    world.d1.run("UPDATE credit_purchases SET payment_provider = 'revenuecat' WHERE id = 'p-local'", &[]);
-    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Reversed { taken: 5, .. }));
-    assert!(matches!(world.refund(&refunded(TX)).unwrap(), Outcome::Duplicate { .. }));
-    assert_eq!(world.d1.d1_balance(APP, "local"), 2);
-}

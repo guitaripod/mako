@@ -229,7 +229,7 @@ for app in apps:
                 f"INSERT INTO credit_transactions (id, app_id, user_id, type, amount, balance_after, description, created_at) VALUES ('t-{uid}', '{app}', '{uid}', 'bonus', {welcome}, {welcome}, 'Welcome bonus', '{now}');"
             )
 lines.append(
-    f"INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at) VALUES ('p-fixture-pending', 'dreameater', 'dreameater-user-05', 'small', 5, 299, 'revenuecat', 'tx-fixture-pending', 'pending', '{now}');"
+    f"INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at) VALUES ('p-fixture-pending', 'dreameater', 'dreameater-user-05', 'small', 5, 299, 'app_store', 'tx-fixture-pending', 'pending', '{now}');"
 )
 print("\n".join(lines))
 PY
@@ -302,7 +302,7 @@ PY
 rows "SELECT app_id, id FROM users ORDER BY app_id, id" | python3 -I "$STATE/links.py" "$GROUP_SIZE" > "$SEED"
 sql_file "$SEED" || { echo "FAIL  the links did not queue"; tail -5 "$STATE/wrangler.log"; exit 1; }
 check "every user has a moving link" "$USERS" "$(value "SELECT COUNT(*) FROM wallet_links WHERE state = 'moving'")"
-echo "UPDATE credit_purchases SET created_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') WHERE status = 'pending' AND payment_provider = 'revenuecat';" > "$STATE/young.sql"
+echo "UPDATE credit_purchases SET created_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') WHERE status = 'pending' AND payment_provider = 'app_store';" > "$STATE/young.sql"
 sql_file "$STATE/young.sql" || { echo "FAIL  the pending purchases could not be made young"; exit 1; }
 echo "      pending App Store purchases in the copy were made young, so the cron leaves them out of the sums"
 
