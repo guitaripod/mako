@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use futures::executor::block_on;
 use serde_json::json;
 
+use super::voided::{voided_window, VoidedPage, VoidedSweep, VoidedWindow};
 use super::*;
 use crate::wallet::pack_credit::{credit_pack, Credit, PurchaseLedger};
 use crate::wallet::pack_refund;
@@ -559,6 +560,170 @@ fn the_token_is_kept_and_dropped_by_payment_id() {
     assert_eq!(token_of(&d1, "gp:GPA.k"), 1);
     block_on(purchase::forget_store_token(&d1, "pixie", "gp:GPA.k")).unwrap();
     assert_eq!(token_of(&d1, "gp:GPA.k"), 0);
+}
+
+const DAY_MS: i64 = 24 * 3_600_000;
+const NOW_MS: i64 = 1_790_000_000_000;
+const MIDGAR: &str = "0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d47";
+
+fn voided(order: &str) -> Value {
+    json!({ "kind": "androidpublisher#voidedPurchase", "purchaseToken": format!("token-{order}"), "orderId": order, "voidedTimeMillis": "1789999000000", "voidedSource": 0, "voidedReason": 1 })
+}
+
+fn voided_answer(orders: &[&str], next: Option<&str>) -> Result<Answer, String> {
+    let mut body = json!({ "voidedPurchases": orders.iter().map(|order| voided(order)).collect::<Vec<_>>() });
+    if let Some(next) = next {
+        body["tokenPagination"] = json!({ "nextPageToken": next });
+    }
+    answer(200, body)
+}
+
+fn balance(d1: &LocalD1) -> i64 {
+    d1.int("SELECT balance FROM user_credits WHERE app_id = 'pixie' AND user_id = 'u1'", &[])
+}
+
+fn sweep(world: &World, d1: &LocalD1, wallets: Option<&FakeWallets>, now_ms: i64) -> VoidedSweep {
+    block_on(sweep_voided(&world.api(NOW), d1, wallets, &pixie_tenant(), now_ms)).unwrap()
+}
+
+fn swept_until(d1: &LocalD1) -> i64 {
+    d1.int("SELECT COALESCE(MAX(swept_until_ms), -1) FROM play_voided_sweeps WHERE package_name = ?1", &[PACKAGE.into()])
+}
+
+/// A pixie user with 10 credits who bought the starter pack (150 credits) in each of `orders`, credited locally.
+fn credited_world(orders: &[&str]) -> (LocalD1, FakeWallets) {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    d1.user("pixie", "u1", 10);
+    for order in orders {
+        let ledger = TestLedger { db: &d1, wallets: &wallets };
+        block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, &format!("gp:{order}"), None)).unwrap();
+    }
+    (d1, wallets)
+}
+
+#[test]
+fn the_first_sweep_reads_the_30_days_google_keeps_and_later_ones_overlap_the_last() {
+    let first = voided_window(None, NOW_MS);
+    assert!(first.start_ms > NOW_MS - 30 * DAY_MS && first.start_ms < NOW_MS - 29 * DAY_MS, "{first:?}");
+    assert_eq!(first.end_ms, NOW_MS - 60_000);
+    let later = voided_window(Some(NOW_MS - 1_800_000), NOW_MS);
+    assert_eq!(later.start_ms, NOW_MS - 1_800_000 - 2 * 3_600_000);
+    assert_eq!(voided_window(Some(NOW_MS - 90 * DAY_MS), NOW_MS).start_ms, first.start_ms, "never older than Google lists");
+    let future = voided_window(Some(NOW_MS + DAY_MS), NOW_MS);
+    assert!(future.start_ms <= future.end_ms);
+}
+
+#[test]
+fn a_page_of_voided_purchases_is_asked_for_one_time_products_in_the_window() {
+    let world = World::new(vec![token_answer("a"), voided_answer(&["GPA.1"], Some("next page/1")), answer(200, json!({})), answer(500, json!({}))]);
+    let window = VoidedWindow { start_ms: 1_000, end_ms: 2_000 };
+    let page = block_on(world.api(NOW).voided_page(PACKAGE, &window, None)).unwrap();
+    assert_eq!(page.purchases.len(), 1);
+    assert_eq!(page.purchases[0].order_id.as_deref(), Some("GPA.1"));
+    assert_eq!(page.next_page_token.as_deref(), Some("next page/1"));
+    let empty = block_on(world.api(NOW).voided_page(PACKAGE, &window, Some("next page/1"))).unwrap();
+    assert_eq!(empty, VoidedPage::default());
+    assert!(matches!(block_on(world.api(NOW).voided_page(PACKAGE, &window, None)), Err(VerifyFailure::Unavailable(_))));
+    let calls = world.script.calls();
+    let base = format!("https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{PACKAGE}/purchases/voidedpurchases");
+    assert_eq!(calls[1].url, format!("{base}?type=0&maxResults=1000&startTime=1000&endTime=2000"));
+    assert_eq!(calls[2].url, format!("{base}?type=0&maxResults=1000&startTime=1000&endTime=2000&token=next%20page%2F1"));
+    assert_eq!((calls[1].verb, calls[1].bearer.as_deref()), (Verb::Get, Some("a")));
+}
+
+#[test]
+fn a_voided_order_takes_its_credits_back_once_and_an_uncredited_one_is_refused_later() {
+    let (d1, _wallets) = credited_world(&["GPA.1"]);
+    assert_eq!(balance(&d1), 160);
+    let world = World::new(vec![token_answer("a"), voided_answer(&["GPA.1", "GPA.later"], Some("p2")), voided_answer(&["GPA.1"], None)]);
+
+    let report = sweep(&world, &d1, None, NOW_MS);
+
+    assert_eq!(report, VoidedSweep { pages: 2, voided: 3, reversed: 1, recorded: 1, settled: 1, failed: 0, finished: true });
+    assert_eq!(balance(&d1), 10, "the 150 credits of the refunded pack are gone");
+    assert_eq!(block_on(purchase::store_status(&d1, "pixie", "gp:GPA.1")).unwrap().as_deref(), Some("refunded"));
+    assert_eq!(
+        d1.int("SELECT COUNT(*) FROM credit_transactions WHERE app_id = 'pixie' AND description = 'Google Play refund reversed: starter pack'", &[]),
+        1
+    );
+    assert_eq!(swept_until(&d1), NOW_MS - 60_000);
+
+    let wallets = FakeWallets::new();
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    let late = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, "gp:GPA.later", None)).unwrap();
+    assert_eq!(late, Credit::Refunded, "an order Google voided before mako saw it is never credited");
+    assert_eq!(balance(&d1), 10);
+}
+
+#[test]
+fn the_next_sweep_starts_before_the_last_one_ended_and_settles_repeats_without_taking_twice() {
+    let (d1, _wallets) = credited_world(&["GPA.1"]);
+    let world = World::new(vec![token_answer("a"), voided_answer(&["GPA.1"], None)]);
+    sweep(&world, &d1, None, NOW_MS);
+    world.script.then(voided_answer(&["GPA.1"], None));
+
+    let again = sweep(&world, &d1, None, NOW_MS + 1_800_000);
+
+    assert_eq!(again, VoidedSweep { pages: 1, voided: 1, reversed: 0, recorded: 0, settled: 1, failed: 0, finished: true });
+    assert_eq!(balance(&d1), 10);
+    let second = &world.script.calls()[2].url;
+    assert!(second.contains(&format!("startTime={}", NOW_MS - 60_000 - 2 * 3_600_000)), "{second}");
+    assert_eq!(swept_until(&d1), NOW_MS + 1_800_000 - 60_000);
+}
+
+#[test]
+fn a_sweep_google_cannot_finish_keeps_its_window_for_the_next_run() {
+    let (d1, _wallets) = credited_world(&["GPA.1"]);
+    let world = World::new(vec![token_answer("a"), voided_answer(&["GPA.1"], Some("p2")), answer(503, json!({}))]);
+    let report = sweep(&world, &d1, None, NOW_MS);
+    assert_eq!((report.reversed, report.finished), (1, false));
+    assert_eq!(swept_until(&d1), -1, "the window does not move on");
+
+    let busy = World::new(std::iter::once(token_answer("a")).chain((0..10).map(|i| voided_answer(&[], Some(&format!("p{i}"))))).collect());
+    let capped = sweep(&busy, &d1, None, NOW_MS);
+    assert_eq!((capped.pages, capped.finished), (10, false), "one run reads at most ten pages");
+    assert_eq!(busy.script.calls().len(), 11);
+    assert_eq!(swept_until(&d1), -1);
+}
+
+#[test]
+fn a_voided_promo_order_is_found_by_its_token() {
+    let (d1, _wallets) = credited_world(&[]);
+    let wallets = FakeWallets::new();
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    let promo = ProductPurchase { order_id: None, purchase_type: Some(1), ..purchase() };
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 0, &payment_id(&promo, "promo-token"), None)).unwrap();
+    assert_eq!(balance(&d1), 160);
+    let world = World::new(vec![token_answer("a"), answer(200, json!({ "voidedPurchases": [{ "purchaseToken": "promo-token" }, {}] }))]);
+
+    let report = sweep(&world, &d1, None, NOW_MS);
+
+    assert_eq!((report.voided, report.reversed), (1, 1), "a record without order or token is skipped");
+    assert_eq!(balance(&d1), 10);
+}
+
+#[test]
+fn a_voided_order_of_a_linked_buyer_is_taken_back_from_the_wallet() {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    d1.user("pixie", "u1", 0);
+    d1.run(
+        "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, linked_at) VALUES ('pixie', 'u1', ?1, 'linked', '2026-10-01T00:00:00+00:00')",
+        &[MIDGAR.into()],
+    );
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, "gp:GPA.w", None)).unwrap();
+    assert_eq!(wallets.balance(MIDGAR, "pixie"), 150);
+    let world = World::new(vec![token_answer("a"), voided_answer(&["GPA.w"], None), voided_answer(&["GPA.w"], None)]);
+
+    assert_eq!(sweep(&world, &d1, Some(&wallets), NOW_MS).reversed, 1);
+    assert_eq!(wallets.balance(MIDGAR, "pixie"), 0);
+    let (status, entry) = wallets.call(MIDGAR, "GET", "/entry?tenant=pixie&key=reverse:gp:GPA.w", None);
+    assert_eq!((status, entry["source"].as_str()), (200, Some("play_store")));
+
+    assert_eq!(sweep(&world, &d1, Some(&wallets), NOW_MS + 1_800_000).settled, 1);
+    assert_eq!(wallets.balance(MIDGAR, "pixie"), 0);
 }
 
 #[test]

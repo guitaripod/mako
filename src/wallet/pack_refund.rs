@@ -11,6 +11,7 @@ use crate::storekit::REFUNDED_MESSAGE;
 pub struct CreditedPurchase {
     pub id: String,
     pub user_id: String,
+    pub pack_id: String,
     pub credits: u32,
     pub status: String,
 }
@@ -33,7 +34,7 @@ pub async fn refundable_purchase(db: &impl D1Exec, app_id: &str, transaction_id:
     let rows = db
         .rows(
             &format!(
-                "SELECT id, user_id, credits, status FROM credit_purchases
+                "SELECT id, user_id, pack_id, credits, status FROM credit_purchases
                  WHERE app_id = ?1 AND {} AND payment_id = ?2 AND status IN ('pending', 'completed', 'refunded')
                  ORDER BY created_at LIMIT 1",
                 super::purchase::IS_STORE_PACK
@@ -44,6 +45,7 @@ pub async fn refundable_purchase(db: &impl D1Exec, app_id: &str, transaction_id:
     Ok(rows.first().map(|row| CreditedPurchase {
         id: text(row, "id").unwrap_or_default().to_string(),
         user_id: text(row, "user_id").unwrap_or_default().to_string(),
+        pack_id: text(row, "pack_id").unwrap_or_default().to_string(),
         credits: int(row, "credits").unwrap_or(0).max(0) as u32,
         status: text(row, "status").unwrap_or_default().to_string(),
     }))
@@ -107,6 +109,11 @@ pub fn reversal_key(transaction_id: &str) -> String {
 /// The ledger description a reversed pack is shown with.
 pub fn description(pack_id: &str) -> String {
     format!("App Store refund reversed: {pack_id} pack")
+}
+
+/// The ledger description a pack reversed for a voided Google Play order is shown with.
+pub fn play_description(pack_id: &str) -> String {
+    format!("Google Play refund reversed: {pack_id} pack")
 }
 
 /// The clamped debit that takes `credits` back for a refunded store transaction, tagged with where the refund came from.

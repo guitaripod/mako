@@ -1516,8 +1516,10 @@ paths:
         paid (`purchaseState` 0, not refunded), for `product_id` in the tenant's Play package (`apps.play_package_name`),
         one pack, and made for the caller when the app set the obfuscated account id. It is credited once per Google
         order, under `tx:gp:<orderId>`, and mako then acknowledges it so Google does not refund it while the app has
-        not consumed it yet. Consume the purchase only after a 200 or `already_processed`. Refunds made in Google Play
-        are not reversed yet (that needs Real-time developer notifications).
+        not consumed it yet. Consume the purchase only after a 200 or `already_processed`. An order Google voids later
+        (refund, chargeback, cancellation) has its credits taken back by the server's sweep of Google's voided
+        purchases, and a voided order not credited yet is answered `refunded`. A license-test or promo purchase is
+        credited but recorded at no price.
       tags: [Credits]
       requestBody: &validate_request
         required: true

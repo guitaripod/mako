@@ -1,9 +1,10 @@
 # Sourced by scripts/test-local.sh. Android pack purchases verified with Google Play: prepare_local_google writes a
 # throwaway service account (a fresh RSA key whose token_uri is the stub in scripts/local-google) into .dev.vars before
-# the server starts, and play_with_linking_off checks the route. Google's purchase API itself cannot be stubbed, so the
-# throwaway access token is refused there and the purchase stays credit_pending; what the run proves is the parts a
-# unit test cannot reach: mako signs a valid RS256 assertion with SubtleCrypto, answers not_configured for a tenant
-# without a Play package, and credits nothing it could not verify.
+# the server starts, and play_with_linking_off checks the route and the cron. Google's APIs themselves cannot be
+# stubbed, so the throwaway access token is refused there: the purchase stays credit_pending and the cron's voided
+# purchases sweep is postponed; what the run proves is the parts a unit test cannot reach: mako signs a valid RS256
+# assertion with SubtleCrypto, answers not_configured for a tenant without a Play package, credits nothing it could
+# not verify, and the cron asks Google for voided purchases without taking anything back or moving its window.
 
 GOOGLE_PORT="${GOOGLE_PORT:-8797}"
 GOOGLE_DIR="$IDENTITY_DIR/google"
@@ -62,18 +63,23 @@ print(h["alg"], h["kid"], c["iss"] == sys.argv[2], c["aud"], c["scope"], c["exp"
 ' "$GOOGLE_DIR" "$GOOGLE_EMAIL"
 }
 
+assertion_count() {
+  wc -l < "$GOOGLE_ASSERTIONS" | tr -d ' '
+}
+
 play_with_linking_off() {
   echo "== Google Play purchases"
-  local before pixie_before
+  local before pixie_before signed mark
   before="$(balance_of key_free)"
   call POST "$PLAY_PATH" key_free "$(play_body com.dreameater.credits. small gp-local-1)"
   check "a tenant without a Play package answers not_configured" "503 not_configured" "$STATUS $(json_get error/code)"
   check "and credits nothing" "$before" "$(balance_of key_free)"
 
   pixie_before="$(balance_of key_pixie pixie)"
+  signed="$(assertion_count)"
   call POST "$PLAY_PATH" key_pixie "$(play_body com.guitaripod.pixie.credits. starter '../../edits')" pixie
   check "a token that cannot be a Play purchase is unverifiable" "400 unverifiable_purchase" "$STATUS $(json_get error/code)"
-  check "and asks Google nothing" 0 "$(wc -l < "$GOOGLE_ASSERTIONS" | tr -d ' ')"
+  check "and asks Google nothing" "$signed" "$(assertion_count)"
 
   call POST "$PLAY_PATH" key_pixie "$(play_body com.guitaripod.pixie.credits. starter gp-local-token-1)" pixie
   check "a purchase Google cannot confirm stays pending" "409 credit_pending" "$STATUS $(json_get error/code)"
@@ -83,4 +89,11 @@ play_with_linking_off() {
     "RS256 local-1 True http://127.0.0.1:$GOOGLE_PORT/token https://www.googleapis.com/auth/androidpublisher 3600" "$(assertion_claims)"
   check "nothing was credited" "$pixie_before" "$(balance_of key_pixie pixie)"
   check "and no purchase row was written" 0 "$(sql_value "SELECT COUNT(*) FROM credit_purchases WHERE payment_provider = 'play_store'")"
+
+  mark="$(log_mark)"
+  curl -s -o /dev/null "$BASE/__scheduled?cron=*/30+*+*+*+*"
+  check "the cron asks Google for PixiePocket's voided purchases" yes "$(log_since_has "$mark" "google play voided sweep of com.guitaripod.pixie postponed")"
+  check "a sweep Google refused leaves its window where it was" 0 "$(sql_value "SELECT COUNT(*) FROM play_voided_sweeps")"
+  check "and takes nothing back" 0 "$(sql_value "SELECT COUNT(*) FROM purchase_refunds WHERE transaction_id LIKE 'gp:%'")"
+  check "the balance is untouched" "$pixie_before" "$(balance_of key_pixie pixie)"
 }

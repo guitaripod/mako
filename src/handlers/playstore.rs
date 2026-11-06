@@ -10,8 +10,9 @@ use crate::handlers::storekit::ALREADY_PROCESSED_MESSAGE;
 use crate::ledgers::Ledgers;
 use crate::playstore::{self, Acknowledgements, Expected, FetchTransport, PlayApi, ProductPurchase, ServiceAccount, SubtleSigner, NOT_CONFIGURED_MESSAGE};
 use crate::storekit::{already_settled, pack_of_product, Refusal, PENDING_MESSAGE, REFUNDED_MESSAGE};
+use crate::wallet::client::DoWallets;
 use crate::wallet::pack_credit::{credit_pack, Credit};
-use crate::wallet::{log, pack_refund, purchase};
+use crate::wallet::{link, log, pack_refund, purchase};
 
 /// A pending answer for any failure that a retry of the same request can fix.
 fn pending(reason: impl std::fmt::Debug) -> AppError {
@@ -39,8 +40,8 @@ fn now_seconds() -> u64 {
 /// tenant's paid pack bought by the caller, and credits it once under `tx:gp:<orderId>` through the same purchase row,
 /// refund tombstone and wallet grant as an App Store pack. A tenant without `play_package_name` or a server without the
 /// secret answers 503 `not_configured` and grants nothing; the app keeps the purchase unconsumed, and Google refunds
-/// it after three days if it is never credited. Refunds made in Play are not reversed yet: that needs Real-time
-/// developer notifications (or the Voided Purchases API) feeding `pack_refund`.
+/// it after three days if it is never credited. A refund, chargeback or cancellation in Play takes the credits back
+/// through the cron's sweep of Google's voided purchases (`run_cron`), under the same `purchase_refunds` claim.
 pub async fn validate_play(env: &Env, db: &D1Database, auth: &AuthedUser, request: &ValidatePurchaseRequest, pack: &CreditPack) -> Result<Response> {
     match credit_play(env, db, auth, request, pack).await {
         Ok(response) => Ok(response),
@@ -131,8 +132,19 @@ async fn acknowledge(
     }
 }
 
-/// The scheduled Google Play work: for every tenant with a Play package, acknowledges the credited purchases that still
-/// wait for it (`playstore::acknowledge_credited`). Does nothing without `GOOGLE_PLAY_SERVICE_ACCOUNT`.
+/// The wallets a voided order's credits are taken back from: the Durable Objects with wallet linking on, none (every
+/// buyer is a local balance) with it off. `Err` when linking is on but the binding is missing, so nothing is reversed
+/// into the wrong balance.
+fn refund_wallets(env: &Env) -> std::result::Result<Option<DoWallets>, AppError> {
+    if !link::enabled(env) {
+        return Ok(None);
+    }
+    env.durable_object("WALLET").map(|namespace| Some(DoWallets(namespace))).map_err(|_| AppError::WalletUnavailable)
+}
+
+/// The scheduled Google Play work, for every tenant with a Play package: takes back the credits of voided orders
+/// (`playstore::sweep_voided`), then acknowledges the credited purchases that still wait for it
+/// (`playstore::acknowledge_credited`). Does nothing without `GOOGLE_PLAY_SERVICE_ACCOUNT`.
 pub async fn run_cron(env: &Env, db: &D1Database) {
     let tenants = match playstore::play_tenants(db).await {
         Ok(tenants) if !tenants.is_empty() => tenants,
@@ -144,7 +156,16 @@ pub async fn run_cron(env: &Env, db: &D1Database) {
     };
     let Ok(account) = service_account(env) else { return };
     let api = PlayApi { account: &account, transport: &FetchTransport, signer: &SubtleSigner, tokens: playstore::isolate_tokens(), now: now_seconds() };
+    let now_ms = worker::Date::now().as_millis() as i64;
     for tenant in &tenants {
+        match refund_wallets(env) {
+            Ok(wallets) => match playstore::sweep_voided(&api, db, wallets.as_ref(), tenant, now_ms).await {
+                Ok(report) if report.voided > 0 || !report.finished => log::info(&format!("google play voided sweep {}: {report:?}", tenant.app_id)),
+                Ok(_) => {}
+                Err(error) => log::error(&format!("google play voided sweep failed for {}: {error:?}", tenant.app_id)),
+            },
+            Err(error) => log::error(&format!("google play voided sweep skipped, wallets unavailable: {error:?}")),
+        }
         match playstore::acknowledge_credited(&api, db, tenant).await {
             Ok(report) if report != Acknowledgements::default() => log::info(&format!("google play cron {}: {report:?}", tenant.app_id)),
             Ok(_) => {}

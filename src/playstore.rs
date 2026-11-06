@@ -12,8 +12,10 @@ use crate::wallet::d1::{text, D1Exec};
 use crate::wallet::purchase::{self, PLAY_PAYMENT_PREFIX};
 
 mod google;
+mod voided;
 
 pub use google::{FetchTransport, SubtleSigner};
+pub use voided::sweep_voided;
 
 /// The secret holding the JSON key file of the Google Cloud service account that reads Play purchases.
 pub const SECRET: &str = "GOOGLE_PLAY_SERVICE_ACCOUNT";
@@ -451,7 +453,12 @@ pub fn check(purchase: &ProductPurchase, expected: &Expected<'_>) -> Result<(), 
 /// The payment id a Play purchase is recorded and granted under (`tx:` plus this): `gp:<orderId>`, or for a purchase
 /// without an order (a redeemed promo code) `gp:token:<SHA-256 of its token>`, so the token itself is never stored.
 pub fn payment_id(purchase: &ProductPurchase, token: &str) -> String {
-    match purchase.order_id.as_deref().map(str::trim).filter(|order| !order.is_empty()) {
+    payment_id_of(purchase.order_id.as_deref(), token)
+}
+
+/// The payment id of a Play order id, or of a purchase token when there is no order (see `payment_id`).
+pub fn payment_id_of(order_id: Option<&str>, token: &str) -> String {
+    match order_id.map(str::trim).filter(|order| !order.is_empty()) {
         Some(order) => format!("{PLAY_PAYMENT_PREFIX}{order}"),
         None => {
             let digest = Sha256::digest(token.as_bytes());

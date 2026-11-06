@@ -75,30 +75,64 @@ pub async fn reverse<D: D1Exec, W: WalletTransport>(db: &D, wallets: &W, transac
     if !packs_for_app(db, &app_id).await.iter().any(|p| p.id == pack_id) {
         return Ok(Outcome::Refused(Reason::UnknownPack));
     }
-    let reverser = LedgerReverser { db, wallets, app_id: &app_id, pack_id: &pack_id, transaction_id: &transaction.transaction_id };
-    Ok(match pack_refund::claim_and_settle(db, &app_id, &transaction.transaction_id, &reverser).await? {
+    let reverser = LedgerReverser {
+        db,
+        wallets: Some(wallets),
+        app_id: &app_id,
+        transaction_id: &transaction.transaction_id,
+        source: "ledger",
+        describe: pack_refund::description,
+    };
+    settle(db, &app_id, &transaction.transaction_id, &reverser).await
+}
+
+/// Takes back the credits of the pack a voided Google Play order bought (`payment_id` is `gp:<orderId>`), once, down to
+/// a zero balance, exactly as `reverse` does for an App Store refund: the claim in `purchase_refunds` comes first, a
+/// purchase still `pending` is finished and then reversed, and an order nothing has credited yet is only recorded, so
+/// its validate call is refused afterwards. With `wallets` (wallet linking on) a linked buyer is reversed in the wallet
+/// under `reverse:gp:<orderId>`; without, every buyer is a local D1 balance, as every credit was.
+pub async fn reverse_play_order<D: D1Exec, W: WalletTransport>(db: &D, wallets: Option<&W>, app_id: &str, payment_id: &str) -> Result<Outcome, AppError> {
+    let reverser = LedgerReverser {
+        db,
+        wallets,
+        app_id,
+        transaction_id: payment_id,
+        source: purchase::PLAY_STORE,
+        describe: pack_refund::play_description,
+    };
+    settle(db, app_id, payment_id, &reverser).await
+}
+
+async fn settle<D: D1Exec, W: WalletTransport>(db: &D, app_id: &str, transaction_id: &str, reverser: &LedgerReverser<'_, D, W>) -> Result<Outcome, AppError> {
+    Ok(match pack_refund::claim_and_settle(db, app_id, transaction_id, reverser).await? {
         Settlement::Tombstone => Outcome::Recorded,
         Settlement::Settled(purchase) => Outcome::Duplicate { purchase_id: purchase.id },
         Settlement::Reversed { purchase, taken } => Outcome::Reversed { purchase_id: purchase.id, credits: purchase.credits, taken },
     })
 }
 
-/// The ledger route's half of a refund: a purchase still `pending` is finished in the account its user has now, and the
-/// pack is reversed there, under `reverse:<transactionId>` in a wallet or in one batch with the flip in a D1 balance.
+/// A store refund's half of the reversal: a purchase still `pending` is finished in the account its user has now, and
+/// the pack is reversed there, under `reverse:<transactionId>` in a wallet or in one batch with the flip in a D1
+/// balance. Without wallets every account is local.
 struct LedgerReverser<'a, D: D1Exec, W: WalletTransport> {
     db: &'a D,
-    wallets: &'a W,
+    wallets: Option<&'a W>,
     app_id: &'a str,
-    pack_id: &'a str,
     transaction_id: &'a str,
+    source: &'static str,
+    describe: fn(&str) -> String,
 }
 
 impl<D: D1Exec, W: WalletTransport> Reverser for LedgerReverser<'_, D, W> {
     async fn reverse(&self, purchase: &CreditedPurchase) -> Result<Step, AppError> {
-        let description = pack_refund::description(self.pack_id);
+        let description = (self.describe)(&purchase.pack_id);
         let reference = crate::purchases::refund_reference(self.transaction_id);
-        let reversal = pack_refund::reversal(self.transaction_id, "ledger", purchase.credits, &description, &reference);
-        match links::read(self.db, self.app_id, &purchase.user_id).await? {
+        let reversal = pack_refund::reversal(self.transaction_id, self.source, purchase.credits, &description, &reference);
+        let link = match self.wallets {
+            Some(_) => links::read(self.db, self.app_id, &purchase.user_id).await?,
+            None => None,
+        };
+        match link {
             Some(link) => self.reverse_in_wallet(&account_of(&link), purchase, &reversal).await,
             None => self.reverse_locally(purchase, &reversal).await,
         }
@@ -111,15 +145,16 @@ impl<D: D1Exec, W: WalletTransport> LedgerReverser<'_, D, W> {
         let Account::Wallet { midgar_id, .. } = account else {
             return Err(AppError::InternalError("a link is not a wallet account".to_string()));
         };
+        let wallets = self.wallets.ok_or(AppError::WalletUnavailable)?;
         if purchase.is_pending() {
             let row = purchase::read(self.db, &purchase.id).await?.ok_or_else(|| AppError::InternalError("purchase row vanished".to_string()))?;
-            match purchase::complete_in_wallet(self.db, self.wallets, account, &row).await {
+            match purchase::complete_in_wallet(self.db, wallets, account, &row).await {
                 Ok(_) => {}
                 Err(AppError::Refunded(_)) => return Ok(Step::Settled),
                 Err(error) => return Err(error),
             }
         }
-        let (_, taken) = (WalletOps { wallets: self.wallets, db: self.db }).reverse(midgar_id, self.app_id, reversal).await?;
+        let (_, taken) = (WalletOps { wallets, db: self.db }).reverse(midgar_id, self.app_id, reversal).await?;
         Ok(Step::Taken(taken))
     }
 
@@ -140,10 +175,11 @@ impl<D: D1Exec, W: WalletTransport> LedgerReverser<'_, D, W> {
         if taken >= reversal.amount {
             return Ok(Step::Taken(taken));
         }
+        let Some(wallets) = self.wallets else { return Ok(Step::Taken(taken)) };
         let Some(link) = links::read(self.db, self.app_id, &purchase.user_id).await? else { return Ok(Step::Taken(taken)) };
         let Account::Wallet { midgar_id, .. } = account_of(&link) else { return Ok(Step::Taken(taken)) };
         let rest = Reversal { key: format!("{}:late", reversal.key), amount: reversal.amount - taken, ..reversal.clone() };
-        let (_, also_taken) = (WalletOps { wallets: self.wallets, db: self.db }).reverse(&midgar_id, self.app_id, &rest).await?;
+        let (_, also_taken) = (WalletOps { wallets, db: self.db }).reverse(&midgar_id, self.app_id, &rest).await?;
         Ok(Step::Taken(taken + also_taken))
     }
 }
