@@ -256,23 +256,23 @@ pub async fn tenant_bundle(db: &impl D1Exec, app_id: &str) -> Result<Option<Stri
     Ok(rows.first().and_then(|row| text(row, "apple_app_bundle_id")).filter(|bundle| !bundle.is_empty()).map(str::to_string))
 }
 
-/// The tenant a product belongs to and the `rc_product_prefix` that claims it: the longest prefix wins, so the most
+/// The tenant a product belongs to and the `store_product_prefix` that claims it: the longest prefix wins, so the most
 /// specific tenant does. `None` when no tenant's prefix starts the product id.
 pub async fn tenant_of_product(db: &impl D1Exec, product_id: &str) -> Result<Option<(String, String)>, AppError> {
     let rows = db
         .rows(
-            "SELECT app_id, rc_product_prefix FROM apps
-             WHERE rc_product_prefix IS NOT NULL AND rc_product_prefix != ''
-               AND instr(?1, rc_product_prefix) = 1
-             ORDER BY length(rc_product_prefix) DESC LIMIT 1",
+            "SELECT app_id, store_product_prefix FROM apps
+             WHERE store_product_prefix IS NOT NULL AND store_product_prefix != ''
+               AND instr(?1, store_product_prefix) = 1
+             ORDER BY length(store_product_prefix) DESC LIMIT 1",
             &[product_id.into()],
         )
         .await?;
     let Some(row) = rows.first() else { return Ok(None) };
-    Ok(text(row, "app_id").zip(text(row, "rc_product_prefix")).map(|(app_id, prefix)| (app_id.to_string(), prefix.to_string())))
+    Ok(text(row, "app_id").zip(text(row, "store_product_prefix")).map(|(app_id, prefix)| (app_id.to_string(), prefix.to_string())))
 }
 
-/// The pack id a product resolves to for a tenant: the product must start with the tenant's own `rc_product_prefix`
+/// The pack id a product resolves to for a tenant: the product must start with the tenant's own `store_product_prefix`
 /// and no other tenant's longer prefix may claim it (the longest prefix wins). `None` when the product is no pack of
 /// this tenant.
 pub async fn pack_of_product(db: &impl D1Exec, app_id: &str, product_id: &str) -> Result<Option<String>, AppError> {

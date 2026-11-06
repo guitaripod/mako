@@ -971,11 +971,11 @@ pub async fn validate_purchase(mut req: Request, ctx: RouteContext<()>) -> Resul
     let db = env.d1("DB")?;
 
     let product_prefix = db
-        .prepare("SELECT rc_product_prefix FROM apps WHERE app_id = ?1")
+        .prepare("SELECT store_product_prefix FROM apps WHERE app_id = ?1")
         .bind(&[app_id.clone().into()])?
         .first::<serde_json::Value>(None)
         .await?
-        .and_then(|v| v.get("rc_product_prefix").and_then(|p| p.as_str()).map(|s| s.to_string()))
+        .and_then(|v| v.get("store_product_prefix").and_then(|p| p.as_str()).map(|s| s.to_string()))
         .unwrap_or_default();
     let expected_product = format!("{}{}", product_prefix, validate_req.pack_id);
     if !product_prefix.is_empty() && validate_req.product_id != expected_product {

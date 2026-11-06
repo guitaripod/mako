@@ -21,7 +21,7 @@ fn pending(d1: &LocalD1) -> String {
 }
 
 fn reversal<'a>(description: &'a str, reference: &'a str) -> Reversal<'a> {
-    Reversal { key: pack_refund::reversal_key(TX), kind: Kind::Reversal, source: "revenuecat", amount: CREDITS as u32, description, reference: Some(reference) }
+    Reversal { key: pack_refund::reversal_key(TX), kind: Kind::Reversal, source: "app_store", amount: CREDITS as u32, description, reference: Some(reference) }
 }
 
 fn reverse(d1: &LocalD1, id: &str) -> Option<u32> {

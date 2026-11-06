@@ -261,7 +261,7 @@ fn a_purchase_completed_meanwhile_through_the_local_balance_is_not_granted_again
     let wallets = FakeWallets::new();
     d1.user(APP, "u1", 0);
     link(&d1, "u1", MIDGAR, "linked");
-    pending(&d1, "p-1", "u1", "revenuecat", "tx-1", 100);
+    pending(&d1, "p-1", "u1", "app_store", "tx-1", 100);
     let stale = row(&d1, "p-1");
     d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'p-1'", &[]);
     let account = wallet(MIDGAR, "u1");
@@ -278,7 +278,7 @@ fn a_crash_between_the_grant_and_the_flip_loses_and_doubles_nothing() {
         let wallets = FakeWallets::new();
         d1.user(APP, "u1", 0);
         link(&d1, "u1", MIDGAR, "linked");
-        pending(&d1, "p-1", "u1", "revenuecat", "tx-1", 100);
+        pending(&d1, "p-1", "u1", "app_store", "tx-1", 100);
         let account = wallet(MIDGAR, "u1");
         let budget = Budget::of(ticks);
         let result = complete(&Flaky { inner: &d1, budget: &budget }, &Flaky { inner: &wallets, budget: &budget }, "p-1", &account);
@@ -329,13 +329,16 @@ fn a_purchase_in_a_terminal_state_cannot_be_completed() {
 fn the_cron_lists_only_stale_pending_store_purchases() {
     let d1 = LocalD1::migrated();
     d1.user(APP, "u1", 0);
-    pending(&d1, "old-rc", "u1", "revenuecat", "t1", 10);
+    pending(&d1, "old-store", "u1", "app_store", "t1", 10);
+    pending(&d1, "old-legacy", "u1", "revenuecat", "t4", 10);
     pending(&d1, "old-stripe", "u1", "stripe", "s1", 10);
-    pending(&d1, "done-rc", "u1", "revenuecat", "t2", 10);
-    d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'done-rc'", &[]);
-    pending(&d1, "fresh-rc", "u1", "revenuecat", "t3", 10);
-    d1.run("UPDATE credit_purchases SET created_at = '2099-01-01T00:00:00+00:00' WHERE id = 'fresh-rc'", &[]);
-    assert_eq!(block_on(purchase::stale_store_purchases(&d1, 50)).unwrap(), ["old-rc"]);
+    pending(&d1, "done-store", "u1", "app_store", "t2", 10);
+    d1.run("UPDATE credit_purchases SET status = 'completed' WHERE id = 'done-store'", &[]);
+    pending(&d1, "fresh-store", "u1", "app_store", "t3", 10);
+    d1.run("UPDATE credit_purchases SET created_at = '2099-01-01T00:00:00+00:00' WHERE id = 'fresh-store'", &[]);
+    let mut stale = block_on(purchase::stale_store_purchases(&d1, 50)).unwrap();
+    stale.sort();
+    assert_eq!(stale, ["old-legacy", "old-store"], "a row still labelled as before migration 039 is swept too");
     assert_eq!(block_on(purchase::stale_store_purchases(&d1, 0)).unwrap().len(), 0);
 }
 

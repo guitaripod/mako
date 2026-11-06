@@ -55,7 +55,7 @@ verify_with_linking_off() {
   check "it credits the pack" 5 "$(json_get credits_added)"
   check "it answers the new balance" $((before + 5)) "$(json_get new_balance)"
   check "the local balance holds it" $((before + 5)) "$(balance_of key_free)"
-  check "the purchase row is keyed by the store transaction" "completed revenuecat" "$(sql_value "SELECT status || ' ' || payment_provider FROM credit_purchases WHERE payment_id = 'sk-1'")"
+  check "the purchase row is keyed by the store transaction" "completed app_store" "$(sql_value "SELECT status || ' ' || payment_provider FROM credit_purchases WHERE payment_id = 'sk-1'")"
 
   signed_validate key_free "$token" "$(validate_body sk-1 "$VERIFY_MIDGAR")"
   check "a replay is 400" 400 "$STATUS"

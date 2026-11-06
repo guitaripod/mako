@@ -116,7 +116,7 @@ impl World {
         }
         world.d1.run("UPDATE user_credits SET balance = ?1, lifetime_purchased = 0, lifetime_spent = 0", &[PACK_CREDITS.into()]);
         if let Accounts::Wallet = accounts {
-            let other = json!({"key": format!("tx:{OTHER_TX}"), "tenant": APP, "kind": "purchase", "amount": PACK_CREDITS, "source": "revenuecat", "description": "Another pack"});
+            let other = json!({"key": format!("tx:{OTHER_TX}"), "tenant": APP, "kind": "purchase", "amount": PACK_CREDITS, "source": "app_store", "description": "Another pack"});
             assert_eq!(world.wallets.call(MIDGAR, "POST", "/grant", Some(&other)).0, 200);
         }
         match start {

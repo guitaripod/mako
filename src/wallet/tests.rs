@@ -181,7 +181,7 @@ pub fn verify_reports_corruption(books: &mut MemoryBooks) {
 
 /// The route table answers the documented statuses and bodies.
 pub fn routes_answer_the_documented_statuses(books: &mut impl Books) {
-    let grant = json!({"key":"tx:1","tenant":"app","kind":"purchase","amount":10,"source":"revenuecat","description":"Pack"});
+    let grant = json!({"key":"tx:1","tenant":"app","kind":"purchase","amount":10,"source":"app_store","description":"Pack"});
     let (status, body) = call(books, "POST", "/grant", grant.clone());
     assert_eq!((status, body["outcome"].as_str(), body["balance"].as_i64()), (200, Some("applied"), Some(10)));
     let (status, body) = call(books, "POST", "/grant", grant);
@@ -201,7 +201,7 @@ pub fn routes_answer_the_documented_statuses(books: &mut impl Books) {
     assert_eq!(call(books, "POST", "/grant", bad_grant).0, 400);
     let pool = json!({"key":"k","tenant":"*","kind":"purchase","amount":4,"source":"x","description":"Chat"});
     assert_eq!(call(books, "POST", "/grant", pool).0, 400);
-    let rev = json!({"key":"reverse:tx:1","tenant":"app","kind":"reversal","amount":-10,"source":"revenuecat","description":"Refund"});
+    let rev = json!({"key":"reverse:tx:1","tenant":"app","kind":"reversal","amount":-10,"source":"app_store","description":"Refund"});
     let (status, body) = call(books, "POST", "/reverse", rev);
     assert_eq!((status, body["taken"].as_i64(), body["balance"].as_i64()), (200, Some(6), Some(0)));
     let (status, body) = call(books, "GET", "/balance?tenant=app", json!({}));

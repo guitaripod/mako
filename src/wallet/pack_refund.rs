@@ -32,9 +32,12 @@ impl CreditedPurchase {
 pub async fn refundable_purchase(db: &impl D1Exec, app_id: &str, transaction_id: &str) -> Result<Option<CreditedPurchase>, AppError> {
     let rows = db
         .rows(
-            "SELECT id, user_id, credits, status FROM credit_purchases
-             WHERE app_id = ?1 AND payment_provider = 'revenuecat' AND payment_id = ?2 AND status IN ('pending', 'completed', 'refunded')
-             ORDER BY created_at LIMIT 1",
+            &format!(
+                "SELECT id, user_id, credits, status FROM credit_purchases
+                 WHERE app_id = ?1 AND {} AND payment_id = ?2 AND status IN ('pending', 'completed', 'refunded')
+                 ORDER BY created_at LIMIT 1",
+                super::purchase::IS_APP_STORE
+            ),
             &[app_id.into(), transaction_id.into()],
         )
         .await?;

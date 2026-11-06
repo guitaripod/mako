@@ -18,6 +18,13 @@ const PENDING_AFTER_MINUTES: i64 = 5;
 /// Pending App Store pack purchases one cron run completes.
 pub const SWEEP_LIMIT: i64 = 50;
 
+/// The `payment_provider` of an App Store pack purchase.
+pub const APP_STORE: &str = "app_store";
+
+/// Matches App Store pack purchases: `'app_store'`, and `'revenuecat'`, the label of rows written before migration 039
+/// relabels them.
+pub const IS_APP_STORE: &str = "payment_provider IN ('app_store', 'revenuecat')";
+
 /// One `credit_purchases` row, as the completion needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurchaseRow {
@@ -54,7 +61,7 @@ const COLUMNS: &str = "id, app_id, user_id, pack_id, credits, amount_usd_cents, 
 /// and the validate call share, and the purchase id for Stripe and crypto, whose payment ids are not minted by us.
 pub fn grant_key(row: &PurchaseRow) -> String {
     match row.provider.as_str() {
-        "revenuecat" => format!("tx:{}", row.payment_id),
+        "app_store" | "revenuecat" => format!("tx:{}", row.payment_id),
         "stripe" => format!("stripe:{}", row.id),
         "nowpayments" => format!("crypto:{}", row.id),
         _ => format!("purchase:{}", row.id),
@@ -64,7 +71,7 @@ pub fn grant_key(row: &PurchaseRow) -> String {
 /// The ledger source and the description a purchase is shown with.
 fn source_and_description(row: &PurchaseRow) -> (&'static str, String) {
     match row.provider.as_str() {
-        "revenuecat" => ("revenuecat", format!("App Store purchase: {} pack", row.pack_id)),
+        "app_store" | "revenuecat" => (APP_STORE, format!("App Store purchase: {} pack", row.pack_id)),
         "stripe" => ("stripe", format!("Card purchase: {} pack", row.pack_id)),
         "nowpayments" => ("crypto", format!("Crypto purchase: {} pack", row.pack_id)),
         _ => ("stripe", format!("Purchased {} pack", row.pack_id)),
@@ -79,9 +86,8 @@ pub async fn read(db: &impl D1Exec, purchase_id: &str) -> Result<Option<Purchase
 
 /// The status of the App Store pack purchase of a store transaction, if one was recorded.
 pub async fn store_status(db: &impl D1Exec, app_id: &str, payment_id: &str) -> Result<Option<String>, AppError> {
-    let sql = "SELECT status FROM credit_purchases WHERE app_id = ?1 AND payment_id = ?2 AND payment_provider = 'revenuecat'
-        ORDER BY created_at LIMIT 1";
-    Ok(db.rows(sql, &[app_id.into(), payment_id.into()]).await?.first().and_then(|r| text(r, "status")).map(str::to_string))
+    let sql = format!("SELECT status FROM credit_purchases WHERE app_id = ?1 AND payment_id = ?2 AND {IS_APP_STORE} ORDER BY created_at LIMIT 1");
+    Ok(db.rows(&sql, &[app_id.into(), payment_id.into()]).await?.first().and_then(|r| text(r, "status")).map(str::to_string))
 }
 
 /// Records an App Store pack purchase as `pending` unless the transaction already has a row or its refund was claimed, and
@@ -101,10 +107,12 @@ pub async fn record_pending(
 ) -> Result<String, AppError> {
     let now = Utc::now().to_rfc3339();
     db.exec(
-        "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'revenuecat', ?7, 'pending', ?8
-         WHERE NOT EXISTS (SELECT 1 FROM credit_purchases WHERE app_id = ?2 AND payment_provider = 'revenuecat' AND payment_id = ?7)
-           AND NOT EXISTS (SELECT 1 FROM purchase_refunds WHERE app_id = ?2 AND transaction_id = ?7)",
+        &format!(
+            "INSERT INTO credit_purchases (id, app_id, user_id, pack_id, credits, amount_usd_cents, payment_provider, payment_id, status, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, '{APP_STORE}', ?7, 'pending', ?8
+             WHERE NOT EXISTS (SELECT 1 FROM credit_purchases WHERE app_id = ?2 AND {IS_APP_STORE} AND payment_id = ?7)
+               AND NOT EXISTS (SELECT 1 FROM purchase_refunds WHERE app_id = ?2 AND transaction_id = ?7)"
+        ),
         &[
             Uuid::new_v4().to_string().into(),
             app_id.into(),
@@ -119,7 +127,7 @@ pub async fn record_pending(
     .await?;
     let rows = db
         .rows(
-            "SELECT id FROM credit_purchases WHERE app_id = ?1 AND payment_provider = 'revenuecat' AND payment_id = ?2 ORDER BY created_at LIMIT 1",
+            &format!("SELECT id FROM credit_purchases WHERE app_id = ?1 AND {IS_APP_STORE} AND payment_id = ?2 ORDER BY created_at LIMIT 1"),
             &[app_id.into(), payment_id.into()],
         )
         .await?;
@@ -326,8 +334,7 @@ pub async fn stale_store_purchases(db: &impl D1Exec, limit: i64) -> Result<Vec<S
     let cutoff = (Utc::now() - Duration::minutes(PENDING_AFTER_MINUTES)).to_rfc3339();
     let rows = db
         .rows(
-            "SELECT id FROM credit_purchases WHERE status = 'pending' AND payment_provider = 'revenuecat' AND created_at < ?1
-             ORDER BY created_at LIMIT ?2",
+            &format!("SELECT id FROM credit_purchases WHERE status = 'pending' AND {IS_APP_STORE} AND created_at < ?1 ORDER BY created_at LIMIT ?2"),
             &[cutoff.into(), limit.into()],
         )
         .await?;

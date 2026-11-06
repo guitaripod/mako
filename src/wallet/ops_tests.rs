@@ -28,7 +28,7 @@ impl WalletTransport for Sick {
 }
 
 fn purchase(key: &str, amount: u32) -> Grant<'static> {
-    Grant { key: key.into(), kind: Kind::Purchase, source: "revenuecat", amount, description: "Pack", reference: Some("p-1") }
+    Grant { key: key.into(), kind: Kind::Purchase, source: "app_store", amount, description: "Pack", reference: Some("p-1") }
 }
 
 fn charge(reference: &str, amount: u32) -> Charge<'static> {
@@ -132,7 +132,7 @@ fn a_reversal_takes_at_most_the_balance_once_per_key() {
     let ops = WalletOps { wallets: &wallets, db: &d1 };
     block_on(ops.grant(MIDGAR, APP, &purchase("tx:1", 10))).unwrap();
     block_on(ops.spend(MIDGAR, APP, &charge("chat:a", 4))).unwrap();
-    let reversal = Reversal { key: "reverse:tx:1".into(), kind: Kind::Reversal, source: "revenuecat", amount: 10, description: "Refund", reference: Some("r") };
+    let reversal = Reversal { key: "reverse:tx:1".into(), kind: Kind::Reversal, source: "app_store", amount: 10, description: "Refund", reference: Some("r") };
     assert_eq!(block_on(ops.reverse(MIDGAR, APP, &reversal)).unwrap(), (0, 6));
     assert_eq!(block_on(ops.reverse(MIDGAR, APP, &reversal)).unwrap(), (0, 6), "a repeat reports the same");
     assert_eq!(wallets.balance(MIDGAR, APP), 0);
