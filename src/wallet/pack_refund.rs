@@ -107,6 +107,60 @@ pub fn reversal_key(transaction_id: &str) -> String {
     format!("reverse:{transaction_id}")
 }
 
+/// The wallet idempotency key of the part of a reversal the D1 balance could not cover, taken from the wallet the buyer
+/// linked to while the refund ran.
+pub fn late_key(transaction_id: &str) -> String {
+    format!("{}:late", reversal_key(transaction_id))
+}
+
+/// Records that a refund still has to take `credits` from the buyer's wallet (`late_key`), before it tries, so a
+/// failed try is retried by the wallet cron instead of being lost behind the purchase's `refunded` status.
+pub async fn owe_late(db: &impl D1Exec, app_id: &str, transaction_id: &str, credits: u32) -> Result<(), AppError> {
+    db.exec(
+        "UPDATE purchase_refunds SET late_owed = ?3 WHERE app_id = ?1 AND transaction_id = ?2",
+        &[app_id.into(), transaction_id.into(), (credits as i64).into()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Records that the late part of a refund was taken.
+pub async fn settle_late(db: &impl D1Exec, app_id: &str, transaction_id: &str) -> Result<(), AppError> {
+    db.exec("UPDATE purchase_refunds SET late_owed = 0 WHERE app_id = ?1 AND transaction_id = ?2", &[app_id.into(), transaction_id.into()])
+        .await?;
+    Ok(())
+}
+
+/// A refund that still owes the late part of its reversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LateReversal {
+    pub app_id: String,
+    pub transaction_id: String,
+    pub user_id: String,
+    pub owed: u32,
+}
+
+/// Refunds whose late part is still owed, oldest first.
+pub async fn late_reversals(db: &impl D1Exec, limit: i64) -> Result<Vec<LateReversal>, AppError> {
+    let rows = db
+        .rows(
+            "SELECT app_id, transaction_id, user_id, late_owed FROM purchase_refunds WHERE late_owed > 0 ORDER BY created_at LIMIT ?1",
+            &[limit.into()],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            Some(LateReversal {
+                app_id: text(row, "app_id")?.to_string(),
+                transaction_id: text(row, "transaction_id")?.to_string(),
+                user_id: text(row, "user_id")?.to_string(),
+                owed: int(row, "late_owed")?.max(0) as u32,
+            })
+        })
+        .collect())
+}
+
 /// The ledger description a reversed pack is shown with.
 pub fn description(pack_id: &str) -> String {
     format!("App Store refund reversed: {pack_id} pack")

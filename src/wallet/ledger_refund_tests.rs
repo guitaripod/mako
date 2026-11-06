@@ -2,7 +2,7 @@ use futures::executor::block_on;
 use serde_json::json;
 
 use super::ledger_grant::{self, Reason as GrantReason};
-use super::ledger_refund::{reverse, Outcome, Reason};
+use super::ledger_refund::{retry_late_reversals, reverse, Outcome, Reason};
 use super::testing::{Budget, FakeWallets, Flaky, LocalD1};
 use super::{pack_refund, purchase};
 use crate::error::AppError;
@@ -87,6 +87,10 @@ impl World {
 
     fn d1_status(&self, id: &str) -> String {
         block_on(purchase::read(&self.d1, id)).unwrap().unwrap().status
+    }
+
+    fn d1_status_of(&self, payment_id: &str) -> String {
+        block_on(purchase::store_status(&self.d1, APP, payment_id)).unwrap().unwrap_or_default()
     }
 }
 
@@ -352,4 +356,123 @@ fn a_credit_that_finishes_after_the_refund_reversed_the_purchase_changes_nothing
     assert_eq!(world.d1_status(&id), "refunded");
     assert_eq!(world.balance(), PACK_CREDITS);
     assert_eq!(world.reversals(TX), 1);
+}
+
+/// A D1 that links the buyer to `MIDGAR` right after the batch that reverses the D1 balance, as a link saga finishing
+/// while a refund runs would.
+struct LinksMidRefund<'a> {
+    d1: &'a LocalD1,
+    linked: std::cell::Cell<bool>,
+}
+
+impl super::d1::D1Exec for LinksMidRefund<'_> {
+    async fn rows(&self, sql: &str, params: &[super::sql::Val]) -> Result<Vec<serde_json::Value>, AppError> {
+        self.d1.rows(sql, params).await
+    }
+
+    async fn exec(&self, sql: &str, params: &[super::sql::Val]) -> Result<u64, AppError> {
+        self.d1.exec(sql, params).await
+    }
+
+    async fn batch(&self, statements: &[super::d1::Stmt]) -> Result<(), AppError> {
+        self.d1.batch(statements).await
+    }
+
+    async fn batch_changes(&self, statements: &[super::d1::Stmt]) -> Result<Vec<u64>, AppError> {
+        let changes = self.d1.batch_changes(statements).await?;
+        if !self.linked.replace(true) {
+            self.d1.run(
+                "INSERT INTO wallet_links (app_id, user_id, midgar_id, state, linked_at) VALUES (?1, 'u1', ?2, 'linked', '2026-10-02T00:00:00+00:00')",
+                &[APP.into(), MIDGAR.into()],
+            );
+        }
+        Ok(changes)
+    }
+}
+
+/// Wallets that can be switched off, as an outage of the wallet objects.
+struct Switchable<'a> {
+    wallets: &'a FakeWallets,
+    down: std::cell::Cell<bool>,
+}
+
+impl super::client::WalletTransport for Switchable<'_> {
+    async fn send(&self, midgar_id: &str, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<(u16, serde_json::Value), AppError> {
+        if self.down.get() {
+            return Err(AppError::WalletUnavailable);
+        }
+        self.wallets.send(midgar_id, method, path, body).await
+    }
+}
+
+/// A local buyer who bought a pack under `payment_id`, spent all but 2 of it from the D1 balance, and whose wallet
+/// (which the link saga is about to bring) holds 10.
+fn spent_locally(payment_id: &str) -> World {
+    let world = World { d1: LocalD1::migrated(), wallets: FakeWallets::new() };
+    world.d1.user(APP, "u1", 0);
+    let ledger = super::testing::TestLedger { db: &world.d1, wallets: &world.wallets };
+    let credited = block_on(super::pack_credit::credit_pack(&world.d1, &ledger, APP, "u1", "small", PACK_CREDITS as u32, 299, payment_id, None)).unwrap();
+    assert!(matches!(credited, super::pack_credit::Credit::Credited { .. }), "{credited:?}");
+    world.d1.run("UPDATE user_credits SET balance = 2 WHERE app_id = ?1 AND user_id = 'u1'", &[APP.into()]);
+    let moved = json!({"key": "migrate-test", "tenant": APP, "kind": "purchase", "amount": 10, "source": "test", "description": "Moved"});
+    assert_eq!(world.wallets.call(MIDGAR, "POST", "/grant", Some(&moved)).0, 200);
+    world
+}
+
+fn late_owed(world: &World, payment_id: &str) -> i64 {
+    world.d1.int("SELECT late_owed FROM purchase_refunds WHERE app_id = ?1 AND transaction_id = ?2", &[APP.into(), payment_id.into()])
+}
+
+fn d1_balance(world: &World) -> i64 {
+    world.d1.int("SELECT balance FROM user_credits WHERE app_id = ?1 AND user_id = 'u1'", &[APP.into()])
+}
+
+/// Runs a refund whose late wallet part fails, then the wallet cron's retry, and checks the remainder is taken once.
+fn the_late_part_survives_a_wallet_outage(payment_id: &str, refund: impl Fn(&LinksMidRefund, &Switchable) -> Result<Outcome, AppError>) {
+    let world = spent_locally(payment_id);
+    let db = LinksMidRefund { d1: &world.d1, linked: std::cell::Cell::new(false) };
+    let wallets = Switchable { wallets: &world.wallets, down: std::cell::Cell::new(true) };
+
+    let outcome = refund(&db, &wallets).unwrap();
+
+    let Outcome::Reversed { taken, .. } = outcome else { panic!("expected a reversal, got {outcome:?}") };
+    assert_eq!(taken, 2, "the D1 balance gave what it had");
+    assert_eq!(d1_balance(&world), 0);
+    assert_eq!(world.d1_status_of(payment_id), "refunded");
+    assert_eq!(late_owed(&world, payment_id), PACK_CREDITS - 2, "the rest is owed, not lost");
+    assert_eq!(world.balance(), 10);
+    assert!(matches!(refund(&db, &wallets).unwrap(), Outcome::Duplicate { .. }), "a retry of the refund itself settles nothing");
+
+    assert_eq!(block_on(retry_late_reversals(&world.d1, &wallets, 50)).unwrap(), 0, "the cron keeps the debt while the wallet is down");
+    assert_eq!(late_owed(&world, payment_id), PACK_CREDITS - 2);
+    wallets.down.set(false);
+    assert_eq!(block_on(retry_late_reversals(&world.d1, &wallets, 50)).unwrap(), 1);
+    assert_eq!(world.balance(), 10 - (PACK_CREDITS - 2));
+    assert_eq!(late_owed(&world, payment_id), 0);
+    let late = world.wallets.call(MIDGAR, "GET", &format!("/entry?tenant={APP}&key={}", pack_refund::late_key(payment_id)), None).1;
+    assert_eq!(late["amount"], -(PACK_CREDITS - 2));
+    assert_eq!(block_on(retry_late_reversals(&world.d1, &wallets, 50)).unwrap(), 0);
+    assert_eq!(world.balance(), 10 - (PACK_CREDITS - 2), "nothing is taken twice");
+    assert!(world.wallets.verified(MIDGAR));
+}
+
+#[test]
+fn the_late_part_of_an_app_store_refund_survives_a_wallet_outage() {
+    the_late_part_survives_a_wallet_outage(TX, |db, wallets| block_on(reverse(db, wallets, &refunded(TX))));
+}
+
+#[test]
+fn the_late_part_of_a_google_play_refund_survives_a_wallet_outage() {
+    let order = "gp:GPA.late";
+    the_late_part_survives_a_wallet_outage(order, |db, wallets| block_on(super::ledger_refund::reverse_play_order(db, Some(wallets), APP, order)));
+}
+
+#[test]
+fn a_late_part_taken_at_once_owes_nothing() {
+    let world = spent_locally(TX);
+    let db = LinksMidRefund { d1: &world.d1, linked: std::cell::Cell::new(false) };
+    let outcome = block_on(reverse(&db, &world.wallets, &refunded(TX))).unwrap();
+    assert!(matches!(outcome, Outcome::Reversed { taken, .. } if taken as i64 == PACK_CREDITS), "{outcome:?}");
+    assert_eq!(late_owed(&world, TX), 0);
+    assert_eq!(world.balance(), 10 - (PACK_CREDITS - 2));
 }

@@ -9,6 +9,9 @@ use crate::wallet::pack_credit::PurchaseLedger;
 use crate::wallet::purchase;
 use crate::wallet::{resolve, target};
 
+/// Refunds whose owed late part one wallet cron run retries.
+const LATE_REVERSAL_LIMIT: i64 = 50;
+
 /// Where a caller's credits live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Account {
@@ -346,6 +349,13 @@ impl<'a> Ledgers<'a> {
             Ok(n) if n > 0 => crate::wallet::log::info(&format!("wallet cron completed {n} pending purchases")),
             Ok(_) => {}
             Err(e) => crate::wallet::log::error(&format!("pending purchase sweep failed: {e:?}")),
+        }
+        if let Some(wallets) = self.wallets.as_ref() {
+            match crate::wallet::ledger_refund::retry_late_reversals(self.db, wallets, LATE_REVERSAL_LIMIT).await {
+                Ok(n) if n > 0 => crate::wallet::log::info(&format!("wallet cron took the late part of {n} refunds")),
+                Ok(_) => {}
+                Err(e) => crate::wallet::log::error(&format!("late refund retry failed: {e:?}")),
+            }
         }
     }
 }
