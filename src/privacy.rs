@@ -34,24 +34,10 @@ fn moved_legal_page(app: &str, doc: &str) -> Option<Result<Response>> {
 /// that has no custom EULA in App Store Connect.
 const STANDARD_EULA_URL: &str = "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/";
 
-/// Tenants whose privacy policy mako still renders itself. Every policy has moved to midgarcorp.cc,
-/// so the list is empty; the templates stay compiled until they are retired.
-const MAKO_PRIVACY_PAGES: [&str; 0] = [];
-
-/// Tenants whose terms mako still renders itself. Pay Day and Living Dex terms live on
-/// midgarcorp.cc, so the list is empty; the template stays compiled until it is retired.
-const MAKO_TERMS_PAGES: [&str; 0] = [];
-
 /// Where a `/terms/<app>` request goes: the moved midgarcorp.cc page, else Apple's Standard EULA
-/// for an app without terms of its own, or `None` when mako renders the page itself.
-fn terms_redirect(app: &str) -> Option<(String, u16)> {
-    if let Some(target) = legal_redirect(app, "terms") {
-        return Some((target, 301));
-    }
-    if MAKO_TERMS_PAGES.contains(&app) {
-        return None;
-    }
-    Some((STANDARD_EULA_URL.to_string(), 302))
+/// for an app without terms of its own.
+fn terms_redirect(app: &str) -> (String, u16) {
+    legal_redirect(app, "terms").map(|target| (target, 301)).unwrap_or_else(|| (STANDARD_EULA_URL.to_string(), 302))
 }
 
 /// The short page served in place of a privacy policy mako does not have.
@@ -77,116 +63,21 @@ pub fn privacy_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response>
     if let Some(moved) = moved_legal_page(app, "privacy") {
         return moved;
     }
-    if MAKO_PRIVACY_PAGES.contains(&app) {
-        return html_response(render(app), 200);
-    }
     html_response(no_policy_page(), 404)
 }
 
-const DREAM_EATER_AI: &str = "the dream text, the options you chose for it and short summaries of earlier dreams you had read are sent to Dream Eater's server, which passes them to Google's Gemini model to write the reading";
-
-/// Every outside service Dream Eater's pages may name: (name, what it does).
-const DREAM_EATER_PROVIDERS: [(&str, &str); 4] = [
-    ("Google (Gemini)", "writes readings and paints art from the text described above"),
-    ("RevenueCat", "processes purchases and tells our server whether you have the subscription"),
-    ("Apple", "StoreKit for purchases, and Apple Ads attribution that tells us which ad campaign an install came from"),
-    ("Cloudflare", "hosts our server"),
-];
-
-struct AppPrivacy {
-    name: &'static str,
-    ai: &'static str,
-    uses_location: bool,
-    voice_consent: bool,
-}
-
-fn config(app: &str) -> AppPrivacy {
+/// The name a tenant's support page carries.
+fn app_name(app: &str) -> &'static str {
     match app {
-        "pixie" => AppPrivacy {
-            name: "PixiePocket",
-            ai: "the text prompts you enter, and any photos you provide for editing, are sent to OpenAI and Google to generate or edit images",
-            uses_location: false,
-            voice_consent: false,
-        },
-        "dreameater" => AppPrivacy {
-            name: "Dream Eater",
-            ai: DREAM_EATER_AI,
-            uses_location: false,
-            voice_consent: false,
-        },
-        "doublekick" => AppPrivacy {
-            name: "Double Kick",
-            ai: "photos of the menus you scan are sent to Google Gemini to read and translate the items",
-            uses_location: false,
-            voice_consent: false,
-        },
-        "psywave" => AppPrivacy {
-            name: "Psywave",
-            ai: "the description or photo you provide is sent to Google Gemini to generate a playlist",
-            uses_location: false,
-            voice_consent: false,
-        },
-        "psybeam" => AppPrivacy {
-            name: "Psybeam",
-            ai: "your speech is streamed directly from your device to OpenAI's real-time translation service over an encrypted connection and spoken back to you; the audio is processed only to translate, is not stored on our servers, and the conversation transcript stays on your device",
-            uses_location: true,
-            voice_consent: true,
-        },
-        "payday" => AppPrivacy {
-            name: "Pay Day",
-            ai: "only when you tap an AI action to draft line items from a photo or a description, the content you provide (that photo or text, plus the invoice currency) is sent over an encrypted connection to our backend, operated by Midgar Oy, which forwards it to OpenAI (OpenAI, L.L.C.) solely to generate the draft you requested. Nothing is sent until you grant permission in the app's AI consent screen, which you can withdraw at any time in Settings. Your saved invoices and client list are not sent",
-            uses_location: false,
-            voice_consent: false,
-        },
-        "livingdex" => AppPrivacy {
-            name: "Living Dex",
-            ai: "the photo you capture is sent to Google (Gemini) to identify the organism, and the species name alone is sent to Anthropic (Claude) when a field entry is written in the cloud",
-            uses_location: true,
-            voice_consent: false,
-        },
-        _ => AppPrivacy {
-            name: "This app",
-            ai: "the content you submit is sent to our AI providers (OpenAI and Google) only to produce the result you requested",
-            uses_location: false,
-            voice_consent: false,
-        },
+        "pixie" => "PixiePocket",
+        "dreameater" => "Dream Eater",
+        "doublekick" => "Double Kick",
+        "psywave" => "Psywave",
+        "psybeam" => "Psybeam",
+        "payday" => "Pay Day",
+        "livingdex" => "Living Dex",
+        _ => "This app",
     }
-}
-
-fn einvoicing_section(app: &str) -> &'static str {
-    if app == "payday" {
-        r#"<h2>Invoice and client data</h2>
-<p>The invoices and estimates you create — including your business details and your clients' names, addresses, VAT identifiers, and the amounts — are stored on your device. Two optional actions send data off your device, only when you start them:</p>
-<ul>
-<li><strong>VAT validation:</strong> a client's VAT number is sent to the EU VIES service to confirm it is valid.</li>
-<li><strong>Peppol delivery:</strong> the complete electronic invoice (an EN 16931 document with the buyer and seller details and the financial breakdown) is transmitted through our certified Peppol access-point provider to your client's accounting system.</li>
-</ul>
-<p>Because invoices necessarily contain information about your clients (third parties), that information is processed and transmitted as above solely to deliver the document or check the number you requested. You are responsible for having a lawful basis to invoice your clients. You can always produce and share an invoice as a PDF without using either action.</p>"#
-    } else {
-        ""
-    }
-}
-
-/// Apple Ads (AdServices) install measurement, disclosed only for the apps that
-/// actually submit an attribution token to us. Apple's attribution carries the
-/// campaign, ad group, keyword and country — no advertising identifier, no device
-/// identifier, nothing that identifies a person — which is why it needs no
-/// tracking permission and does not make the "no third-party tracking" statement
-/// below untrue.
-///
-/// Solar Beam is deliberately absent even though it runs a campaign: it has no
-/// backend identity and never sends a token, so claiming its campaign data
-/// reaches a server would be a false disclosure. Add it here only if it ever
-/// gains the integration.
-fn ad_measurement_section(app: &str, name: &str) -> String {
-    if !matches!(app, "dreameater" | "payday" | "psybeam") {
-        return String::new();
-    }
-    format!(
-        r#"<h2>Advertising measurement</h2>
-<p>We may promote {name} with ads on the App Store. If you installed the app after tapping one of those ads, Apple tells our server which campaign, ad group, and search keyword produced the install, and the country the App Store served it in — never who you are. Apple's App Store attribution includes no advertising identifier and no device identifier, which is why it requires no tracking permission. We keep those campaign details alongside your anonymous identity purely to see which ads pay for themselves, we receive nothing that could recognise you in any other app or website, and we never share it.</p>"#,
-        name = name
-    )
 }
 
 fn contact_link(app: &str) -> &'static str {
@@ -197,307 +88,6 @@ fn contact_link(app: &str) -> &'static str {
     } else {
         r#"<a href="https://x.com/prblemslver">@prblemslver</a>"#
     }
-}
-
-fn on_device_content(app: &str) -> &'static str {
-    match app {
-        "payday" => "your invoices, estimates, clients, logo, and settings",
-        "psywave" => "your playlist history and a small copy of any photo you made a playlist from",
-        _ => "results, history, and transcripts",
-    }
-}
-
-fn last_updated(app: &str) -> &'static str {
-    match app {
-        "psywave" => "September 2026",
-        "livingdex" | "inventory" | "dreameater" => "October 2026",
-        _ => "June 2026",
-    }
-}
-
-/// Psywave's two data flows beyond generation: playlist pages the listener
-/// chooses to publish, and on-device reads of their Apple Music library.
-fn psywave_sections(app: &str) -> &'static str {
-    if app != "psywave" {
-        return "";
-    }
-    r#"<h2>Shared playlists</h2>
-<p>When you tap Share Link, the playlist's name, description, mood, and song list (titles, artists, albums, Apple Music song identifiers, and album-art addresses) are stored on our server so the link can show them. Anyone with the link can view that page. It never includes your photo, your identity, or anything else from your device. To have a shared page removed, contact us with its link.</p>
-<h2>Apple Music</h2>
-<p>With your permission, Psywave adds the playlists you make to your Apple Music library. If you turn on Psywave Pro's “Only songs new to me” or “Grow One of My Playlists”, the app reads your library on your device to skip songs you already have or to see which songs a chosen playlist contains; only the song titles and artists of that chosen playlist are sent to our AI provider to suggest additions, and nothing from your library is stored on our servers.</p>"#
-}
-
-fn render(app: &str) -> String {
-    if app == "flaccy" {
-        return render_flaccy();
-    }
-    if app == "livingdex" {
-        return render_livingdex();
-    }
-    if app == "inventory" {
-        return render_inventory();
-    }
-    if app == "dreameater" {
-        return render_dreameater();
-    }
-    let c = config(app);
-    let location = if c.uses_location {
-        "<h2>Location</h2><p>If you grant location access, your approximate location is used on your device to improve the experience (such as suggesting a nearby language) and is not sent to our servers.</p>"
-    } else {
-        ""
-    };
-    let consent = if c.voice_consent {
-        " Where the app shows a cloud-AI consent control, you can withdraw it at any time in Settings; translation is unavailable until consent is granted."
-    } else {
-        ""
-    };
-    let einvoicing = einvoicing_section(app);
-    let ad_measurement = ad_measurement_section(app, c.name);
-    let contact = contact_link(app);
-    let on_device = on_device_content(app);
-    let psywave = psywave_sections(app);
-    let updated = last_updated(app);
-    let purchases = if app == "psywave" {
-        "Psywave Pro (an auto-renewing subscription) and credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock Pro or credit your balance. We never receive your payment-card details."
-    } else if app == "payday" {
-        "Subscriptions and credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which product and a transaction identifier) to unlock features or credit your balance. We never receive your payment-card details."
-    } else {
-        "Credit packs are sold through Apple In-App Purchase and validated via RevenueCat. We receive purchase records (which pack and a transaction identifier) to credit your balance. We never receive your payment-card details."
-    };
-    let deletion = if app == "payday" || app == "psybeam" {
-        "You can delete your account from within the app at any time (in Settings), which removes your server-side identity and credit ledger; deleting the app removes any remaining on-device data."
-    } else {
-        "You can delete the app at any time to remove on-device data."
-    };
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{name} — Privacy Policy</title>
-<style>body{{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1c1c1e}}h1{{font-size:28px}}h2{{font-size:18px;margin-top:28px}}a{{color:#06c}}@media(prefers-color-scheme:dark){{body{{background:#000;color:#e5e5ea}}a{{color:#4da3ff}}}}</style>
-</head><body>
-<h1>{name} Privacy Policy</h1>
-<p><em>Last updated: {updated}</em></p>
-<p>{name} is designed to collect as little as possible. This policy explains what is processed and why.</p>
-<h2>AI processing</h2>
-<p>To provide the app's core feature, {ai}. This data is processed only to produce your result and is not used to train AI models. Our AI providers handle it under their own privacy and security commitments that protect it to a standard comparable to this policy, and are permitted to use it only to return your result.</p>
-<h2>Identity</h2>
-<p>{name} works without an account. On first launch we create an anonymous, device-based identity used only to track your credit balance. You may optionally Sign in with Apple to sync your balance across devices, in which case we receive only the identifier Apple provides.</p>
-<h2>Purchases</h2>
-<p>{purchases}</p>
-{einvoicing}
-<h2>On-device data</h2>
-<p>Content you create in the app — such as {on_device} — is stored on your device and is not uploaded to us.</p>
-{psywave}
-{location}
-{ad_measurement}
-<h2>What we don't do</h2>
-<p>We do not sell your data, show advertising inside the app, or use third-party tracking or advertising identifiers.</p>
-<h2>Your choices</h2>
-<p>{deletion}{consent} For any questions, contact {contact}.</p>
-</body></html>"#,
-        name = c.name,
-        ai = c.ai,
-        purchases = purchases,
-        einvoicing = einvoicing,
-        on_device = on_device,
-        psywave = psywave,
-        updated = updated,
-        location = location,
-        ad_measurement = ad_measurement,
-        consent = consent,
-        deletion = deletion,
-        contact = contact,
-    )
-}
-
-/// Dream Eater's privacy policy. Each statement matches what the app and the
-/// `dreameater` tenant do: the server keeps no dream text, prompt, reading or
-/// image, only an anonymous identity, the credit ledger, weekly counters and the
-/// ad attribution verdict, and deletion removes all of that.
-fn render_dreameater() -> String {
-    let c = config("dreameater");
-    let providers: String = DREAM_EATER_PROVIDERS
-        .iter()
-        .map(|(name, role)| format!("<li><strong>{}</strong>: {}.</li>", name, role))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let body = format!(
-        r#"<h1>{name} Privacy Policy</h1>
-<p><em>Last updated: {updated}</em></p>
-<p>{name} is a private dream journal. This policy explains what stays on your device, what leaves it, who handles it and how to delete it.</p>
-<h2>What stays on your device</h2>
-<p>Your dreams, voice recordings, transcripts, journal, tags, birth details and the sky data worked out from them are stored on your device and are not uploaded to us.</p>
-<h2>Readings</h2>
-<p>Only when you ask for a reading, {ai_reading}. Our server keeps no dream text, prompt or reading afterwards: it passes the request on, returns the answer to your device and forgets it. You can withdraw your permission for readings at any time in Settings, then Privacy, and everything else keeps working.</p>
-<h2>Art</h2>
-<p>Art is made from a short scene summary, not from your dream text. The summary goes through our server to Google's image model, and the image is returned to your device and is not stored on our server.</p>
-<h2>What our server keeps</h2>
-<ul>
-<li>An anonymous identifier and key for your device. There is no name and no email address.</li>
-<li>Your credit balance and the ledger of credits granted, used and bought.</li>
-<li>Counters for your weekly free readings.</li>
-<li>The Apple Ads attribution verdict, if you installed the app after tapping one of our ads (see Advertising measurement below).</li>
-</ul>
-<h2>Purchases</h2>
-<p>Credit packs and the optional subscription are sold through Apple In-App Purchase and processed with RevenueCat. We receive purchase records (which product and a transaction identifier) to credit your balance or unlock the subscription. We never receive your payment-card details.</p>
-<h2>Who handles data</h2>
-<ul>
-{providers}
-</ul>
-<p>Google handles the text sent for a reading or for art under its own terms and privacy policy. Under its terms for the paid Gemini API, Google does not use those prompts and responses to improve its products, and it keeps a log of them for a limited time solely to detect abuse. We do not use your dreams to train AI models, and nothing is sold or shared for advertising.</p>
-{ad_measurement}
-<h2>Deleting your data</h2>
-<p>In the app, open Settings, then Privacy, then Delete all data. This removes the dreams and everything else stored on your device, and deletes your server identity, credit ledger and weekly counters. It cannot be undone, and it does not cancel a subscription: manage or cancel that in iOS Settings under your Apple Account, then Subscriptions. Purchase records held by Apple and RevenueCat are kept under their own policies.</p>
-<h2>Children</h2>
-<p>{name} is not directed at children under 13, and we do not knowingly collect data from them.</p>
-<h2>What we don't do</h2>
-<p>We do not sell your data, show advertising inside the app, or use third-party tracking or advertising identifiers.</p>
-<h2>Contact</h2>
-<p>For any questions, contact {contact}.</p>"#,
-        name = c.name,
-        updated = last_updated("dreameater"),
-        ai_reading = c.ai,
-        providers = providers,
-        ad_measurement = ad_measurement_section("dreameater", c.name),
-        contact = contact_link("dreameater"),
-    );
-    without_em_dashes(&page(c.name, "Privacy Policy", &body))
-}
-
-/// Dream Eater's pages are written without em dashes, including the shared
-/// advertising paragraph and the page title they are wrapped in.
-fn without_em_dashes(html: &str) -> String {
-    html.replace("<title>Dream Eater \u{2014} Privacy Policy", "<title>Dream Eater Privacy Policy")
-        .replace(" \u{2014} ", ", ")
-}
-
-/// Living Dex's privacy policy. Every statement here is tied to what the app and
-/// the `livingdex` tenant actually do: all identification runs in the cloud,
-/// nothing the user photographs is stored by us, and account deletion erases the
-/// anonymous account, wallet and ledger.
-fn render_livingdex() -> String {
-    let body = format!(
-        r#"<h1>Living Dex Privacy Policy</h1>
-<p><em>Last updated: {updated}</em></p>
-<p>Living Dex is designed to collect as little as possible. This policy explains exactly what leaves your device, where it goes, and how long it is kept.</p>
-<h2>Identifying a photo</h2>
-<p>Every identification happens in the cloud: the app has no on-device species model. When you capture a photo, the app shrinks a copy (longest side 1,536 pixels, JPEG) and sends it over an encrypted connection to our backend, operated by Midgar Oy. The backend forwards it to Google (Gemini) solely to identify the organism and returns the result. We do not save the photo or add it to any gallery: our servers keep no copy once the answer is returned. Google processes it under its own terms and privacy policy, which may include a short retention period for safety and abuse monitoring. We do not use your photos to train AI models, and we ask our providers not to. The full-resolution original stays on your device.</p>
-<h2>Field entries</h2>
-<p>The written field entry for a species is generated on your device with Apple Foundation Models when your device supports it. Otherwise the species name, its classification, and a short factual summary (never your photo, location, or identity) are sent through our backend to Anthropic (Claude) to write the text.</p>
-<h2>Species information lookups</h2>
-<p>To rate rarity, build your Nearby list, and fill in each species' card, the app contacts the Living Dex service, a Cloudflare Worker run by us. It looks up public sources with the species' scientific name: GBIF (occurrence counts and taxonomy), Wikipedia and Wikimedia Commons (summaries and images), and Xeno-canto (recordings). The Worker stores nothing and has no database; it does not receive your account, your photos, or your purchases. Like any web service, Cloudflare may keep standard request logs (such as the request address and your IP address) for a limited time.</p>
-<h2>Location</h2>
-<p>Location is optional and used only while the app is open (While Using the App). If you allow it, each sighting is tagged with its place on your device. To rate how rare a species is where you are, the coordinates of the sighting, first rounded to about 11 km, are sent to the Living Dex service, which asks GBIF how often that species is recorded within about 150 km. A photo you pick from your library or a bundled sample carries no location, so its rarity is rated from worldwide data. To build the Nearby list, the app sends the centre of a roughly 55 km grid cell around you. We do not store these coordinates; they appear only in the standard request logs described above, and in a short-lived cache that is keyed to an area of roughly 11 km and not to you. Your location is never sent to the AI providers, never shown to other players, and never linked to your account. If you decline location access, identification still works; rarity is rated from worldwide data instead and the Nearby list cannot be built.</p>
-<h2>Identity</h2>
-<p>Living Dex works without an account. On first launch the app creates a random device identifier, kept in your Keychain, and uses Apple DeviceCheck so that Apple can confirm the request comes from a genuine Apple device; Apple tells us only yes or no. We use that to create an anonymous account holding an account ID, an access key, and your credit balance. Each new device receives 30 free identifications once; after that, identifications need Living Dex Pro or purchased credits.</p>
-<p>If you choose to link Sign in with Apple, we additionally store Apple's user identifier and the email address Apple provides, which may be Apple's private relay address. We never receive your Apple password.</p>
-<h2>Credits and purchases</h2>
-<p>We keep a ledger for your account: credits granted, credits used by each identification or field entry (with the time), and credit packs bought. Living Dex Pro (monthly or annual) and credit packs are sold through Apple In-App Purchase. RevenueCat processes the purchases: it receives your Apple transaction data and your anonymous account ID so that it can tell us whether you have Pro. We never receive your payment-card details.</p>
-<h2>Game Center</h2>
-<p>If you are signed in to Game Center, the app reports your number of unique species and achievement progress to Apple's Game Center, which handles them under Apple's privacy policy. Nothing else is shared with it.</p>
-<h2>On-device data</h2>
-<p>Content you create in the app, such as your species collection (your Dex), your sightings with their locations, your saved photos, and your progress, is stored on your device and is not uploaded to us for storage.</p>
-<h2>How long we keep data</h2>
-<ul>
-<li>Photos sent for identification: not kept by us. Google and Anthropic keep API data only under their own terms.</li>
-<li>Account, credit balance, and ledger: kept until you delete your account.</li>
-<li>Cloudflare request logs: kept for the limited period Cloudflare's logging settings allow.</li>
-<li>Purchase records at Apple and RevenueCat, and Game Center data at Apple: kept under their policies.</li>
-</ul>
-<h2>Deleting your account and data</h2>
-<p>In the app, open Profile, then Settings, then Delete Account. This permanently deletes your anonymous account, your credit wallet and ledger, and any images stored for it on our servers, and clears all data on your device (your collection, photos, and progress). It cannot be undone, and it does not cancel an App Store subscription: manage or cancel that in iOS Settings under your Apple Account, then Subscriptions. Records held by Apple (purchases, Game Center) and by RevenueCat are kept under their own policies; contact us if you want us to ask RevenueCat to erase yours. Deleting the app alone removes the on-device data but not the server-side account.</p>
-<h2>What we don't do</h2>
-<p>We do not sell your data, show advertising inside the app, or use third-party tracking or advertising identifiers. The app does not ask for tracking permission and does not measure ad campaigns.</p>
-<h2>Contact</h2>
-<p>For any questions, contact {contact}.</p>"#,
-        updated = last_updated("livingdex"),
-        contact = contact_link("livingdex"),
-    );
-    page("Living Dex", "Privacy Policy", &body)
-}
-
-fn render_flaccy() -> String {
-    let body = r#"<h1>Flaccy Privacy Policy</h1>
-<p><em>Last updated: July 2026</em></p>
-<p>Flaccy is designed to collect as little as possible. This policy explains what is processed and why.</p>
-<h2>On-device data</h2>
-<p>Flaccy works without an account — there is no sign-up, no analytics, no advertising, and no tracking. Your music library, playlists, and play history are stored on your device and are not uploaded to us.</p>
-<h2>Last.fm (optional)</h2>
-<p>If you connect a Last.fm account, you authenticate directly with Last.fm; we never see your Last.fm password. While connected, the app sends scrobbles (track, artist, album, and timestamp) and now-playing updates to Last.fm, and fetches your charts, loved tracks, and artist information from it. That data is handled under <a href="https://www.last.fm/legal/privacy">Last.fm's privacy policy</a>. You can disconnect at any time in Settings.</p>
-<h2>AI metadata cleanup</h2>
-<p>When an imported file lacks recognizable metadata, its file and folder names — never the audio content — are sent to the Groq API, where a language model identifies the artist, album, and track. No personal identifiers are attached, and per Groq's data policy this data is not used to train AI models.</p>
-<h2>Other service lookups</h2>
-<p>To enrich your library, the app fetches lyrics from LRCLIB, artwork and artist images from Apple Music/iTunes, MusicBrainz, and Last.fm, and share links from Songlink. These queries contain only track, artist, or album names.</p>
-<h2>What we don't do</h2>
-<p>We do not sell your data, show advertising, or use third-party tracking or advertising identifiers. No data leaves your device except the service calls described above.</p>
-<h2>Your choices</h2>
-<p>You can delete the app at any time to remove on-device data. For any questions, contact <a href="https://x.com/prblemslver">@prblemslver</a>.</p>"#;
-    page("Flaccy", "Privacy Policy", body)
-}
-
-/// Master of Inventory's privacy policy. The app has no account and no AI: the
-/// inventory stays on the device and in the user's own iCloud, receipts are read
-/// on the device, and the only things that leave it are purchase records for
-/// RevenueCat and the anonymous "More apps" catalogue request.
-fn render_inventory() -> String {
-    let body = format!(
-        r#"<h1>Master of Inventory Privacy Policy</h1>
-<p><em>Last updated: {updated}</em></p>
-<p>Master of Inventory is a private record of what you own: what it cost, when you bought it, when the warranty ends and until when you can still return it. It has no account, no analytics, no advertising, and no server of ours that holds your inventory. This policy explains exactly what the app stores, what leaves your device, and who receives it.</p>
-<h2>In short</h2>
-<ul>
-<li>Your items, photos, receipts and notes stay on your device and, if you use iCloud, in your own iCloud. We cannot see them.</li>
-<li>Receipts and serial numbers are read on your device. Nothing is uploaded for text recognition.</li>
-<li>The only information that leaves the app is purchase records sent to RevenueCat and anonymous counts from the optional "More apps" screen.</li>
-<li>No advertising, no tracking, no analytics software, no sale of data.</li>
-</ul>
-<h2>Who we are</h2>
-<p>Master of Inventory is published by Midgar Oy, a company in Finland. For the small amount of information described under Purchases and More apps below, Midgar Oy is the controller. You can reach us at {contact}.</p>
-<h2>What the app stores on your device</h2>
-<p>Everything you enter or capture: item names, brands, models, serial numbers, stores, prices and currencies, purchase dates, warranty and return deadlines, notes, where an item is kept, categories, photos, receipts and other documents (images and PDFs) together with the text read from them, and your settings such as reminder times and default warranty. It is kept in the app's private storage on your device, protected by iOS data protection, and is not uploaded to us.</p>
-<h2>iCloud sync</h2>
-<p>If you are signed in to iCloud, the app syncs your inventory between your own devices using Apple's CloudKit, in the private database of your Apple Account. Only you can read it; we have no access to it and no way to open it. Apple processes it under its own terms and privacy policy and encrypts it in transit and at rest. iCloud also uses Apple's push service to tell your other devices that something changed, which carries no inventory content. The iCloud row in the app's Settings shows the state of sync, and you control it in iOS Settings under your name, then iCloud. If iCloud is off, your inventory stays on the device only.</p>
-<h2>Receipts and serial numbers</h2>
-<p>When you scan a receipt, the app reads the price, date and store on your device with Apple's Vision framework, and reads serial numbers from the camera with Apple's Live Text. The images and the recognised text are never sent to us or to anyone else.</p>
-<h2>Camera, photos and files</h2>
-<p>The camera is used only to photograph items and to scan receipts, documents and serial numbers. The app reads your photo library only for the photos you choose to attach, and writes to it only when you save a photo. Files you import, such as a backup, are read only when you pick them. Each permission is optional and can be changed in iOS Settings. What you capture is stored inside the app and is not sent to us.</p>
-<h2>Reminders</h2>
-<p>Warranty and return reminders are notifications scheduled on your device. No server of ours sends them. You can turn them off in the app or in iOS Settings.</p>
-<h2>Face ID and passcode lock</h2>
-<p>You can lock the app with Face ID or your device passcode. iOS performs the check and tells the app only whether it succeeded; the app never receives your face data or your passcode.</p>
-<h2>Spotlight, Siri and Shortcuts</h2>
-<p>So that you can find an item from the Home Screen, the app adds each active item's name, brand, model, store, serial number and category to your device's Spotlight index, which stays on your device. Items you archive or delete are removed from it, and while the Face ID lock or "Hide values when switching apps" is on, the app adds nothing to Spotlight. Siri and Shortcuts actions run on your device and use only what the app already holds.</p>
-<h2>Exports, claim packs and backups</h2>
-<p>PDF reports, claim packs, CSV files and backups are created on your device when you ask. They leave the app only through the iOS share sheet, to the place you choose, such as Mail, Files or AirDrop. They contain what you select, including prices, serial numbers, photos and receipts, so treat them like the original documents. Once you share one, the recipient's own practices apply.</p>
-<h2>Purchases and RevenueCat</h2>
-<p>Pro (monthly, yearly or lifetime) is sold through Apple In-App Purchase. Apple handles payment and billing, and we never receive your card details or your Apple Account details. The app verifies your purchase on your device with Apple's StoreKit. If you bought Master of Inventory when it was a paid app, the app checks with Apple, on your device, which version you first downloaded and unlocks Pro for you.</p>
-<p>To understand purchases and subscriptions, the app also uses RevenueCat (RevenueCat, Inc., United States). The RevenueCat software in the app sends RevenueCat your Apple transaction records (which product, price, dates and subscription status, and your App Store country) together with an anonymous identifier created on your device, and standard technical information such as the app and iOS version and your IP address. It receives no name, no email address and no inventory content. We use it to see how purchases and subscriptions are doing; it does not decide whether Pro is unlocked. RevenueCat processes this on our behalf and under its own privacy policy at <a href="https://www.revenuecat.com/privacy">revenuecat.com/privacy</a>. Because it is based in the United States, the information may be processed there.</p>
-<h2>More apps</h2>
-<p>Settings has a "More apps" screen that shows our other apps. Only when you open it, the app downloads the list from a catalogue service we run on Cloudflare, and the artwork from Apple's servers. It also sends the catalogue service a small anonymous event when an app is shown or tapped: the kind of event, which app, the bundle identifier of this app, and your App Store country. It carries no identifier for you or your device. Like any web service, Cloudflare may keep standard request logs, such as your IP address, for a limited time.</p>
-<h2>Help and diagnostics</h2>
-<p>The app keeps a short activity log on your device to help find faults. It is never sent automatically. In Settings, under Help and contact, you can copy a diagnostic summary (app and iOS version, device model, iCloud state, the number of items and the latest log lines) or start an email to us with a short header filled in. Read it first: nothing is sent unless you send it. If you have chosen in iOS to share analytics with app developers, Apple may give us anonymous crash and usage reports, which contain nothing we can link to you.</p>
-<h2>What we don't do</h2>
-<p>We do not sell your data, show advertising, or use third-party tracking or advertising identifiers. The app does not ask for tracking permission and contains no advertising or analytics software. We do not use your data to train AI models, and nothing in the app sends your content to an AI service.</p>
-<h2>How long we keep data</h2>
-<ul>
-<li>Your inventory: only on your devices and in your iCloud, until you delete it.</li>
-<li>Purchase records at Apple and RevenueCat: kept under their policies.</li>
-<li>"More apps" events: anonymous counts, kept as long as they are useful for measuring our own promotion.</li>
-</ul>
-<h2>Deleting your data</h2>
-<p>Delete items in the app, or delete the app to remove everything stored on that device. To remove the iCloud copy, open iOS Settings, your name, iCloud, Manage Account Storage, then Master of Inventory, and choose Delete Data. Deleting the app does not cancel a subscription: manage or cancel it in iOS Settings under your Apple Account, then Subscriptions. We hold no account for you, so there is nothing else for us to delete; if you want the purchase records that RevenueCat holds erased, contact us and we will ask RevenueCat to do it.</p>
-<h2>Your rights</h2>
-<p>Because we keep almost no information about you, most requests are answered by the controls above. Where privacy law, such as the GDPR, gives you rights to access, correct, erase, restrict or move information about you, or to object to its use, contact us and we will help. We process purchase records to provide and support the purchases you make and, for the anonymous counts, in our legitimate interest in measuring our own promotion. You may complain to your local data protection authority; in Finland that is the Office of the Data Protection Ombudsman (tietosuoja.fi).</p>
-<h2>Children</h2>
-<p>Master of Inventory is not directed at children, and we do not knowingly collect personal information from anyone, including children.</p>
-<h2>Changes</h2>
-<p>If this policy changes we will publish the new version here with a new date, and mention material changes in the app's release notes.</p>
-<h2>Contact</h2>
-<p>For any questions, contact {contact}.</p>"#,
-        updated = last_updated("inventory"),
-        contact = r#"<a href="mailto:support@midgarcorp.cc">support@midgarcorp.cc</a>"#,
-    );
-    page("Master of Inventory", "Privacy Policy", &body)
 }
 
 pub fn payday_landing(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
@@ -1099,10 +689,8 @@ pub fn payday_landing(_req: Request, _ctx: RouteContext<()>) -> Result<Response>
 
 pub fn terms_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let app = ctx.param("app").map(|s| s.as_str()).unwrap_or("");
-    if let Some((target, status)) = terms_redirect(app) {
-        return Url::parse(&target).map_err(Into::into).and_then(|url| Response::redirect_with_status(url, status));
-    }
-    html_response(render_terms(app), 200)
+    let (target, status) = terms_redirect(app);
+    Url::parse(&target).map_err(Into::into).and_then(|url| Response::redirect_with_status(url, status))
 }
 
 pub fn support_handler(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -1126,59 +714,8 @@ fn page(name: &str, title: &str, body: &str) -> String {
     )
 }
 
-fn render_terms(app: &str) -> String {
-    let c = config(app);
-    let subscriptions = if app == "livingdex" {
-        "Every new device receives 30 free identifications. Each identification uses one credit; when they are used up you can continue with Living Dex Pro or buy credit packs. Living Dex Pro is an auto-renewing subscription, offered monthly and annually, that includes unlimited cloud identifications (subject to reasonable rate limits that protect the service). Eligible new subscribers get a 3-day free trial on the annual plan. Payment is charged to your Apple Account at confirmation of purchase, or when the free trial ends. The subscription renews automatically at the same price unless you cancel at least 24 hours before the end of the current period, and your account is charged for renewal within 24 hours before the period ends. Manage or cancel it in iOS Settings under your Apple Account, then Subscriptions. Any unused portion of a free trial is forfeited when you purchase a subscription. Cancelling does not delete your account; deleting your Living Dex account does not cancel a subscription.</p><p>Credit packs are consumable one-time purchases: credits are not refundable, transferable, or redeemable for money, except where the law requires otherwise. A photo that reaches the identification service uses a credit even when nothing is recognised; a request that fails because of a network or service error does not. Prices are shown in the App before purchase, and purchases are processed by Apple under the Apple Media Services Terms."
-    } else {
-        "Pay Day Pro is an auto-renewing subscription sold through Apple In-App Purchase. Payment is charged to your Apple Account at confirmation. It renews automatically unless cancelled at least 24 hours before the end of the current period; manage or cancel it in your Apple Account settings. Any free-trial portion is forfeited when you purchase a subscription. Credit packs are one-time consumable purchases used to send invoices over the Peppol network and for optional AI features; consumed credits are non-refundable. Prices are shown in the App before purchase."
-    };
-    let responsibilities = if app == "livingdex" {
-        "Identifications, field entries, and rarity ratings are produced by AI and public data, are best guesses, and may be wrong or incomplete. <strong>Never eat, taste, touch, or handle any wild plant, fungus, or animal based on the App's output. Never consume a wild mushroom or plant on the strength of this App.</strong> Many species are toxic, venomous, protected, or dangerous, and misidentification can cause serious harm or death. The App is for general education and enjoyment and is not safety, medical, foraging, or professional advice. Keep a safe distance from wildlife, do not disturb it, and follow all local laws and protected-area rules."
-    } else {
-        "You are responsible for the accuracy and legality of the invoices, client data, and tax information you enter, and for having a lawful basis to invoice your clients. The App helps you produce documents in standard formats (including EN 16931 / Peppol); it is not tax, accounting, or legal advice, and you remain responsible for your compliance obligations."
-    };
-    let acceptable = if app == "livingdex" {
-        "Do not use the App unlawfully, to harass, bait, or endanger wildlife, to disturb protected species, nests, or habitats, to infringe others' rights, or to interfere with or reverse-engineer the service."
-    } else {
-        "Do not use the App unlawfully, to send fraudulent or unsolicited documents, to infringe others' rights, or to interfere with or reverse-engineer the service."
-    };
-    let availability = if app == "livingdex" {
-        "Identification is performed in the cloud for every photo, so it needs an internet connection and depends on third-party AI and data services that may be unavailable, delayed, or inaccurate. Browsing your collection works offline. The App sends your photos to AI providers as described in the Privacy Policy."
-    } else {
-        "Network features (VAT validation, currency rates, and Peppol delivery) depend on third-party services and may be unavailable or delayed; issuing and sharing invoices as PDFs does not require them."
-    };
-    let body = format!(
-        r#"<h1>{name} Terms of Use</h1>
-<p><em>Last updated: {updated}</em></p>
-<p>These Terms govern your use of {name} (the "App"), operated by Midgar Oy. By downloading or using the App you agree to them.</p>
-<h2>Licence</h2>
-<p>We grant you a personal, non-transferable, revocable licence to use the App on Apple devices you own or control, in accordance with the Apple Media Services Terms and these Terms.</p>
-<h2>Subscriptions and purchases</h2>
-<p>{subscriptions}</p>
-<h2>Your responsibilities</h2>
-<p>{responsibilities}</p>
-<h2>Acceptable use</h2>
-<p>{acceptable}</p>
-<h2>Availability and third parties</h2>
-<p>{availability}</p>
-<h2>Disclaimer and liability</h2>
-<p>The App is provided "as is" without warranties of any kind. To the maximum extent permitted by law, Midgar Oy is not liable for indirect or consequential damages, and our total liability is limited to the amount you paid for the App in the 12 months before the claim. Nothing limits liability that cannot be excluded by law.</p>
-<h2>Changes and termination</h2>
-<p>We may update these Terms; continued use after an update constitutes acceptance. We may suspend the service for misuse.</p>
-<h2>Governing law</h2>
-<p>These Terms are governed by the laws of Finland, without regard to conflict-of-laws rules.</p>
-<h2>Contact</h2>
-<p>{contact}</p>"#,
-        name = c.name,
-        updated = if app == "livingdex" { last_updated(app) } else { "July 2026" },
-        contact = contact_link(app),
-    );
-    page(c.name, "Terms of Use", &body)
-}
-
 fn render_support(app: &str) -> String {
-    let c = config(app);
+    let name = app_name(app);
     let topics = match app {
         "livingdex" => r#"<li><strong>It says "no clear living thing".</strong> The AI could not find one clearly visible wild animal, bird, insect, plant, or fungus it was confident about, so nothing was added to your Dex. Get closer, fill the frame with the subject, use good light, hold steady, and avoid people, pets, screens, food, and objects. A photo that reaches the AI uses a credit even when nothing is recognised; if the request fails because you are offline or the service is down, no credit is used.</li>
 <li><strong>The identification is wrong.</strong> Identification is done by AI and can be mistaken, especially for look-alike species, so treat it as a best guess. Never eat, taste, touch, or handle a wild animal, plant, or fungus, and never consume a wild mushroom or plant, based on this App.</li>
@@ -1209,11 +746,11 @@ fn render_support(app: &str) -> String {
 </ul>
 <h2>Legal</h2>
 <p>See our <a href="/privacy/{app}">Privacy Policy</a> and <a href="/terms/{app}">Terms of Use</a>.</p>"#,
-        name = c.name,
+        name = name,
         contact = contact_link(app),
         app = link_slug(app),
     );
-    page(c.name, "Support", &body)
+    page(name, "Support", &body)
 }
 
 /// The app path segment as it may appear inside a link: only ASCII letters, digits and hyphens survive, so a crafted
@@ -1271,13 +808,13 @@ mod tests {
 
     #[test]
     fn payday_and_livingdex_terms_still_move_to_midgarcorp() {
-        assert_eq!(terms_redirect("payday"), Some(("https://midgarcorp.cc/legal/pay-day/terms/".to_string(), 301)));
-        assert_eq!(terms_redirect("livingdex"), Some(("https://midgarcorp.cc/legal/living-dex/terms/".to_string(), 301)));
+        assert_eq!(terms_redirect("payday"), ("https://midgarcorp.cc/legal/pay-day/terms/".to_string(), 301));
+        assert_eq!(terms_redirect("livingdex"), ("https://midgarcorp.cc/legal/living-dex/terms/".to_string(), 301));
     }
 
     #[test]
     fn every_other_app_gets_apples_standard_eula() {
-        let eula = Some((STANDARD_EULA_URL.to_string(), 302));
+        let eula = (STANDARD_EULA_URL.to_string(), 302);
         for app in ["helia", "pixie", "pixiepocket", "dreameater", "doublekick", "psywave", "psybeam", "flaccy", "inventory", "solarbeam", "unknown-app"] {
             assert_eq!(terms_redirect(app), eula, "{} terms", app);
         }
@@ -1288,7 +825,6 @@ mod tests {
     fn no_app_is_left_on_a_generic_privacy_page() {
         for app in ["solarbeam", "strata", "embr", "unknown-app", ""] {
             assert_eq!(legal_redirect(app, "privacy"), None, "{} should have no moved policy", app);
-            assert!(!MAKO_PRIVACY_PAGES.contains(&app), "{} would render a generic policy", app);
         }
         for (tenant, _, docs) in LEGAL_MOVES {
             assert!(docs.contains(&"privacy"), "{} has no privacy policy to move", tenant);
@@ -1312,45 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn campaign_apps_disclose_apple_ads_measurement() {
-        for app in ["dreameater", "payday", "psybeam"] {
-            let html = render(app);
-            assert!(html.contains("Advertising measurement"), "{} lacks the section", app);
-            assert!(html.contains("no advertising identifier"), "{} omits the no-IDFA promise", app);
-        }
-    }
-
-    #[test]
-    fn apps_without_campaigns_say_nothing_about_ads() {
-        for app in ["pixie", "livingdex", "doublekick", "psywave"] {
-            assert!(!render(app).contains("Advertising measurement"), "{} gained an ads section", app);
-        }
-    }
-
-    /// Solar Beam runs an App Store campaign but sends us nothing, so its page
-    /// must not claim we receive campaign data for it.
-    #[test]
-    fn an_app_that_submits_no_token_claims_no_ad_measurement() {
-        let html = render("solarbeam");
-        assert!(!html.contains("Advertising measurement"));
-        assert!(!html.contains("which campaign, ad group, and search keyword"));
-    }
-
-    #[test]
-    fn no_app_claims_in_app_advertising_or_third_party_tracking() {
-        for app in ["dreameater", "payday", "pixie", "psybeam", "livingdex"] {
-            let html = render(app);
-            assert!(html.contains("show advertising inside the app"));
-            assert!(html.contains("third-party tracking or advertising identifiers"));
-        }
-    }
-
-    #[test]
-    fn psywave_pages_describe_psywave() {
-        let privacy = render("psywave");
-        assert!(privacy.contains("Shared playlists"));
-        assert!(privacy.contains("It never includes your photo"));
-        assert!(privacy.contains("Psywave Pro (an auto-renewing subscription)"));
+    fn psywave_support_describes_psywave() {
         let support = render_support("psywave");
         assert!(support.contains("Importing needs Apple Music"));
         assert!(!support.contains("Invoices"));
@@ -1365,94 +863,9 @@ mod tests {
     }
 
     #[test]
-    fn livingdex_pages_describe_cloud_identification_and_deletion() {
-        let privacy = render("livingdex");
-        assert!(privacy.contains("no on-device species model"));
-        assert!(privacy.contains("Delete Account"));
-        assert!(privacy.contains("does not cancel an App Store subscription"));
-        assert!(privacy.contains("October 2026"));
-        assert!(privacy.contains("guitaripod@gmail.com"));
-        assert!(!privacy.contains("on-device identification"));
-        let terms = render_terms("livingdex");
-        assert!(terms.contains("30 free identifications"));
-        assert!(terms.contains("3-day free trial"));
-        assert!(terms.contains("Never consume a wild mushroom or plant"));
-        assert!(!terms.contains("on-device features work offline"));
+    fn livingdex_support_describes_cloud_identification_and_deletion() {
         let support = render_support("livingdex");
         assert!(support.contains("no clear living thing"));
         assert!(support.contains("Restore"));
-    }
-
-
-    #[test]
-    fn inventory_policy_describes_local_data_revenuecat_and_more_apps() {
-        let privacy = render("inventory");
-        assert!(privacy.contains("Master of Inventory Privacy Policy"));
-        assert!(privacy.contains("October 2026"));
-        assert!(privacy.contains("no server of ours that holds your inventory"));
-        assert!(privacy.contains("never sent to us or to anyone else"));
-        assert!(privacy.contains("RevenueCat"));
-        assert!(privacy.contains("More apps"));
-        assert!(privacy.contains("support@midgarcorp.cc"));
-        assert!(privacy.contains("third-party tracking or advertising identifiers"));
-        assert!(!privacy.contains("AI processing"));
-        assert!(!privacy.contains("anonymous, device-based identity"));
-    }
-
-    #[test]
-    fn dream_eater_policy_states_what_is_true_after_the_privacy_release() {
-        let html = render("dreameater");
-        assert!(html.contains("Dream Eater Privacy Policy"));
-        assert!(html.contains("October 2026"));
-        for stays in ["dreams", "voice recordings", "transcripts", "journal", "tags", "birth details", "sky data"] {
-            assert!(html.contains(stays), "missing {}", stays);
-        }
-        assert!(html.contains("short summaries of earlier dreams you had read"));
-        assert!(html.contains("Our server keeps no dream text, prompt or reading afterwards"));
-        assert!(html.contains("Art is made from a short scene summary"));
-        assert!(html.contains("is not stored on our server"));
-        assert!(html.contains("anonymous identifier and key"));
-        assert!(html.contains("no name and no email address"));
-        assert!(html.contains("credit balance"));
-        assert!(html.contains("weekly free readings"));
-        assert!(html.contains("Apple Ads attribution verdict"));
-        assert!(html.contains("Settings, then Privacy, then Delete all data"));
-        assert!(html.contains("not directed at children under 13"));
-        assert!(html.contains("support@midgarcorp.cc"));
-        assert!(html.contains("show advertising inside the app"));
-        assert!(!html.contains("iCloud"));
-        assert!(html.contains("keeps a log of them for a limited time solely to detect abuse"));
-    }
-
-    #[test]
-    fn dream_eater_policy_lists_every_provider() {
-        let html = render("dreameater");
-        for provider in ["Google (Gemini)", "RevenueCat", "Apple", "Cloudflare"] {
-            assert!(html.contains(provider), "missing {}", provider);
-        }
-        assert!(!html.contains("sent to Google Gemini to generate an interpretation"));
-        assert!(!html.contains("approximate location"));
-        assert!(!html.contains("Sign in with Apple"));
-    }
-
-    #[test]
-    fn dream_eater_policy_has_no_em_dashes() {
-        assert!(!render("dreameater").contains('\u{2014}'));
-        assert!(!DREAM_EATER_AI.contains('\u{2014}'));
-    }
-
-    #[test]
-    fn other_tenants_keep_their_pages() {
-        assert!(render("pixie").contains("<title>PixiePocket \u{2014} Privacy Policy</title>"));
-        assert!(render("pixie").contains("sent to OpenAI and Google to generate or edit images"));
-        assert!(render("doublekick").contains("Google Gemini to read and translate the items"));
-        assert!(!render("livingdex").contains("Delete all data"));
-        assert!(!render("payday").contains("Delete all data"));
-    }
-
-    #[test]
-    fn on_device_promises_are_unchanged() {
-        assert!(render("payday").contains("stored on your device and is not uploaded to us"));
-        assert!(render("livingdex").contains("stored on your device and is not uploaded to us"));
     }
 }

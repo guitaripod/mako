@@ -49,7 +49,7 @@ Traces an App Store ad install to the keyword that produced it, then to whether 
 - `GET /v1/attribution/keywords?since=&until=`: admin-only per-keyword installs / payers / revenue.
 - Tables (migration 015): `install_attributions` (one row per identity, PK `(app_id,user_id)`, unique `(app_id,token_hash)`) and `purchase_attributions` (one row per purchase, PK `purchase_id`). Both idempotent by construction; purchases are tagged when a pack purchase completes (`credits::tag_purchase_attribution`). Rows tagged `subscription` before 2026-11-06 came from the retired RevenueCat webhook; subscription revenue is not attributed until the ledger feeds it.
 - `apps.store_net_share` (0.85 Small Business Program / 0.70 otherwise) nets out purchases recorded without a net amount (every pack purchase). Unset ⇒ the report returns `net_*: null` rather than 0.
-- **Privacy invariants**: never store or log the raw token (only its SHA-256 fingerprint); no IDFA, no `ASIdentifierManager`, no ATT prompt. Apps running campaigns disclose this in `src/privacy.rs` (`ad_measurement_section`).
+- **Privacy invariants**: never store or log the raw token (only its SHA-256 fingerprint); no IDFA, no `ASIdentifierManager`, no ATT prompt. Apps running campaigns disclose this in their policy on midgarcorp.cc (`web/midgarcorp/src/content/legal/<slug>/privacy.html`).
 
 ## Tenant switches and v2 request shapes (migrations 020-024)
 
