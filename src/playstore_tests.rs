@@ -5,7 +5,7 @@ use futures::executor::block_on;
 use serde_json::json;
 
 use super::*;
-use crate::wallet::pack_credit::{credit_pack, Credit};
+use crate::wallet::pack_credit::{credit_pack, Credit, PurchaseLedger};
 use crate::wallet::pack_refund;
 use crate::wallet::purchase;
 use crate::wallet::testing::{FakeWallets, LocalD1, TestLedger};
@@ -334,6 +334,10 @@ fn the_acknowledgement_posts_to_the_purchase() {
     block_on(world.api(NOW).acknowledge(PACKAGE, PRODUCT, TOKEN)).unwrap();
     block_on(world.api(NOW).acknowledge(PACKAGE, PRODUCT, TOKEN)).unwrap();
     assert!(matches!(block_on(world.api(NOW).acknowledge(PACKAGE, PRODUCT, TOKEN)), Err(VerifyFailure::Unavailable(_))));
+    for status in [400, 404, 410] {
+        world.script.then(answer(status, json!({})));
+        assert_eq!(block_on(world.api(NOW).acknowledge(PACKAGE, PRODUCT, TOKEN)), Err(VerifyFailure::Rejected), "{status}");
+    }
     let calls = world.script.calls();
     assert_eq!((calls[1].verb, calls[1].url.clone()), (Verb::Post, format!("{}:acknowledge", purchase_url_of(TOKEN))));
     assert_eq!(calls[1].bearer.as_deref(), Some("a"));
@@ -449,7 +453,7 @@ fn a_test_purchase_is_credited_at_no_price_and_is_no_sale() {
     let ledger = TestLedger { db: &d1, wallets: &wallets };
     d1.user("pixie", "u1", 0);
     let tester = ProductPurchase { purchase_type: Some(0), ..purchase() };
-    let credited = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, tester.charged_cents(299), &payment_id(&tester, TOKEN))).unwrap();
+    let credited = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, tester.charged_cents(299), &payment_id(&tester, TOKEN), None)).unwrap();
     let Credit::Credited { purchase_id } = credited else { panic!("{credited:?}") };
     let row = block_on(purchase::read(&d1, &purchase_id)).unwrap().unwrap();
     assert_eq!((row.status.as_str(), row.amount_usd_cents), ("completed", 0));
@@ -457,9 +461,104 @@ fn a_test_purchase_is_credited_at_no_price_and_is_no_sale() {
     assert_eq!(d1.int("SELECT balance FROM user_credits WHERE app_id = 'pixie' AND user_id = 'u1'", &[]), 150);
     assert_eq!(d1.int("SELECT COALESCE(SUM(amount_usd_cents), 0) FROM credit_purchases WHERE app_id = 'pixie' AND status = 'completed'", &[]), 0);
 
-    let paid = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, purchase().charged_cents(299), "gp:GPA.paid")).unwrap();
+    let paid = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, purchase().charged_cents(299), "gp:GPA.paid", None)).unwrap();
     let Credit::Credited { purchase_id } = paid else { panic!("{paid:?}") };
     assert!(purchase::is_sale(&block_on(purchase::read(&d1, &purchase_id)).unwrap().unwrap()));
+}
+
+/// A ledger whose completion always fails, as a wallet outage does: the purchase row stays `pending` for the sweep.
+struct DownLedger;
+
+impl PurchaseLedger for DownLedger {
+    async fn complete(&self, _purchase_id: &str) -> Result<(), AppError> {
+        Err(AppError::WalletUnavailable)
+    }
+}
+
+fn pixie_tenant() -> PlayTenant {
+    PlayTenant { app_id: "pixie".to_string(), package: PACKAGE.to_string(), product_prefix: "com.guitaripod.pixie.credits.".to_string() }
+}
+
+fn token_of(d1: &LocalD1, payment_id: &str) -> i64 {
+    d1.int("SELECT COUNT(*) FROM credit_purchases WHERE payment_id = ?1 AND store_token IS NOT NULL", &[payment_id.into()])
+}
+
+#[test]
+fn pixiepocket_is_the_one_play_tenant() {
+    let d1 = LocalD1::migrated();
+    assert_eq!(block_on(play_tenants(&d1)).unwrap(), [pixie_tenant()]);
+}
+
+#[test]
+fn a_credit_keeps_the_token_before_it_completes_so_a_swept_purchase_can_be_acknowledged() {
+    let d1 = LocalD1::migrated();
+    d1.user("pixie", "u1", 0);
+    let pending = block_on(credit_pack(&d1, &DownLedger, "pixie", "u1", "starter", 150, 299, "gp:GPA.swept", Some("swept-token")));
+    assert!(matches!(pending, Err(AppError::WalletUnavailable)));
+    assert_eq!(block_on(purchase::store_status(&d1, "pixie", "gp:GPA.swept")).unwrap().as_deref(), Some("pending"));
+    assert_eq!(token_of(&d1, "gp:GPA.swept"), 1);
+
+    let world = World::new(vec![token_answer("a"), answer(200, json!({}))]);
+    let nothing = block_on(acknowledge_credited(&world.api(NOW), &d1, &pixie_tenant())).unwrap();
+    assert_eq!(nothing, Acknowledgements::default(), "a purchase is acknowledged only once it is credited");
+    assert!(world.script.calls().is_empty());
+
+    let id = d1.int("SELECT COUNT(*) FROM credit_purchases WHERE payment_id = 'gp:GPA.swept'", &[]);
+    assert_eq!(id, 1);
+    let row_id: String = d1.0.query_row("SELECT id FROM credit_purchases WHERE payment_id = 'gp:GPA.swept'", [], |r| r.get(0)).unwrap();
+    assert!(block_on(purchase::complete_locally(&d1, &row_id)).unwrap(), "the cron sweep finishes it");
+
+    let report = block_on(acknowledge_credited(&world.api(NOW), &d1, &pixie_tenant())).unwrap();
+    assert_eq!(report, Acknowledgements { acknowledged: 1, dropped: 0, kept: 0 });
+    let calls = world.script.calls();
+    assert_eq!(calls[1].url, format!("{}:acknowledge", purchase_url_of("swept-token")));
+    assert_eq!(token_of(&d1, "gp:GPA.swept"), 0, "the token is dropped once Google has the acknowledgement");
+}
+
+#[test]
+fn an_acknowledgement_google_refuses_drops_the_token_and_one_it_cannot_take_keeps_it() {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    d1.user("pixie", "u1", 0);
+    for (order, token) in [("gp:GPA.1", "token-1"), ("gp:GPA.2", "token-2"), ("gp:GPA.3", "token-3")] {
+        block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, order, Some(token))).unwrap();
+    }
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, "gp:GPA.acked", None)).unwrap();
+    let world = World::new(vec![token_answer("a"), answer(200, json!({})), answer(400, json!({})), answer(503, json!({}))]);
+
+    let report = block_on(acknowledge_credited(&world.api(NOW), &d1, &pixie_tenant())).unwrap();
+
+    assert_eq!(report, Acknowledgements { acknowledged: 1, dropped: 1, kept: 1 });
+    assert_eq!((token_of(&d1, "gp:GPA.1"), token_of(&d1, "gp:GPA.2"), token_of(&d1, "gp:GPA.3")), (0, 0, 1));
+    assert_eq!(world.script.calls().len(), 4, "a purchase without a token is never asked about");
+
+    world.script.then(answer(200, json!({})));
+    let retried = block_on(acknowledge_credited(&world.api(NOW), &d1, &pixie_tenant())).unwrap();
+    assert_eq!(retried, Acknowledgements { acknowledged: 1, dropped: 0, kept: 0 });
+    assert_eq!(token_of(&d1, "gp:GPA.3"), 0);
+}
+
+#[test]
+fn a_refunded_purchase_is_not_acknowledged() {
+    let d1 = LocalD1::migrated();
+    let wallets = FakeWallets::new();
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    d1.user("pixie", "u1", 0);
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, "gp:GPA.back", Some("token-back"))).unwrap();
+    d1.run("UPDATE credit_purchases SET status = 'refunded' WHERE payment_id = 'gp:GPA.back'", &[]);
+    assert!(block_on(purchase::unacknowledged_play_purchases(&d1, "pixie", 50)).unwrap().is_empty());
+}
+
+#[test]
+fn the_token_is_kept_and_dropped_by_payment_id() {
+    let d1 = LocalD1::migrated();
+    d1.user("pixie", "u1", 0);
+    block_on(purchase::record_pending(&d1, "pixie", "u1", "starter", 150, 299, "gp:GPA.k")).unwrap();
+    block_on(purchase::remember_store_token(&d1, "pixie", "gp:GPA.k", "kept")).unwrap();
+    assert_eq!(token_of(&d1, "gp:GPA.k"), 1);
+    block_on(purchase::forget_store_token(&d1, "pixie", "gp:GPA.k")).unwrap();
+    assert_eq!(token_of(&d1, "gp:GPA.k"), 0);
 }
 
 #[test]
@@ -536,7 +635,7 @@ fn a_play_pack_credits_the_local_balance_once_and_never_after_its_refund_claim()
     let ledger = TestLedger { db: &d1, wallets: &wallets };
     d1.user("pixie", "u1", 10);
     let play = format!("gp:{ORDER}");
-    let credit = || block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, &play)).unwrap();
+    let credit = || block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, &play, None)).unwrap();
 
     assert!(matches!(credit(), Credit::Credited { .. }));
     assert_eq!(d1.int("SELECT balance FROM user_credits WHERE app_id = 'pixie' AND user_id = 'u1'", &[]), 160);
@@ -549,7 +648,7 @@ fn a_play_pack_credits_the_local_balance_once_and_never_after_its_refund_claim()
 
     let refunded = "gp:GPA.refunded".to_string();
     assert!(block_on(pack_refund::claim(&d1, "pixie", &refunded, "u1", 150)).unwrap());
-    let after = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, &refunded)).unwrap();
+    let after = block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, &refunded, None)).unwrap();
     assert_eq!(after, Credit::Refunded);
     assert_eq!(d1.int("SELECT balance FROM user_credits WHERE app_id = 'pixie' AND user_id = 'u1'", &[]), 160);
 }

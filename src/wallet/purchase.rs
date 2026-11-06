@@ -101,6 +101,61 @@ fn source_and_description(row: &PurchaseRow) -> (&'static str, String) {
     }
 }
 
+/// Keeps the store's purchase token on the store pack purchase of `payment_id`, so the purchase can still be acknowledged
+/// at Google after the request that credited it is gone. The token is dropped again once Google has the
+/// acknowledgement (`forget_store_token`).
+pub async fn remember_store_token(db: &impl D1Exec, app_id: &str, payment_id: &str, token: &str) -> Result<(), AppError> {
+    db.exec(
+        &format!("UPDATE credit_purchases SET store_token = ?3 WHERE app_id = ?1 AND payment_id = ?2 AND {IS_STORE_PACK}"),
+        &[app_id.into(), payment_id.into(), token.into()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Drops the purchase token of a store pack purchase Google has acknowledged, or will never acknowledge.
+pub async fn forget_store_token(db: &impl D1Exec, app_id: &str, payment_id: &str) -> Result<(), AppError> {
+    db.exec(
+        &format!("UPDATE credit_purchases SET store_token = NULL WHERE app_id = ?1 AND payment_id = ?2 AND {IS_STORE_PACK}"),
+        &[app_id.into(), payment_id.into()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// A credited Google Play pack purchase that still waits for mako's acknowledgement at Google.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unacknowledged {
+    pub pack_id: String,
+    pub payment_id: String,
+    pub token: String,
+}
+
+/// The tenant's `completed` Google Play pack purchases that still carry their token, oldest first: credited by the cron
+/// sweep, or by a validate call whose acknowledgement failed.
+pub async fn unacknowledged_play_purchases(db: &impl D1Exec, app_id: &str, limit: i64) -> Result<Vec<Unacknowledged>, AppError> {
+    let rows = db
+        .rows(
+            &format!(
+                "SELECT pack_id, payment_id, store_token FROM credit_purchases
+                 WHERE app_id = ?1 AND payment_provider = '{PLAY_STORE}' AND status = 'completed' AND store_token IS NOT NULL
+                 ORDER BY created_at LIMIT ?2"
+            ),
+            &[app_id.into(), limit.into()],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            Some(Unacknowledged {
+                pack_id: text(row, "pack_id")?.to_string(),
+                payment_id: text(row, "payment_id")?.to_string(),
+                token: text(row, "store_token").filter(|token| !token.is_empty())?.to_string(),
+            })
+        })
+        .collect())
+}
+
 /// A purchase by id, in any status.
 pub async fn read(db: &impl D1Exec, purchase_id: &str) -> Result<Option<PurchaseRow>, AppError> {
     let sql = format!("SELECT {COLUMNS} FROM credit_purchases WHERE id = ?1");

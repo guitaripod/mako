@@ -26,7 +26,9 @@ pub enum Credit {
 /// `ledger_grant`. A claimed refund is refused and a row that is no longer `pending` is a duplicate; both checks are only
 /// shortcuts, because the row is created unless the refund was claimed in the same statement (`purchase::record_pending`,
 /// the linearization point) and completed through the ledger, whose wallet grant is idempotent by the transaction key and
-/// whose flip never overwrites `refunded`.
+/// whose flip never overwrites `refunded`. A `store_token` (a Google Play purchase token that still needs mako's
+/// acknowledgement) is kept on the row before the credit is completed, so a row the cron sweep finishes later can still
+/// be acknowledged; failing to keep it is only logged.
 #[allow(clippy::too_many_arguments)]
 pub async fn credit_pack<D: D1Exec, L: PurchaseLedger>(
     db: &D,
@@ -37,6 +39,7 @@ pub async fn credit_pack<D: D1Exec, L: PurchaseLedger>(
     credits: u32,
     amount_usd_cents: u32,
     transaction_id: &str,
+    store_token: Option<&str>,
 ) -> Result<Credit, AppError> {
     if pack_refund::is_claimed(db, app_id, transaction_id).await? {
         return Ok(Credit::Refunded);
@@ -50,6 +53,11 @@ pub async fn credit_pack<D: D1Exec, L: PurchaseLedger>(
         Err(AppError::Refunded(_)) => return Ok(Credit::Refunded),
         Err(error) => return Err(error),
     };
+    if let Some(token) = store_token {
+        if let Err(error) = purchase::remember_store_token(db, app_id, transaction_id, token).await {
+            super::log::error(&format!("the store token of {transaction_id} could not be kept: {error:?}"));
+        }
+    }
     match ledger.complete(&purchase_id).await {
         Ok(()) => Ok(Credit::Credited { purchase_id }),
         Err(AppError::Refunded(_)) => Ok(Credit::Refunded),

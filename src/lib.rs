@@ -50,6 +50,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     }
     if let Ok(db) = env.d1("DB") {
         ledgers::Ledgers::new(&env, &db).run_wallet_cron().await;
+        handlers::playstore::run_cron(&env, &db).await;
         retention::run_scheduled(&env, &db).await;
     }
 }

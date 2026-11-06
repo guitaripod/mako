@@ -107,6 +107,7 @@ async fn credit_signed(
         credits,
         pack.price_usd_cents as u32,
         &transaction.transaction_id,
+        None,
     )
     .await;
     let purchase_id = match credited {

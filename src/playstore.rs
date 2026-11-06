@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 use crate::storekit::{VerifyFailure, PENDING_MESSAGE, REFUNDED_MESSAGE};
 use crate::wallet::d1::{text, D1Exec};
-use crate::wallet::purchase::PLAY_PAYMENT_PREFIX;
+use crate::wallet::purchase::{self, PLAY_PAYMENT_PREFIX};
 
 mod google;
 
@@ -38,6 +38,9 @@ const DEFAULT_TOKEN_SECONDS: u64 = 3600;
 
 /// A cached access token is renewed this long before Google would expire it.
 const REFRESH_MARGIN_SECONDS: u64 = 300;
+
+/// Credited purchases one cron run acknowledges per tenant.
+const ACKNOWLEDGE_LIMIT: i64 = 50;
 
 /// Longest purchase token sent to Google; Play's are a few hundred bytes.
 const MAX_TOKEN_BYTES: usize = 4096;
@@ -257,12 +260,14 @@ impl<T: Transport, S: Signer> PlayApi<'_, T, S> {
     }
 
     /// `purchases.products.acknowledge`, which keeps Google from refunding a credited purchase the app has not consumed
-    /// yet (it refunds an unacknowledged one after three days).
+    /// yet (it refunds an unacknowledged one after three days). A purchase Google will not take an acknowledgement for
+    /// (400, 404, 410: consumed already, or an expired token) is `Rejected`; asking again cannot change that.
     pub async fn acknowledge(&self, package: &str, product_id: &str, token: &str) -> Result<(), VerifyFailure> {
         let url = format!("{}:acknowledge", purchase_url(package, product_id, token));
         let answer = self.authorized(&Call::post(url, "application/json", "{}".to_string())).await?;
         match answer.status {
             200 | 204 => Ok(()),
+            400 | 404 | 410 => Err(VerifyFailure::Rejected),
             other => Err(unavailable(format!("Google answered {other} to the acknowledgement{}", google_reason(&answer.body)))),
         }
     }
@@ -478,6 +483,70 @@ pub async fn vet<T: Transport, S: Signer>(
     };
     check(&purchase, expected).map_err(Refusal::into_error)?;
     Ok(purchase)
+}
+
+/// A tenant that sells packs through Google Play: its package and the product prefix its packs follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayTenant {
+    pub app_id: String,
+    pub package: String,
+    pub product_prefix: String,
+}
+
+/// Every tenant with both a `play_package_name` and a `store_product_prefix`. A database without the column has none.
+pub async fn play_tenants(db: &impl D1Exec) -> Result<Vec<PlayTenant>, AppError> {
+    let rows = db.rows("SELECT * FROM apps", &[]).await?;
+    let filled = |row: &Value, column: &str| text(row, column).filter(|value| !value.is_empty()).map(str::to_string);
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            Some(PlayTenant {
+                app_id: filled(row, "app_id")?,
+                package: filled(row, "play_package_name")?,
+                product_prefix: filled(row, "store_product_prefix")?,
+            })
+        })
+        .collect())
+}
+
+/// What one round of acknowledgements came to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Acknowledgements {
+    /// Google took the acknowledgement; the token is dropped.
+    pub acknowledged: u32,
+    /// Google will never take one (consumed already, or the token expired); the token is dropped.
+    pub dropped: u32,
+    /// Google could not be asked; the token stays for the next run.
+    pub kept: u32,
+}
+
+/// Acknowledges at Google every credited Play purchase of the tenant that still carries its token: one the cron sweep
+/// completed after its validate call was gone, or one whose acknowledgement failed in the validate call. Without it
+/// Google would refund a credited purchase three days later if the app never consumed it.
+pub async fn acknowledge_credited<T: Transport, S: Signer>(
+    api: &PlayApi<'_, T, S>,
+    db: &impl D1Exec,
+    tenant: &PlayTenant,
+) -> Result<Acknowledgements, AppError> {
+    let mut report = Acknowledgements::default();
+    for waiting in purchase::unacknowledged_play_purchases(db, &tenant.app_id, ACKNOWLEDGE_LIMIT).await? {
+        let product_id = format!("{}{}", tenant.product_prefix, waiting.pack_id);
+        match api.acknowledge(&tenant.package, &product_id, &waiting.token).await {
+            Ok(()) => {
+                purchase::forget_store_token(db, &tenant.app_id, &waiting.payment_id).await?;
+                report.acknowledged += 1;
+            }
+            Err(VerifyFailure::Rejected) => {
+                purchase::forget_store_token(db, &tenant.app_id, &waiting.payment_id).await?;
+                report.dropped += 1;
+            }
+            Err(VerifyFailure::Unavailable(reason)) => {
+                crate::wallet::log::error(&format!("google play acknowledgement of {} postponed: {reason}", waiting.payment_id));
+                report.kept += 1;
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// The Play package name configured for a tenant (`apps.play_package_name`), if any. A database without the column

@@ -1,12 +1,14 @@
 use worker::{D1Database, Env, Response, Result};
 
+use crate::storekit::VerifyFailure;
+
 use crate::auth::AuthedUser;
 use crate::credits::CreditPack;
 use crate::error::AppError;
 use crate::handlers::credits::{ValidatePurchaseRequest, ValidatePurchaseResponse};
 use crate::handlers::storekit::ALREADY_PROCESSED_MESSAGE;
 use crate::ledgers::Ledgers;
-use crate::playstore::{self, Expected, FetchTransport, PlayApi, ProductPurchase, ServiceAccount, SubtleSigner, NOT_CONFIGURED_MESSAGE};
+use crate::playstore::{self, Acknowledgements, Expected, FetchTransport, PlayApi, ProductPurchase, ServiceAccount, SubtleSigner, NOT_CONFIGURED_MESSAGE};
 use crate::storekit::{already_settled, pack_of_product, Refusal, PENDING_MESSAGE, REFUNDED_MESSAGE};
 use crate::wallet::pack_credit::{credit_pack, Credit};
 use crate::wallet::{log, pack_refund, purchase};
@@ -76,7 +78,7 @@ async fn credit_play(env: &Env, db: &D1Database, auth: &AuthedUser, request: &Va
     }
     match purchase::store_status(db, app_id, &payment_id).await {
         Ok(status) if already_settled(status.as_deref()) => {
-            acknowledge(&api, &package, request, &bought).await;
+            acknowledge(&api, db, app_id, &package, request, &bought, &payment_id).await;
             return AppError::AlreadyProcessed(ALREADY_PROCESSED_MESSAGE.to_string()).to_response();
         }
         Ok(_) => {}
@@ -85,28 +87,68 @@ async fn credit_play(env: &Env, db: &D1Database, auth: &AuthedUser, request: &Va
     let ledgers = Ledgers::new(env, db);
     let credits = (pack.credits + pack.bonus_credits) as u32;
     let charged = bought.charged_cents(pack.price_usd_cents as u32);
-    let credited = credit_pack(db, &ledgers, app_id, auth.account.user_id(), &pack.id, credits, charged, &payment_id).await;
+    let token = (!bought.acknowledged()).then_some(request.purchase_token.as_str());
+    let credited = credit_pack(db, &ledgers, app_id, auth.account.user_id(), &pack.id, credits, charged, &payment_id, token).await;
     let purchase_id = match credited {
         Ok(Credit::Credited { purchase_id }) => purchase_id,
         Ok(Credit::Duplicate) => {
-            acknowledge(&api, &package, request, &bought).await;
+            acknowledge(&api, db, app_id, &package, request, &bought, &payment_id).await;
             return AppError::AlreadyProcessed(ALREADY_PROCESSED_MESSAGE.to_string()).to_response();
         }
         Ok(Credit::Refunded) | Err(AppError::Refunded(_)) => return AppError::Refunded(REFUNDED_MESSAGE.to_string()).to_response(),
         Err(error) => return pending(error).to_response(),
     };
-    acknowledge(&api, &package, request, &bought).await;
+    acknowledge(&api, db, app_id, &package, request, &bought, &payment_id).await;
     let new_balance = ledgers.get_user_balance(&auth.account).await?;
     Response::from_json(&ValidatePurchaseResponse { success: true, purchase_id, credits_added: credits, new_balance })
 }
 
 /// Acknowledges a credited purchase the app has not consumed yet, so Google cannot refund it after three days while the
-/// app is closed. Only logged when it fails: the app's consume acknowledges it as well.
-async fn acknowledge(api: &PlayApi<'_, FetchTransport, SubtleSigner>, package: &str, request: &ValidatePurchaseRequest, bought: &ProductPurchase) {
+/// app is closed. Once Google has it (or will never take it) the row's token is dropped; while Google cannot be asked the
+/// token stays on the row and the cron acknowledges it (`run_cron`).
+#[allow(clippy::too_many_arguments)]
+async fn acknowledge(
+    api: &PlayApi<'_, FetchTransport, SubtleSigner>,
+    db: &D1Database,
+    app_id: &str,
+    package: &str,
+    request: &ValidatePurchaseRequest,
+    bought: &ProductPurchase,
+    payment_id: &str,
+) {
     if bought.acknowledged() {
         return;
     }
-    if let Err(failure) = api.acknowledge(package, &request.product_id, &request.purchase_token).await {
-        log::error(&format!("google play acknowledgement failed: {failure:?}"));
+    let kept = match api.acknowledge(package, &request.product_id, &request.purchase_token).await {
+        Ok(()) | Err(VerifyFailure::Rejected) => purchase::forget_store_token(db, app_id, payment_id).await,
+        Err(failure) => {
+            log::error(&format!("google play acknowledgement postponed to the cron: {failure:?}"));
+            purchase::remember_store_token(db, app_id, payment_id, &request.purchase_token).await
+        }
+    };
+    if let Err(error) = kept {
+        log::error(&format!("google play token bookkeeping failed for {payment_id}: {error:?}"));
+    }
+}
+
+/// The scheduled Google Play work: for every tenant with a Play package, acknowledges the credited purchases that still
+/// wait for it (`playstore::acknowledge_credited`). Does nothing without `GOOGLE_PLAY_SERVICE_ACCOUNT`.
+pub async fn run_cron(env: &Env, db: &D1Database) {
+    let tenants = match playstore::play_tenants(db).await {
+        Ok(tenants) if !tenants.is_empty() => tenants,
+        Ok(_) => return,
+        Err(error) => {
+            log::error(&format!("google play cron could not list tenants: {error:?}"));
+            return;
+        }
+    };
+    let Ok(account) = service_account(env) else { return };
+    let api = PlayApi { account: &account, transport: &FetchTransport, signer: &SubtleSigner, tokens: playstore::isolate_tokens(), now: now_seconds() };
+    for tenant in &tenants {
+        match playstore::acknowledge_credited(&api, db, tenant).await {
+            Ok(report) if report != Acknowledgements::default() => log::info(&format!("google play cron {}: {report:?}", tenant.app_id)),
+            Ok(_) => {}
+            Err(error) => log::error(&format!("google play acknowledgements failed for {}: {error:?}", tenant.app_id)),
+        }
     }
 }

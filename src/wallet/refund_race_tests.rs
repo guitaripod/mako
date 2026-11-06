@@ -194,7 +194,7 @@ async fn credit(path: CreditPath, world: &World, budget: &Budget) -> Result<(), 
                 return Ok(());
             }
             let ledger = TestLedger { db: &d1, wallets: &wallets };
-            credit_pack(&d1, &ledger, APP, "u1", "small", PACK_CREDITS as u32, 299, TX).await?;
+            credit_pack(&d1, &ledger, APP, "u1", "small", PACK_CREDITS as u32, 299, TX, None).await?;
         }
         CreditPath::LocalLedgerGrant => {
             let naming_the_user = LedgerTransaction { app_account_token: Some("u1".to_string()), ..transaction(TX) };
