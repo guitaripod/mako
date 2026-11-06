@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use futures::executor::block_on;
 use serde_json::json;
 
-use super::voided::{load_state, voided_window, Resume, VoidedPage, VoidedSweep, VoidedWindow};
+use super::voided::{gap_of, load_state, voided_window, Gap, Resume, SweepState, VoidedPage, VoidedSweep, VoidedWindow};
 use super::*;
 use crate::wallet::pack_credit::{credit_pack, Credit, PurchaseLedger};
 use crate::wallet::pack_refund;
@@ -663,7 +663,7 @@ fn a_voided_order_takes_its_credits_back_once_and_an_uncredited_one_is_refused_l
 
     let report = sweep(&world, &d1, None, NOW_MS);
 
-    assert_eq!(report, VoidedSweep { pages: 2, voided: 3, reversed: 1, recorded: 1, settled: 1, failed: 0, finished: true });
+    assert_eq!(report, VoidedSweep { pages: 2, voided: 3, reversed: 1, recorded: 1, settled: 1, failed: 0, finished: true, ..VoidedSweep::default() });
     assert_eq!(balance(&d1), 10, "the 150 credits of the refunded pack are gone");
     assert_eq!(block_on(purchase::store_status(&d1, "pixie", "gp:GPA.1")).unwrap().as_deref(), Some("refunded"));
     assert_eq!(
@@ -688,7 +688,7 @@ fn the_next_sweep_starts_before_the_last_one_ended_and_settles_repeats_without_t
 
     let again = sweep(&world, &d1, None, NOW_MS + 1_800_000);
 
-    assert_eq!(again, VoidedSweep { pages: 1, voided: 1, reversed: 0, recorded: 0, settled: 1, failed: 0, finished: true });
+    assert_eq!(again, VoidedSweep { pages: 1, voided: 1, reversed: 0, recorded: 0, settled: 1, failed: 0, finished: true, ..VoidedSweep::default() });
     assert_eq!(balance(&d1), 10);
     let second = &world.script.calls()[2].url;
     assert!(second.contains(&format!("startTime={}", NOW_MS - 60_000 - 2 * 3_600_000)), "{second}");
@@ -785,6 +785,121 @@ fn a_page_token_google_refuses_starts_the_window_over() {
     world.script.then(voided_answer(&[], None));
     assert!(sweep(&world, &d1, None, NOW_MS + 3_600_000).finished);
     assert!(!world.script.calls()[4].url.contains("token="), "the window starts over without a page token");
+}
+
+#[test]
+fn a_gap_exists_once_reading_stopped_longer_ago_than_google_keeps_voids() {
+    let swept = |until: i64| SweepState { swept_until_ms: Some(until), ..SweepState::default() };
+    assert_eq!(gap_of(&swept(NOW_MS - DAY_MS), None, NOW_MS), None);
+    assert_eq!(gap_of(&swept(NOW_MS - 29 * DAY_MS), None, NOW_MS), None);
+    let gap = gap_of(&swept(NOW_MS - 45 * DAY_MS), None, NOW_MS).unwrap();
+    assert_eq!(gap.from_ms, NOW_MS - 45 * DAY_MS);
+    assert_eq!(gap.to_ms, voided_window(None, NOW_MS).start_ms);
+    let stalled = SweepState {
+        swept_until_ms: Some(NOW_MS - DAY_MS),
+        resume: Some(Resume { window: VoidedWindow { start_ms: NOW_MS - 40 * DAY_MS, end_ms: NOW_MS - 39 * DAY_MS }, page_token: "p".to_string() }),
+        ..SweepState::default()
+    };
+    assert_eq!(gap_of(&stalled, None, NOW_MS).map(|gap| gap.from_ms), Some(NOW_MS - 40 * DAY_MS), "an unfinished window counts from its start");
+    assert_eq!(gap_of(&SweepState::default(), None, NOW_MS), None, "never swept and nothing credited");
+    assert_eq!(gap_of(&SweepState::default(), Some(NOW_MS - DAY_MS), NOW_MS), None);
+    assert_eq!(gap_of(&SweepState::default(), Some(NOW_MS - 60 * DAY_MS), NOW_MS).map(|gap| gap.from_ms), Some(NOW_MS - 60 * DAY_MS));
+}
+
+fn iso(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap().to_rfc3339()
+}
+
+/// A pixie user with five credited packs bought 60 days before `NOW_MS` (three orders, two promo purchases, one of them
+/// still holding its token) and one bought yesterday, swept last 45 days ago.
+fn gap_world() -> (LocalD1, FakeWallets) {
+    let (d1, wallets) = credited_world(&["GPA.refunded", "GPA.kept", "GPA.unknown"]);
+    let ledger = TestLedger { db: &d1, wallets: &wallets };
+    let promo = ProductPurchase { order_id: None, purchase_type: Some(1), ..purchase() };
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 0, &payment_id(&promo, "promo-kept-token"), Some("promo-kept-token"))).unwrap();
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 0, &payment_id(&promo, "promo-dropped-token"), None)).unwrap();
+    block_on(credit_pack(&d1, &ledger, "pixie", "u1", "starter", 150, 299, "gp:GPA.recent", None)).unwrap();
+    let order = [
+        "gp:GPA.refunded".to_string(),
+        "gp:GPA.kept".to_string(),
+        "gp:GPA.unknown".to_string(),
+        payment_id(&promo, "promo-kept-token"),
+        payment_id(&promo, "promo-dropped-token"),
+    ];
+    for (minute, payment) in order.iter().enumerate() {
+        d1.run("UPDATE credit_purchases SET created_at = ?1 WHERE payment_id = ?2", &[iso(NOW_MS - 60 * DAY_MS + minute as i64 * 60_000).into(), payment.as_str().into()]);
+    }
+    d1.run("UPDATE credit_purchases SET created_at = ?1 WHERE payment_id = 'gp:GPA.recent'", &[iso(NOW_MS - DAY_MS).into()]);
+    d1.run(
+        "INSERT INTO play_voided_sweeps (package_name, swept_until_ms, updated_at) VALUES (?1, ?2, 'x')",
+        &[PACKAGE.into(), (NOW_MS - 45 * DAY_MS).into()],
+    );
+    (d1, wallets)
+}
+
+#[test]
+fn a_gap_is_checked_order_by_order_and_what_cannot_be_checked_is_left_to_the_founder() {
+    let (d1, _wallets) = gap_world();
+    assert_eq!(balance(&d1), 10 + 6 * 150);
+    let world = World::new(vec![
+        token_answer("a"),
+        answer(200, json!({ "orderId": "GPA.refunded", "state": "REFUNDED" })),
+        answer(200, json!({ "orderId": "GPA.kept", "state": "PROCESSED" })),
+        answer(404, json!({})),
+        answer(200, json!({ "purchaseState": 1 })),
+        voided_answer(&[], None),
+    ]);
+
+    let report = sweep(&world, &d1, None, NOW_MS);
+
+    assert_eq!(report.gap, Some(Gap { from_ms: NOW_MS - 45 * DAY_MS, to_ms: voided_window(None, NOW_MS).start_ms }));
+    assert_eq!((report.gap_checked, report.gap_by_hand, report.reversed, report.finished), (5, 2, 2, true));
+    assert_eq!(balance(&d1), 10 + 4 * 150, "the refunded order and the canceled promo purchase are taken back");
+    assert_eq!(block_on(purchase::store_status(&d1, "pixie", "gp:GPA.refunded")).unwrap().as_deref(), Some("refunded"));
+    assert_eq!(block_on(purchase::store_status(&d1, "pixie", "gp:GPA.kept")).unwrap().as_deref(), Some("completed"));
+    let urls: Vec<String> = world.script.calls().iter().map(|call| call.url.clone()).collect();
+    let base = format!("https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{PACKAGE}");
+    assert_eq!(urls[1], format!("{base}/orders/GPA.refunded"));
+    assert_eq!(urls[3], format!("{base}/orders/GPA.unknown"));
+    assert_eq!(urls[4], format!("{base}/purchases/products/{PRODUCT}/tokens/promo-kept-token"));
+    assert!(!urls.iter().any(|url| url.contains("GPA.recent")), "an order bought after the gap is covered by the window");
+    assert_eq!(urls.len(), 6, "nothing is asked about the promo purchase whose token is gone");
+    assert_eq!(swept_until(&d1), NOW_MS - 60_000);
+    assert_eq!(block_on(load_state(&d1, PACKAGE)).unwrap(), SweepState { swept_until_ms: Some(NOW_MS - 60_000), ..SweepState::default() });
+}
+
+#[test]
+fn a_gap_check_google_cannot_answer_goes_on_from_there_and_holds_the_window() {
+    let (d1, _wallets) = gap_world();
+    let world = World::new(vec![
+        token_answer("a"),
+        answer(200, json!({ "state": "REFUNDED" })),
+        answer(503, json!({})),
+        voided_answer(&[], None),
+    ]);
+
+    let stopped = sweep(&world, &d1, None, NOW_MS);
+
+    assert_eq!((stopped.gap_checked, stopped.reversed, stopped.finished), (1, 1, false));
+    assert_eq!(swept_until(&d1), NOW_MS - 45 * DAY_MS, "the window holds until the gap is checked");
+    let cursor = block_on(load_state(&d1, PACKAGE)).unwrap().gap_checked_through.unwrap();
+    assert!(cursor.starts_with(&iso(NOW_MS - 60 * DAY_MS)), "{cursor}");
+
+    for next in [
+        answer(200, json!({ "state": "PROCESSED" })),
+        answer(404, json!({})),
+        answer(200, json!({ "purchaseState": 0 })),
+        voided_answer(&[], None),
+    ] {
+        world.script.then(next);
+    }
+    let resumed = sweep(&world, &d1, None, NOW_MS + 1_800_000);
+    assert_eq!((resumed.gap_checked, resumed.finished), (4, true));
+    let urls: Vec<String> = world.script.calls().iter().map(|call| call.url.clone()).collect();
+    assert!(urls[4].ends_with("/orders/GPA.kept"), "the check goes on with the order it stopped at: {}", urls[4]);
+    assert_eq!(urls.iter().filter(|url| url.ends_with("/orders/GPA.refunded")).count(), 1);
+    assert_eq!(balance(&d1), 10 + 5 * 150);
+    assert_eq!(swept_until(&d1), NOW_MS + 1_800_000 - 60_000);
 }
 
 #[test]

@@ -93,7 +93,7 @@ play_with_linking_off() {
   mark="$(log_mark)"
   curl -s -o /dev/null "$BASE/__scheduled?cron=*/30+*+*+*+*"
   check "the cron asks Google for PixiePocket's voided purchases" yes "$(log_since_has "$mark" "google play voided sweep of com.guitaripod.pixie postponed")"
-  check "a sweep Google refused leaves its window where it was" 0 "$(sql_value "SELECT COUNT(*) FROM play_voided_sweeps")"
+  check "a sweep Google refused leaves its window where it was" 0 "$(sql_value "SELECT COUNT(*) FROM play_voided_sweeps WHERE swept_until_ms IS NOT NULL")"
   check "and takes nothing back" 0 "$(sql_value "SELECT COUNT(*) FROM purchase_refunds WHERE transaction_id LIKE 'gp:%'")"
   check "the balance is untouched" "$pixie_before" "$(balance_of key_pixie pixie)"
 }

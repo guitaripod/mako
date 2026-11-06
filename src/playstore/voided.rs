@@ -1,14 +1,15 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{encode, google_reason, payment_id_of, unavailable, Call, PlayApi, PlayTenant, Signer, Transport, APPLICATIONS_URL};
+use super::{encode, google_reason, payment_id_of, unavailable, Call, PlayApi, PlayTenant, ProductPurchase, Signer, Transport, APPLICATIONS_URL};
 use crate::error::AppError;
 use crate::storekit::VerifyFailure;
 use crate::wallet::client::WalletTransport;
 use crate::wallet::d1::{int, text, D1Exec};
 use crate::wallet::ledger_refund::{self, Outcome};
 use crate::wallet::log;
+use crate::wallet::purchase::{PLAY_PAYMENT_PREFIX, PLAY_STORE};
 
 /// How far back Google lists voided purchases: 30 days, less a margin so a request is never refused as too old.
 const LOOKBACK_MS: i64 = 30 * 24 * 3_600_000 - 10 * 60_000;
@@ -26,6 +27,15 @@ const PAGE_SIZE: u32 = 1000;
 /// Pages one run reads per package. The cron runs every 30 minutes, so this stays far inside the 6000 queries a day
 /// and 30 queries per 30 seconds Google allows each package. A window with more pages goes on in the next run.
 const PAGES_PER_RUN: u32 = 10;
+
+/// Credited orders one run checks one by one while a stretch of voids can no longer be listed.
+const GAP_CHECKS_PER_RUN: i64 = 50;
+
+/// The order states `orders.get` answers for an order whose money went back.
+const VOIDED_ORDER_STATES: [&str; 2] = ["REFUNDED", "CANCELED"];
+
+/// The prefix of the payment id of a purchase without an order id (a redeemed promo code).
+const TOKEN_PAYMENT_PREFIX: &str = "gp:token:";
 
 /// One voided one-time purchase as `purchases.voidedpurchases.list` answers it.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -86,6 +96,29 @@ pub struct SweepState {
     pub swept_until_ms: Option<i64>,
     /// A window whose later pages the next run reads.
     pub resume: Option<Resume>,
+    /// The last credited order checked one by one for a gap, as `created_at|id`.
+    pub gap_checked_through: Option<String>,
+}
+
+/// A stretch of void-recording times no sweep read and Google no longer lists: from where reading stopped to the
+/// oldest void Google still lists. A void recorded in it can only be found by asking about each order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gap {
+    pub from_ms: i64,
+    pub to_ms: i64,
+}
+
+/// The gap a run at `now_ms` faces: reading stopped where the last finished window ended (or where an unfinished one
+/// began), or, for a package never swept, at its oldest credited order; a gap exists once that is older than Google
+/// lists.
+pub fn gap_of(state: &SweepState, oldest_credit_ms: Option<i64>, now_ms: i64) -> Option<Gap> {
+    let oldest = now_ms - LOOKBACK_MS;
+    let from_ms = match (&state.resume, state.swept_until_ms) {
+        (Some(resume), _) => resume.window.start_ms,
+        (None, Some(until)) => until,
+        (None, None) => oldest_credit_ms?,
+    };
+    (from_ms < oldest).then_some(Gap { from_ms, to_ms: oldest })
 }
 
 impl<T: Transport, S: Signer> PlayApi<'_, T, S> {
@@ -120,6 +153,23 @@ impl<T: Transport, S: Signer> PlayApi<'_, T, S> {
             .map(str::to_string);
         Ok(VoidedPage { purchases, next_page_token })
     }
+
+    /// The `state` of a Play order (`orders.get`): `PROCESSED`, `REFUNDED`, `CANCELED` and so on. An order Google does
+    /// not know (400, 404, 410) is `Rejected`.
+    pub async fn order_state(&self, package: &str, order_id: &str) -> Result<String, VerifyFailure> {
+        let url = format!("{APPLICATIONS_URL}/{}/orders/{}", encode(package), encode(order_id));
+        let answer = self.authorized(&Call::get(url)).await?;
+        match answer.status {
+            200 => answer
+                .body
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| unavailable("Google answered an order without a state")),
+            400 | 404 | 410 => Err(VerifyFailure::Rejected),
+            status => Err(unavailable(format!("Google answered {status} for the order{}", google_reason(&answer.body)))),
+        }
+    }
 }
 
 /// What one run of the voided purchases sweep came to for a tenant.
@@ -135,7 +185,13 @@ pub struct VoidedSweep {
     pub settled: u32,
     /// Orders whose reversal failed; they are asked about again by the next run.
     pub failed: u32,
-    /// True when every page was read and every order settled, so the next run starts from this one.
+    /// The stretch of voids Google no longer lists, when there is one.
+    pub gap: Option<Gap>,
+    /// Credited orders checked one by one for the gap this run.
+    pub gap_checked: u32,
+    /// Orders that could not be checked and need the founder's look (logged one by one).
+    pub gap_by_hand: u32,
+    /// True when every page was read, every order settled and any gap checked, so the next run starts from this one.
     pub finished: bool,
 }
 
@@ -144,7 +200,9 @@ pub struct VoidedSweep {
 /// path an App Store refund takes (`ledger_refund::reverse_play_order`, the `purchase_refunds` claim under
 /// `gp:<orderId>`), which makes a repeat harmless and refuses a later credit of the same order. A window with more pages
 /// than one run reads, or a page with an order that could not be settled, goes on from that page in the next run; the
-/// window only moves on once it was read through.
+/// window only moves on once it was read through. When no window was finished for longer than Google keeps voids, the
+/// stretch in between is logged as an error every run and the credited orders that could have been voided in it are
+/// checked one by one (`check_gap`) before the window may move on.
 pub async fn sweep_voided<T: Transport, S: Signer, D: D1Exec, W: WalletTransport>(
     api: &PlayApi<'_, T, S>,
     db: &D,
@@ -154,6 +212,19 @@ pub async fn sweep_voided<T: Transport, S: Signer, D: D1Exec, W: WalletTransport
 ) -> Result<VoidedSweep, AppError> {
     let state = load_state(db, &tenant.package).await?;
     let mut report = VoidedSweep::default();
+    let gap_done = match gap_of(&state, oldest_credit_ms(db, &tenant.app_id).await?, now_ms) {
+        Some(gap) => {
+            log::error(&format!(
+                "google play voids of {} recorded between {} and {} can no longer be listed (no sweep finished in that time); checking credited orders one by one",
+                tenant.package,
+                iso(gap.from_ms),
+                iso(gap.to_ms)
+            ));
+            report.gap = Some(gap);
+            check_gap(api, db, wallets, tenant, &gap, &state, &mut report).await?
+        }
+        None => true,
+    };
     let (window, mut page_token) = match &state.resume {
         Some(resume) => (resume.window, Some(resume.page_token.clone())),
         None => (voided_window(state.swept_until_ms, now_ms), None),
@@ -193,8 +264,12 @@ pub async fn sweep_voided<T: Transport, S: Signer, D: D1Exec, W: WalletTransport
             None => break,
         }
     }
-    finish_window(db, &tenant.package, window.end_ms).await?;
-    report.finished = true;
+    if gap_done {
+        finish_window(db, &tenant.package, window.end_ms).await?;
+        report.finished = true;
+    } else {
+        save_resume(db, &tenant.package, None).await?;
+    }
     Ok(report)
 }
 
@@ -212,6 +287,147 @@ async fn settle_one<D: D1Exec, W: WalletTransport>(db: &D, wallets: Option<&W>, 
     }
 }
 
+/// What asking Google about one credited order came to.
+enum Verdict {
+    Kept,
+    Voided,
+    /// Google could not be asked; the check goes on from this order in the next run.
+    Postponed(String),
+    /// Nothing can tell; the founder has to look the order up in Play Console.
+    ByHand(String),
+}
+
+/// One credited Play purchase that could have been voided in a gap.
+struct GapCandidate {
+    id: String,
+    pack_id: String,
+    payment_id: String,
+    token: Option<String>,
+    created_at: String,
+}
+
+/// Checks, one by one, the tenant's credited Play orders bought before the end of the gap (any of them could have been
+/// voided in it), after the last one checked: an order by `orders.get` (refunded or canceled is voided), a promo
+/// purchase without an order id by `purchases.products.get` while its token is still stored. A voided one goes through
+/// the refund path; one nothing can tell about is logged for the founder to reconcile by hand. Returns true once every
+/// such order was checked; the progress is kept in `play_voided_sweeps.gap_checked_through`.
+async fn check_gap<T: Transport, S: Signer, D: D1Exec, W: WalletTransport>(
+    api: &PlayApi<'_, T, S>,
+    db: &D,
+    wallets: Option<&W>,
+    tenant: &PlayTenant,
+    gap: &Gap,
+    state: &SweepState,
+    report: &mut VoidedSweep,
+) -> Result<bool, AppError> {
+    let candidates = gap_candidates(db, &tenant.app_id, gap, state.gap_checked_through.as_deref()).await?;
+    let mut through = state.gap_checked_through.clone();
+    for candidate in &candidates {
+        match verdict(api, tenant, candidate).await {
+            Verdict::Kept => {}
+            Verdict::Voided => match ledger_refund::reverse_play_order(db, wallets, &tenant.app_id, &candidate.payment_id).await {
+                Ok(Outcome::Reversed { .. }) => report.reversed += 1,
+                Ok(_) => report.settled += 1,
+                Err(error) => {
+                    log::error(&format!("google play refund of {} found in the gap could not be reversed: {error:?}", candidate.payment_id));
+                    save_gap_cursor(db, &tenant.package, through.as_deref()).await?;
+                    return Ok(false);
+                }
+            },
+            Verdict::Postponed(reason) => {
+                log::error(&format!("google play gap check of {} postponed at {}: {reason}", tenant.package, candidate.payment_id));
+                save_gap_cursor(db, &tenant.package, through.as_deref()).await?;
+                return Ok(false);
+            }
+            Verdict::ByHand(reason) => {
+                log::error(&format!(
+                    "google play order {} of {} (credited {}) may have been voided while no sweep ran and cannot be checked: {reason}; look it up in Play Console and reverse it by hand if it was refunded",
+                    candidate.payment_id, tenant.app_id, candidate.created_at
+                ));
+                report.gap_by_hand += 1;
+            }
+        }
+        report.gap_checked += 1;
+        through = Some(format!("{}|{}", candidate.created_at, candidate.id));
+    }
+    save_gap_cursor(db, &tenant.package, through.as_deref()).await?;
+    Ok((candidates.len() as i64) < GAP_CHECKS_PER_RUN)
+}
+
+async fn verdict<T: Transport, S: Signer>(api: &PlayApi<'_, T, S>, tenant: &PlayTenant, candidate: &GapCandidate) -> Verdict {
+    if candidate.payment_id.starts_with(TOKEN_PAYMENT_PREFIX) {
+        let Some(token) = candidate.token.as_deref() else {
+            return Verdict::ByHand("a promo purchase has no order id, and its token was dropped once Google acknowledged it".to_string());
+        };
+        let product_id = format!("{}{}", tenant.product_prefix, candidate.pack_id);
+        return match api.product_purchase(&tenant.package, &product_id, token).await {
+            Ok(purchase) if voided(&purchase) => Verdict::Voided,
+            Ok(_) => Verdict::Kept,
+            Err(VerifyFailure::Rejected) => Verdict::ByHand("Google no longer knows its purchase token".to_string()),
+            Err(VerifyFailure::Unavailable(reason)) => Verdict::Postponed(reason),
+        };
+    }
+    let order_id = candidate.payment_id.trim_start_matches(PLAY_PAYMENT_PREFIX);
+    match api.order_state(&tenant.package, order_id).await {
+        Ok(state) if VOIDED_ORDER_STATES.contains(&state.as_str()) => Verdict::Voided,
+        Ok(_) => Verdict::Kept,
+        Err(VerifyFailure::Rejected) => Verdict::ByHand("Google does not know the order".to_string()),
+        Err(VerifyFailure::Unavailable(reason)) => Verdict::Postponed(reason),
+    }
+}
+
+/// True when a purchase Google answered for was canceled or refunded.
+fn voided(purchase: &ProductPurchase) -> bool {
+    !matches!(purchase.purchase_state, Some(0) | Some(2)) || purchase.refundable_quantity == Some(0)
+}
+
+async fn gap_candidates(db: &impl D1Exec, app_id: &str, gap: &Gap, after: Option<&str>) -> Result<Vec<GapCandidate>, AppError> {
+    let (after_created, after_id) = after.and_then(|cursor| cursor.split_once('|')).unwrap_or(("", ""));
+    let rows = db
+        .rows(
+            &format!(
+                "SELECT id, pack_id, payment_id, store_token, created_at FROM credit_purchases
+                 WHERE app_id = ?1 AND payment_provider = '{PLAY_STORE}' AND status = 'completed' AND created_at < ?2
+                   AND (created_at > ?3 OR (created_at = ?3 AND id > ?4))
+                 ORDER BY created_at, id LIMIT ?5"
+            ),
+            &[app_id.into(), iso(gap.to_ms).into(), after_created.into(), after_id.into(), GAP_CHECKS_PER_RUN.into()],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            Some(GapCandidate {
+                id: text(row, "id")?.to_string(),
+                pack_id: text(row, "pack_id")?.to_string(),
+                payment_id: text(row, "payment_id")?.to_string(),
+                token: text(row, "store_token").filter(|token| !token.is_empty()).map(str::to_string),
+                created_at: text(row, "created_at")?.to_string(),
+            })
+        })
+        .collect())
+}
+
+/// When the tenant's oldest credited Play order was bought, for a package never swept.
+async fn oldest_credit_ms(db: &impl D1Exec, app_id: &str) -> Result<Option<i64>, AppError> {
+    let rows = db
+        .rows(
+            &format!("SELECT MIN(created_at) AS oldest FROM credit_purchases WHERE app_id = ?1 AND payment_provider = '{PLAY_STORE}' AND status = 'completed'"),
+            &[app_id.into()],
+        )
+        .await?;
+    Ok(rows
+        .first()
+        .and_then(|row| text(row, "oldest"))
+        .and_then(|oldest| DateTime::parse_from_rfc3339(oldest).ok())
+        .map(|oldest| oldest.timestamp_millis()))
+}
+
+/// A time as the purchase rows write theirs (`created_at`), so the two compare as text.
+fn iso(ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()
+}
+
 /// Where the sweep of a package stands; the default for one never swept.
 pub async fn load_state(db: &impl D1Exec, package: &str) -> Result<SweepState, AppError> {
     let rows = db.rows("SELECT * FROM play_voided_sweeps WHERE package_name = ?1", &[package.into()]).await?;
@@ -220,7 +436,11 @@ pub async fn load_state(db: &impl D1Exec, package: &str) -> Result<SweepState, A
         (Some(start_ms), Some(end_ms), Some(token)) => Some(Resume { window: VoidedWindow { start_ms, end_ms }, page_token: token.to_string() }),
         _ => None,
     };
-    Ok(SweepState { swept_until_ms: int(row, "swept_until_ms"), resume })
+    Ok(SweepState {
+        swept_until_ms: int(row, "swept_until_ms"),
+        resume,
+        gap_checked_through: text(row, "gap_checked_through").filter(|cursor| !cursor.is_empty()).map(str::to_string),
+    })
 }
 
 async fn ensure_row(db: &impl D1Exec, package: &str) -> Result<(), AppError> {
@@ -247,13 +467,23 @@ async fn save_resume(db: &impl D1Exec, package: &str, resume: Option<&Resume>) -
     Ok(())
 }
 
-/// Records that a window was read through to `end_ms`. It never moves back, so an older
+async fn save_gap_cursor(db: &impl D1Exec, package: &str, through: Option<&str>) -> Result<(), AppError> {
+    ensure_row(db, package).await?;
+    db.exec(
+        "UPDATE play_voided_sweeps SET gap_checked_through = ?2, updated_at = ?3 WHERE package_name = ?1",
+        &[package.into(), through.into(), Utc::now().to_rfc3339().into()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Records that a window was read through to `end_ms` and any gap before it checked. It never moves back, so an older
 /// run finishing late cannot undo a newer one.
 async fn finish_window(db: &impl D1Exec, package: &str, end_ms: i64) -> Result<(), AppError> {
     ensure_row(db, package).await?;
     db.exec(
         "UPDATE play_voided_sweeps SET swept_until_ms = MAX(COALESCE(swept_until_ms, 0), ?2), window_start_ms = NULL, window_end_ms = NULL,
-             page_token = NULL, updated_at = ?3
+             page_token = NULL, gap_checked_through = NULL, updated_at = ?3
          WHERE package_name = ?1",
         &[package.into(), end_ms.into(), Utc::now().to_rfc3339().into()],
     )

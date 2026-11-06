@@ -160,7 +160,9 @@ pub async fn run_cron(env: &Env, db: &D1Database) {
     for tenant in &tenants {
         match refund_wallets(env) {
             Ok(wallets) => match playstore::sweep_voided(&api, db, wallets.as_ref(), tenant, now_ms).await {
-                Ok(report) if report.voided > 0 || !report.finished => log::info(&format!("google play voided sweep {}: {report:?}", tenant.app_id)),
+                Ok(report) if report.voided > 0 || !report.finished || report.gap.is_some() => {
+                    log::info(&format!("google play voided sweep {}: {report:?}", tenant.app_id))
+                }
                 Ok(_) => {}
                 Err(error) => log::error(&format!("google play voided sweep failed for {}: {error:?}", tenant.app_id)),
             },
