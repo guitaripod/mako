@@ -1,6 +1,7 @@
-# Sourced by scripts/test-local.sh after the whole existing suite has run with WALLET_LINKING off. It restarts the
-# server with WALLET_LINKING on against the same local database and Durable Object storage and runs the wallet flow
-# of P3.07 steps 5 and 6: linking, spends, purchases, residue, native requests and deletion.
+# Sourced by scripts/test-local.sh after the whole existing suite has run with WALLET_LINKING off (the local config
+# turns it off whatever wrangler.toml ships). It restarts the server with WALLET_LINKING on against the same local
+# database and Durable Object storage and runs the wallet flow of P3.07 steps 5 and 6: linking, spends, purchases,
+# residue, native requests and deletion.
 
 M1="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d47"
 M_SECOND="0194f3a2-7b1c-4d2e-9a60-3c5e8f1b2d48"
@@ -117,7 +118,7 @@ if ! sql_file "$WSEED"; then
   exit 1
 fi
 rm -f "$WSEED"
-check "the flag ships off" off "$(sed -n 's/^WALLET_LINKING = "\(.*\)"$/\1/p' wrangler.toml)"
+check "the first phase runs with the flag off" off "$(sed -n 's/^WALLET_LINKING = "\(.*\)"$/\1/p' "$CONFIG")"
 call_token GET /v1/credits/balance key_link "$(minted_token valid)"
 check "a valid token with the flag off leaves the user on its D1 balance" 40 "$(json_get balance)"
 check "the flag off creates no link" 0 "$(sql_value "SELECT COUNT(*) FROM wallet_links")"

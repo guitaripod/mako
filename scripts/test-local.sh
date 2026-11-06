@@ -114,7 +114,7 @@ balance_of() {
 }
 
 echo "== building and preparing a fresh local database"
-sed -e 's|^command = .*|command = "worker-build --dev"|' wrangler.toml > "$CONFIG"
+sed -e 's|^command = .*|command = "worker-build --dev"|' -e 's|^WALLET_LINKING = .*|WALLET_LINKING = "off"|' wrangler.toml > "$CONFIG"
 
 if [ -f "$DEV_VARS" ]; then
   cp "$DEV_VARS" "$DEV_VARS_BACKUP"
