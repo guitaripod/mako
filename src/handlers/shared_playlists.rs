@@ -307,7 +307,7 @@ fn escape(text: &str) -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PageLanguage {
-    En, De, Es, Fr, It, Ja, Ko, Pl, PtBr, ZhHans, ZhHant,
+    En, De, Es, Fr, It, Ja, Ko, Pl, PtBr, ZhHans, ZhHant, Sv, Da, Nb, Fi, Is,
 }
 
 struct PageText {
@@ -333,6 +333,11 @@ fn text(language: PageLanguage) -> PageText {
         PageLanguage::PtBr => PageText { songs: "músicas", open_in_app: "Abrir no Psywave", get_app: "Baixe o Psywave grátis", made_with: "Feita com o Psywave", pitch: "Transforme qualquer vibe ou foto em uma playlist de músicas de verdade.", missing: "Esta playlist não está mais disponível.", report: "Denunciar esta playlist" },
         PageLanguage::ZhHans => PageText { songs: "首", open_in_app: "在 Psywave 中打开", get_app: "免费获取 Psywave", made_with: "由 Psywave 生成", pitch: "把任何心情或照片变成真实歌曲组成的歌单。", missing: "此歌单已不再可用。", report: "举报此歌单" },
         PageLanguage::ZhHant => PageText { songs: "首", open_in_app: "在 Psywave 中開啟", get_app: "免費取得 Psywave", made_with: "由 Psywave 產生", pitch: "把任何心情或照片變成真實歌曲組成的歌單。", missing: "此歌單已無法使用。", report: "檢舉此歌單" },
+        PageLanguage::Sv => PageText { songs: "låtar", open_in_app: "Öppna i Psywave", get_app: "Hämta Psywave gratis", made_with: "Skapad med Psywave", pitch: "Gör vilken känsla eller bild som helst till en spellista med riktiga låtar.", missing: "Den här spellistan finns inte längre.", report: "Anmäl spellistan" },
+        PageLanguage::Da => PageText { songs: "sange", open_in_app: "Åbn i Psywave", get_app: "Hent Psywave gratis", made_with: "Lavet med Psywave", pitch: "Gør enhver stemning eller ethvert billede til en playliste med rigtige sange.", missing: "Denne playliste er ikke længere tilgængelig.", report: "Anmeld denne playliste" },
+        PageLanguage::Nb => PageText { songs: "sanger", open_in_app: "Åpne i Psywave", get_app: "Hent Psywave gratis", made_with: "Laget med Psywave", pitch: "Gjør enhver stemning eller ethvert bilde om til en spilleliste med ekte sanger.", missing: "Denne spillelisten er ikke lenger tilgjengelig.", report: "Rapporter denne spillelisten" },
+        PageLanguage::Fi => PageText { songs: "kappaletta", open_in_app: "Avaa Psywavessa", get_app: "Lataa Psywave ilmaiseksi", made_with: "Tehty Psywavella", pitch: "Muuta mikä tahansa tunnelma tai kuva soittolistaksi oikeista kappaleista.", missing: "Tämä soittolista ei ole enää saatavilla.", report: "Ilmoita tästä soittolistasta" },
+        PageLanguage::Is => PageText { songs: "lög", open_in_app: "Opna í Psywave", get_app: "Sæktu Psywave ókeypis", made_with: "Búið til með Psywave", pitch: "Breyttu hvaða stemningu eða mynd sem er í lagalista með alvöru lögum.", missing: "Þessi lagalisti er ekki lengur í boði.", report: "Tilkynna þennan lagalista" },
     }
 }
 
@@ -354,6 +359,11 @@ pub fn preferred_language(header: Option<&str>) -> PageLanguage {
             "ko" => Some(PageLanguage::Ko),
             "pl" => Some(PageLanguage::Pl),
             "pt" => Some(PageLanguage::PtBr),
+            "sv" => Some(PageLanguage::Sv),
+            "da" => Some(PageLanguage::Da),
+            "nb" | "no" | "nn" => Some(PageLanguage::Nb),
+            "fi" => Some(PageLanguage::Fi),
+            "is" => Some(PageLanguage::Is),
             "zh" => Some(
                 if tag.contains("hant") || tag.ends_with("-tw") || tag.ends_with("-hk") || tag.ends_with("-mo") {
                     PageLanguage::ZhHant
@@ -383,6 +393,11 @@ fn html_lang(language: PageLanguage) -> &'static str {
         PageLanguage::PtBr => "pt-BR",
         PageLanguage::ZhHans => "zh-Hans",
         PageLanguage::ZhHant => "zh-Hant",
+        PageLanguage::Sv => "sv",
+        PageLanguage::Da => "da",
+        PageLanguage::Nb => "nb",
+        PageLanguage::Fi => "fi",
+        PageLanguage::Is => "is",
     }
 }
 
@@ -550,7 +565,13 @@ mod tests {
         assert_eq!(preferred_language(Some("zh-TW,zh;q=0.9")), PageLanguage::ZhHant);
         assert_eq!(preferred_language(Some("zh-CN")), PageLanguage::ZhHans);
         assert_eq!(preferred_language(Some("pt-BR,pt;q=0.9")), PageLanguage::PtBr);
-        assert_eq!(preferred_language(Some("fi-FI,sv;q=0.8")), PageLanguage::En);
+        assert_eq!(preferred_language(Some("fi-FI,sv;q=0.8")), PageLanguage::Fi);
+        assert_eq!(preferred_language(Some("sv")), PageLanguage::Sv);
+        assert_eq!(preferred_language(Some("da-DK")), PageLanguage::Da);
+        assert_eq!(preferred_language(Some("nb-NO")), PageLanguage::Nb);
+        assert_eq!(preferred_language(Some("no")), PageLanguage::Nb);
+        assert_eq!(preferred_language(Some("is-IS")), PageLanguage::Is);
+        assert_eq!(preferred_language(Some("hu-HU,en;q=0.5")), PageLanguage::En);
         assert_eq!(preferred_language(None), PageLanguage::En);
     }
 
