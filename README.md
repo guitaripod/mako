@@ -27,7 +27,8 @@ Chat is routed by model id prefix (`src/handlers/chat.rs`):
 Anthropic's monthly credit carries features in every app, so one day's Anthropic spend is capped across all tenants
 (`src/spend.rs`). Each answered Anthropic call adds its cost, from its token usage at the model's price in
 `model_prices`, to the UTC day's row in `provider_spend`, in millionths of a dollar. Once the day's total reaches
-`ANTHROPIC_DAILY_SPEND_LIMIT_USD` (`wrangler.toml`, 2.00 when unset or not a positive number), Anthropic-backed chat
+2.00 dollars (`DEFAULT_ANTHROPIC_CEILING_USD`; the `ANTHROPIC_DAILY_SPEND_LIMIT_USD` variable that would override it is
+left unset because Cloudflare's deployments API answered 500 to every version carrying it), Anthropic-backed chat
 answers `429 rate_limit_exceeded` before anything is reserved or charged, until midnight UTC. OpenAI and Gemini are
 not counted or stopped. A count that cannot be read or written is logged and the call goes through. Read the figure:
 

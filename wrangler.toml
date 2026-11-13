@@ -43,8 +43,9 @@ ENVIRONMENT = "production"
 
 # P3.21. The most Anthropic may cost in one UTC day, in dollars, across every tenant: once the day's answered calls
 # have cost this much (counted from token usage in provider_spend), Anthropic-backed chat answers 429 until midnight
-# UTC. Not set or not a positive number: 2.00.
-ANTHROPIC_DAILY_SPEND_LIMIT_USD = "2.00"
+# UTC. ANTHROPIC_DAILY_SPEND_LIMIT_USD is deliberately not set here, so the 2.00 in src/spend.rs applies: on
+# 2026-11-13 every version uploaded with it as a plain variable made Cloudflare's deployments API answer 500 (code
+# 10013) while the same code without it deployed at once. Change the figure in src/spend.rs.
 
 # P3.07 wallets. "on" links users who present a Midgar token to their Midgar ID wallet, resolves Midgar-ID-native
 # requests and routes every credit change through the wallet when the user has a link. Anything else leaves every
