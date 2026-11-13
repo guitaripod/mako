@@ -41,6 +41,11 @@ PUBLIC_BASE_URL = "https://api.midgarcorp.cc/v1/intelligence"
 # Environment
 ENVIRONMENT = "production"
 
+# P3.21. The most Anthropic may cost in one UTC day, in dollars, across every tenant: once the day's answered calls
+# have cost this much (counted from token usage in provider_spend), Anthropic-backed chat answers 429 until midnight
+# UTC. Not set or not a positive number: 2.00.
+ANTHROPIC_DAILY_SPEND_LIMIT_USD = "2.00"
+
 # P3.07 wallets. "on" links users who present a Midgar token to their Midgar ID wallet, resolves Midgar-ID-native
 # requests and routes every credit change through the wallet when the user has a link. Anything else leaves every
 # account on its D1 balance and runs none of that code. Needs the IDENTITY_LOOKUP_SECRET secret for grants addressed

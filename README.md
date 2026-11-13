@@ -22,6 +22,20 @@ Chat is routed by model id prefix (`src/handlers/chat.rs`):
 | `gpt*`, `o1`, `o3`, `o4`, `chatgpt*` | OpenAI | `OPENAI_API_KEY` |
 | everything else | Gemini | `GEMINI_API_KEY` |
 
+### The Anthropic ceiling
+
+Anthropic's monthly credit carries features in every app, so one day's Anthropic spend is capped across all tenants
+(`src/spend.rs`). Each answered Anthropic call adds its cost, from its token usage at the model's price in
+`model_prices`, to the UTC day's row in `provider_spend`, in millionths of a dollar. Once the day's total reaches
+`ANTHROPIC_DAILY_SPEND_LIMIT_USD` (`wrangler.toml`, 2.00 when unset or not a positive number), Anthropic-backed chat
+answers `429 rate_limit_exceeded` before anything is reserved or charged, until midnight UTC. OpenAI and Gemini are
+not counted or stopped. A count that cannot be read or written is logged and the call goes through. Read the figure:
+
+```sh
+npx wrangler d1 execute openai-image-proxy --remote \
+  --command "SELECT day, micro_usd / 1000000.0 AS usd, calls FROM provider_spend ORDER BY day DESC LIMIT 14"
+```
+
 ## Adding a tenant
 
 Data only, no deploy: add `migrations/0XX_seed_<app>.sql` (`014_seed_livingdex.sql` is the model) with the `apps` row and any `capability_costs` and `credit_packs`, then:

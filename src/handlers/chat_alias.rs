@@ -322,6 +322,10 @@ async fn call_provider(
         return crate::mock::alias_reply(cfg, turns).map_err(reply_error);
     }
     let provider = Provider::for_model(&cfg.model);
+    let is_anthropic = matches!(provider, Provider::Anthropic);
+    if is_anthropic {
+        crate::spend::refuse_anthropic_over_ceiling(env, db).await?;
+    }
     let api_key = env
         .secret(provider.secret_name())
         .map_err(|_| AppError::InternalError(format!("{} not configured", provider.secret_name())))?
@@ -346,12 +350,16 @@ async fn call_provider(
         }
     };
     route.apply(&headers)?;
-    let value = post_json(&route.url, headers, &body, label, matches!(provider, Provider::Anthropic)).await?;
+    let value = post_json(&route.url, headers, &body, label, is_anthropic).await?;
     let parsed = match provider {
         Provider::Gemini => parse_gemini_reply(&value),
         Provider::OpenAI => parse_openai_reply(&value),
         Provider::Anthropic => parse_anthropic_reply(&value),
     };
+    if let (true, Ok(reply)) = (is_anthropic, &parsed) {
+        let prices = crate::handlers::chat::model_prices(&cfg.model);
+        crate::spend::count_anthropic(db, prices, reply.prompt_tokens, reply.output_tokens).await;
+    }
     parsed.map_err(reply_error)
 }
 

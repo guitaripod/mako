@@ -17,7 +17,7 @@ const MIN_BALANCE_GUARD: u32 = 2;
 /// Per-1M-token USD prices (input, output) across providers, used to convert
 /// real token usage into credits. Defaults to a mid-tier estimate for unknown
 /// models. (Apps with a flat capability cost ignore this entirely.)
-fn model_prices(model: &str) -> (f64, f64) {
+pub(crate) fn model_prices(model: &str) -> (f64, f64) {
     match model {
         "gemini-3.1-flash-lite" => (0.25, 1.50),
         "gemini-3.5-flash" => (1.50, 9.00),
@@ -164,6 +164,13 @@ async fn chat_completion_inner(
             .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string()),
     };
 
+    let provider = Provider::for_model(&model);
+    let mocked = crate::mock::enabled(&ctx.env);
+    let counts_as_anthropic = matches!(provider, Provider::Anthropic) && !mocked;
+    if counts_as_anthropic {
+        crate::spend::refuse_anthropic_over_ceiling(&ctx.env, &db).await?;
+    }
+
     let flat_cost = get_flat_capability_cost(&auth.app_id, "chat.completion", &db).await;
     let premium = crate::handlers::credits::is_premium_user(&ctx.env, &db, &auth).await;
 
@@ -179,8 +186,6 @@ async fn chat_completion_inner(
         }
     }
 
-    let provider = Provider::for_model(&model);
-    let mocked = crate::mock::enabled(&ctx.env);
     let api_key = match ctx.env.secret(provider.secret_name()) {
         Ok(k) => k.to_string(),
         Err(_) if mocked => String::new(),
@@ -209,6 +214,9 @@ async fn chat_completion_inner(
             return Err(e);
         }
     };
+    if counts_as_anthropic {
+        crate::spend::count_anthropic(&db, model_prices(&model), prompt_tokens, output_tokens).await;
+    }
 
     let credits = if premium {
         0

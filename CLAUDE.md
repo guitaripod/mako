@@ -4,6 +4,7 @@ Midgar's shared multi-tenant AI-credits backend: a Rust Cloudflare Worker fronti
 
 ## Layout
 - `src/` (`handlers/`, `wallet/`, `auth.rs`, `api_keys.rs`, `ledgers.rs`, `midgar_token.rs`, `purchases.rs`, `storekit.rs`, `playstore.rs`, `storage.rs`, `retention.rs`, `attribution.rs`, `privacy.rs`, `redact.rs`, `chat_alias.rs`, `art.rs`, `tenant.rs`), `migrations/`, `scripts/`, `test-vectors/`, `docs/` (`p3.07-wallet-design.md`).
+- Anthropic has a daily ceiling in dollars across every tenant (`src/spend.rs`, table `provider_spend`, `ANTHROPIC_DAILY_SPEND_LIMIT_USD`, 2.00): both chat paths refuse with 429 once the UTC day's answered calls have cost that much and count each answered call from its token usage. A new Anthropic call site must call `spend::refuse_anthropic_over_ceiling` before the call and `spend::count_anthropic` after it; a new Claude model needs its price in `model_prices` or it counts at Sonnet rates.
 - Chat routing by model prefix in `src/handlers/chat.rs`: `claude*`/`anthropic*` to Anthropic, `gpt*`/`o1`/`o3`/`o4`/`chatgpt*` to OpenAI, everything else to Gemini. A new provider extends `enum Provider`, `for_model()`, `secret_name()`, a `<provider>_generate()` fn and `model_prices()`.
 
 ## Commands

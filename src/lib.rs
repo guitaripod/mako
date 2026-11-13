@@ -27,6 +27,7 @@ mod redact;
 mod tenant;
 mod ledgers;
 mod internal;
+mod spend;
 mod midgar_token;
 pub mod wallet;
 
