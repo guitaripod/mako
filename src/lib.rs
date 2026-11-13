@@ -28,6 +28,7 @@ mod tenant;
 mod ledgers;
 mod internal;
 mod spend;
+mod daily;
 mod midgar_token;
 pub mod wallet;
 

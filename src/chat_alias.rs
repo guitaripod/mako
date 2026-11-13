@@ -25,6 +25,7 @@ pub struct AliasConfig {
     pub flat_credits: u32,
     pub weekly_free: u32,
     pub premium_bypass: bool,
+    pub daily_limit: u32,
     pub version: i64,
 }
 
@@ -45,6 +46,7 @@ impl AliasConfig {
             flat_credits: row.get("flat_credits").and_then(|v| v.as_i64()).unwrap_or(1).max(0) as u32,
             weekly_free: row.get("weekly_free").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
             premium_bypass: row.get("premium_bypass").and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+            daily_limit: row.get("daily_limit").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
             version: row.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
         })
     }
@@ -621,6 +623,7 @@ mod tests {
             flat_credits: 1,
             weekly_free: 3,
             premium_bypass: true,
+            daily_limit: 0,
             version: 7,
         }
     }

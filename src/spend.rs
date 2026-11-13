@@ -61,14 +61,49 @@ pub async fn has_room(db: &impl D1Exec, provider: &str, day: &str, ceiling_micro
     Ok(spent(db, provider, day).await? < ceiling_micro_usd)
 }
 
-/// Refuses an Anthropic call with the rate-limit error once today's Anthropic spend has reached the ceiling. A count
-/// that cannot be read lets the call through: a storage fault must not turn off a paid feature.
-pub async fn refuse_anthropic_over_ceiling(env: &Env, db: &impl D1Exec) -> Result<(), AppError> {
+/// The name a tenant's own share of a provider's spend is kept under in `provider_spend`.
+pub fn tenant_share(provider: &str, app_id: &str) -> String {
+    format!("{provider}:{app_id}")
+}
+
+/// The most a tenant's own Anthropic calls may cost in a day, when its `apps` row names a figure above zero.
+pub async fn tenant_ceiling(db: &impl D1Exec, app_id: &str) -> Result<Option<u64>, AppError> {
+    let rows = db.rows("SELECT anthropic_daily_micro_usd FROM apps WHERE app_id = ?1", &[app_id.into()]).await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("anthropic_daily_micro_usd"))
+        .and_then(|value| value.as_i64())
+        .filter(|figure| *figure > 0)
+        .map(|figure| figure as u64))
+}
+
+/// Whether an Anthropic call for `app_id` may go out: the day's total is under the ceiling every tenant shares, and
+/// the tenant's own share is under its own ceiling when it has one.
+pub async fn anthropic_has_room(db: &impl D1Exec, app_id: &str, day: &str, shared_ceiling: u64) -> Result<bool, AppError> {
+    if !has_room(db, ANTHROPIC, day, shared_ceiling).await? {
+        return Ok(false);
+    }
+    match tenant_ceiling(db, app_id).await? {
+        Some(own_ceiling) => has_room(db, &tenant_share(ANTHROPIC, app_id), day, own_ceiling).await,
+        None => Ok(true),
+    }
+}
+
+/// Adds an answered Anthropic call to the day's total and to the tenant's own share of it.
+pub async fn add_anthropic(db: &impl D1Exec, app_id: &str, day: &str, micro_usd: u64) -> Result<(), AppError> {
+    add(db, ANTHROPIC, day, micro_usd).await?;
+    add(db, &tenant_share(ANTHROPIC, app_id), day, micro_usd).await
+}
+
+/// Refuses an Anthropic call with the rate-limit error once today's Anthropic spend, or this tenant's share of it,
+/// has reached its ceiling. A count that cannot be read lets the call through: a storage fault must not turn off a
+/// paid feature.
+pub async fn refuse_anthropic_over_ceiling(env: &Env, db: &impl D1Exec, app_id: &str) -> Result<(), AppError> {
     let ceiling = ceiling_micro_usd(env.var(ANTHROPIC_CEILING_VAR).ok().map(|value| value.to_string()).as_deref());
-    match has_room(db, ANTHROPIC, &day_of(Utc::now()), ceiling).await {
+    match anthropic_has_room(db, app_id, &day_of(Utc::now()), ceiling).await {
         Ok(true) => Ok(()),
         Ok(false) => {
-            console_log!("Anthropic spend ceiling reached for today ({} micro-USD); call refused", ceiling);
+            console_log!("Anthropic spend ceiling reached for today; call for {} refused", app_id);
             Err(AppError::RateLimitExceeded)
         }
         Err(error) => {
@@ -80,9 +115,9 @@ pub async fn refuse_anthropic_over_ceiling(env: &Env, db: &impl D1Exec) -> Resul
 
 /// Counts an Anthropic call that was answered. A count that cannot be written is logged and the answer still goes
 /// back to the person who paid for it.
-pub async fn count_anthropic(db: &impl D1Exec, prices: (f64, f64), prompt_tokens: u64, output_tokens: u64) {
+pub async fn count_anthropic(db: &impl D1Exec, app_id: &str, prices: (f64, f64), prompt_tokens: u64, output_tokens: u64) {
     let cost = micro_usd(prices, prompt_tokens, output_tokens);
-    if let Err(error) = add(db, ANTHROPIC, &day_of(Utc::now()), cost).await {
+    if let Err(error) = add_anthropic(db, app_id, &day_of(Utc::now()), cost).await {
         console_log!("Anthropic spend of {} micro-USD was not counted: {:?}", cost, error);
     }
 }
@@ -148,6 +183,23 @@ mod tests {
         block_on(add(&d1, ANTHROPIC, "2026-11-13", 1)).unwrap();
         assert!(!room("2026-11-13"));
         assert!(room("2026-11-14"));
+    }
+
+    #[test]
+    fn a_tenant_with_its_own_ceiling_stops_alone_and_the_shared_ceiling_stops_everyone() {
+        let d1 = LocalD1::migrated();
+        let room = |app: &str| block_on(anthropic_has_room(&d1, app, "2026-11-13", 2_000_000)).unwrap();
+        assert_eq!(block_on(tenant_ceiling(&d1, "crucible")).unwrap(), Some(750_000));
+        assert_eq!(block_on(tenant_ceiling(&d1, "dreameater")).unwrap(), None);
+        block_on(add_anthropic(&d1, "crucible", "2026-11-13", 749_999)).unwrap();
+        assert!(room("crucible"));
+        block_on(add_anthropic(&d1, "crucible", "2026-11-13", 1)).unwrap();
+        assert!(!room("crucible"));
+        assert!(room("dreameater"));
+        assert_eq!(block_on(spent(&d1, ANTHROPIC, "2026-11-13")).unwrap(), 750_000);
+        block_on(add_anthropic(&d1, "dreameater", "2026-11-13", 1_250_000)).unwrap();
+        assert!(!room("dreameater"));
+        assert!(block_on(anthropic_has_room(&d1, "crucible", "2026-11-14", 2_000_000)).unwrap());
     }
 
     #[test]

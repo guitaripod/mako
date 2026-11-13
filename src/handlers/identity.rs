@@ -567,6 +567,7 @@ const USER_DATA_TABLES: &[&str] = &[
     "install_attributions",
     "purchase_attributions",
     "weekly_usage",
+    "daily_usage",
     "edit_allowances",
     "runways",
     "chat_requests",

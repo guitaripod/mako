@@ -125,6 +125,7 @@ mod tests {
             flat_credits: 1,
             weekly_free: 0,
             premium_bypass: false,
+            daily_limit: 0,
             version: 1,
         }
     }

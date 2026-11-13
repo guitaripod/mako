@@ -168,7 +168,7 @@ async fn chat_completion_inner(
     let mocked = crate::mock::enabled(&ctx.env);
     let counts_as_anthropic = matches!(provider, Provider::Anthropic) && !mocked;
     if counts_as_anthropic {
-        crate::spend::refuse_anthropic_over_ceiling(&ctx.env, &db).await?;
+        crate::spend::refuse_anthropic_over_ceiling(&ctx.env, &db, &auth.app_id).await?;
     }
 
     let flat_cost = get_flat_capability_cost(&auth.app_id, "chat.completion", &db).await;
@@ -215,7 +215,7 @@ async fn chat_completion_inner(
         }
     };
     if counts_as_anthropic {
-        crate::spend::count_anthropic(&db, model_prices(&model), prompt_tokens, output_tokens).await;
+        crate::spend::count_anthropic(&db, &auth.app_id, model_prices(&model), prompt_tokens, output_tokens).await;
     }
 
     let credits = if premium {

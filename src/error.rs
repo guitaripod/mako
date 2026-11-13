@@ -18,6 +18,9 @@ pub enum AppError {
     PaymentRequired(String, Option<i32>),
     InternalError(String),
     RateLimitExceeded,
+    /// 429 `daily_limit_reached`: this person has used today's allowance of an alias. It returns at midnight UTC,
+    /// which `Retry-After` counts down to.
+    DailyLimitReached,
     Truncated,
     ContentBlocked,
     WalletUnavailable,
@@ -59,6 +62,7 @@ impl AppError {
             AppError::PaymentRequired(msg, balance) => (402, "insufficient_credits", msg.clone(), "insufficient_credits", *balance),
             AppError::InternalError(_) => (500, "internal_error", "An internal error occurred. Please try again later.".to_string(), "internal_error", None),
             AppError::RateLimitExceeded => (429, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.".to_string(), "rate_limit_exceeded", None),
+            AppError::DailyLimitReached => (429, "rate_limit_exceeded", "Today's allowance for this is used up. It comes back at midnight UTC.".to_string(), "daily_limit_reached", None),
             AppError::Truncated => (422, "generation_error", "The reply was cut off before it finished. Nothing was charged. Try again.".to_string(), "truncated", None),
             AppError::ContentBlocked => (422, "generation_error", "The provider declined to process this text. Nothing was charged.".to_string(), "content_blocked", None),
             AppError::WalletUnavailable => (503, "service_unavailable", "Your credit balance is temporarily unavailable. Please try again in a moment.".to_string(), "wallet_unavailable", None),
@@ -89,6 +93,9 @@ impl AppError {
         let mut resp = Response::from_json(&self.body())?.with_status(self.parts().status);
         if let AppError::RateLimitExceeded = self {
             resp.headers_mut().set("Retry-After", "60")?;
+        }
+        if let AppError::DailyLimitReached = self {
+            resp.headers_mut().set("Retry-After", &crate::daily::seconds_until_next_day(chrono::Utc::now()).to_string())?;
         }
         if let AppError::WalletUnavailable = self {
             resp.headers_mut().set("Retry-After", WALLET_RETRY_AFTER_SECONDS)?;
@@ -146,6 +153,9 @@ impl From<worker::Error> for AppError {
         if error_str.starts_with("AppError::RateLimitExceeded::") {
             return AppError::RateLimitExceeded;
         }
+        if error_str.starts_with("AppError::DailyLimitReached::") {
+            return AppError::DailyLimitReached;
+        }
         if error_str.starts_with("AppError::Truncated::") {
             return AppError::Truncated;
         }
@@ -195,6 +205,7 @@ impl From<AppError> for worker::Error {
             AppError::NotConfigured(msg) => format!("AppError::NotConfigured::{}", msg),
             AppError::InternalError(msg) => format!("AppError::InternalError::{}", msg),
             AppError::RateLimitExceeded => "AppError::RateLimitExceeded::".to_string(),
+            AppError::DailyLimitReached => "AppError::DailyLimitReached::".to_string(),
             AppError::Truncated => "AppError::Truncated::".to_string(),
             AppError::ContentBlocked => "AppError::ContentBlocked::".to_string(),
             AppError::WalletUnavailable => "AppError::WalletUnavailable::".to_string(),

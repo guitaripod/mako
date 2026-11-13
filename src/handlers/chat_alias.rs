@@ -50,10 +50,13 @@ async fn run(
     let mut plan = plan_charge(cfg, premium, used_before, settlement);
 
     ensure_affordable(env, db, auth, &plan).await?;
+    let today = crate::spend::day_of(Utc::now());
+    refuse_over_daily_limit(db, auth, cfg, &today).await?;
 
     let system = compose_system_prompt(&cfg.system_prompt, request.language.as_deref());
     let turns = compose_turns(&request.messages, &request.input);
     let reply = call_provider(env, db, &auth.app_id, cfg, &system, &turns).await?;
+    count_toward_daily_limit(db, auth, cfg, &today).await;
 
     let mut consumed_weekly = false;
     if plan.consumes_weekly {
@@ -79,6 +82,32 @@ async fn run(
     record_settlement(db, auth, request, cfg, &plan, &reference, settlement).await;
 
     Ok(respond(cfg, &reply, &plan, charge_reference, free_remaining(cfg, used_before, consumed_weekly))?)
+}
+
+/// Refuses the call when this person has used today's allowance of the alias. A count that cannot be read lets the
+/// call through, like the spend ceiling: a storage fault must not turn off what someone paid for.
+async fn refuse_over_daily_limit(db: &D1Database, auth: &AuthedUser, cfg: &AliasConfig, day: &str) -> Result<(), AppError> {
+    if cfg.daily_limit == 0 {
+        return Ok(());
+    }
+    match crate::daily::used(db, &auth.app_id, &auth.user_id, &cfg.alias, day).await {
+        Ok(used) if !crate::daily::has_room(used, cfg.daily_limit) => Err(AppError::DailyLimitReached),
+        Ok(_) => Ok(()),
+        Err(error) => {
+            worker::console_log!("daily_usage could not be read, call allowed: {:?}", error);
+            Ok(())
+        }
+    }
+}
+
+/// Counts an answered call toward this person's allowance of the alias for the day.
+async fn count_toward_daily_limit(db: &D1Database, auth: &AuthedUser, cfg: &AliasConfig, day: &str) {
+    if cfg.daily_limit == 0 {
+        return;
+    }
+    if let Err(error) = crate::daily::count(db, &auth.app_id, &auth.user_id, &cfg.alias, day).await {
+        worker::console_log!("daily_usage was not counted: {:?}", error);
+    }
 }
 
 async fn ensure_affordable(env: &Env, db: &D1Database, auth: &AuthedUser, plan: &ChargePlan) -> Result<(), AppError> {
@@ -127,7 +156,7 @@ async fn load_alias(db: &D1Database, app_id: &str, alias: &str) -> Result<Option
     let row = db
         .prepare(
             "SELECT alias, model, system_prompt, response_schema, max_tokens, temperature, flat_credits,
-                    weekly_free, premium_bypass, version
+                    weekly_free, premium_bypass, daily_limit, version
              FROM chat_aliases WHERE app_id = ?1 AND alias = ?2",
         )
         .bind(&[app_id.into(), alias.into()])?
@@ -324,7 +353,7 @@ async fn call_provider(
     let provider = Provider::for_model(&cfg.model);
     let is_anthropic = matches!(provider, Provider::Anthropic);
     if is_anthropic {
-        crate::spend::refuse_anthropic_over_ceiling(env, db).await?;
+        crate::spend::refuse_anthropic_over_ceiling(env, db, app_id).await?;
     }
     let api_key = env
         .secret(provider.secret_name())
@@ -358,7 +387,7 @@ async fn call_provider(
     };
     if let (true, Ok(reply)) = (is_anthropic, &parsed) {
         let prices = crate::handlers::chat::model_prices(&cfg.model);
-        crate::spend::count_anthropic(db, prices, reply.prompt_tokens, reply.output_tokens).await;
+        crate::spend::count_anthropic(db, app_id, prices, reply.prompt_tokens, reply.output_tokens).await;
     }
     parsed.map_err(reply_error)
 }

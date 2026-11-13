@@ -30,7 +30,13 @@ Anthropic's monthly credit carries features in every app, so one day's Anthropic
 2.00 dollars (`DEFAULT_ANTHROPIC_CEILING_USD`; the `ANTHROPIC_DAILY_SPEND_LIMIT_USD` variable that would override it is
 left unset because Cloudflare's deployments API answered 500 to every version carrying it), Anthropic-backed chat
 answers `429 rate_limit_exceeded` before anything is reserved or charged, until midnight UTC. OpenAI and Gemini are
-not counted or stopped. A count that cannot be read or written is logged and the call goes through. Read the figure:
+not counted or stopped. A count that cannot be read or written is logged and the call goes through.
+
+A tenant can have a share of its own: `apps.anthropic_daily_micro_usd` (millionths of a dollar, NULL for none) stops
+that tenant alone once its own calls have cost that much, counted under the provider name `anthropic:<app_id>`, so one
+app's allowance can never use up what the others share. Crucible's is 0.75 dollars. And an alias row can cap one
+person: `chat_aliases.daily_limit` answered calls per UTC day (0 for none), counted in `daily_usage` whoever pays, with
+`429 daily_limit_reached` and a `Retry-After` that counts down to midnight UTC. Read the figures:
 
 ```sh
 npx wrangler d1 execute openai-image-proxy --remote \
