@@ -156,7 +156,7 @@ async fn load_alias(db: &D1Database, app_id: &str, alias: &str) -> Result<Option
     let row = db
         .prepare(
             "SELECT alias, model, system_prompt, response_schema, max_tokens, temperature, flat_credits,
-                    weekly_free, premium_bypass, daily_limit, version
+                    weekly_free, premium_bypass, daily_limit, reasoning, version
              FROM chat_aliases WHERE app_id = ?1 AND alias = ?2",
         )
         .bind(&[app_id.into(), alias.into()])?

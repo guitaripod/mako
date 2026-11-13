@@ -126,6 +126,7 @@ mod tests {
             weekly_free: 0,
             premium_bypass: false,
             daily_limit: 0,
+            reasoning: None,
             version: 1,
         }
     }

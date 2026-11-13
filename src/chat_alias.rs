@@ -26,7 +26,14 @@ pub struct AliasConfig {
     pub weekly_free: u32,
     pub premium_bypass: bool,
     pub daily_limit: u32,
+    pub reasoning: Option<String>,
     pub version: i64,
+}
+
+/// The effort an alias row asks an Anthropic model to think at, or None for a word that is not one of the three.
+pub fn reasoning_effort(word: &str) -> Option<String> {
+    let word = word.trim().to_ascii_lowercase();
+    matches!(word.as_str(), "low" | "medium" | "high").then_some(word)
 }
 
 impl AliasConfig {
@@ -47,6 +54,7 @@ impl AliasConfig {
             weekly_free: row.get("weekly_free").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
             premium_bypass: row.get("premium_bypass").and_then(|v| v.as_i64()).unwrap_or(0) != 0,
             daily_limit: row.get("daily_limit").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
+            reasoning: row.get("reasoning").and_then(|v| v.as_str()).and_then(reasoning_effort),
             version: row.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
         })
     }
@@ -464,13 +472,22 @@ pub fn build_anthropic_body(cfg: &AliasConfig, system: &str, turns: &[Turn]) -> 
         "system": system,
         "messages": messages,
     });
-    if let Some(schema) = &cfg.response_schema {
-        body["tools"] = json!([{
-            "name": ANTHROPIC_TOOL_NAME,
-            "description": "Return the answer in the required structure.",
-            "input_schema": schema,
-        }]);
-        body["tool_choice"] = json!({ "type": "tool", "name": ANTHROPIC_TOOL_NAME });
+    match (&cfg.response_schema, &cfg.reasoning) {
+        (Some(schema), Some(effort)) => {
+            body["output_config"] = json!({ "effort": effort, "format": { "type": "json_schema", "schema": schema } });
+        }
+        (Some(schema), None) => {
+            body["tools"] = json!([{
+                "name": ANTHROPIC_TOOL_NAME,
+                "description": "Return the answer in the required structure.",
+                "input_schema": schema,
+            }]);
+            body["tool_choice"] = json!({ "type": "tool", "name": ANTHROPIC_TOOL_NAME });
+        }
+        (None, Some(effort)) => {
+            body["output_config"] = json!({ "effort": effort });
+        }
+        (None, None) => {}
     }
     body
 }
@@ -624,6 +641,7 @@ mod tests {
             weekly_free: 3,
             premium_bypass: true,
             daily_limit: 0,
+            reasoning: None,
             version: 7,
         }
     }
@@ -939,6 +957,32 @@ mod tests {
         let b = build_openai_body(&c, "SYS", &compose_turns(&[], "hello"));
         assert!(b.get("temperature").is_none());
         assert_eq!(b["reasoning_effort"], "minimal");
+    }
+
+    #[test]
+    fn an_alias_that_reasons_asks_for_a_structured_output_instead_of_a_forced_tool() {
+        let mut c = cfg();
+        c.model = "claude-haiku-5-5".to_string();
+        c.reasoning = Some("medium".to_string());
+        let b = build_anthropic_body(&c, "SYS", &compose_turns(&[], "hello"));
+        assert_eq!(b["output_config"]["effort"], "medium");
+        assert_eq!(b["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(b["output_config"]["format"]["schema"], c.response_schema.clone().unwrap());
+        assert!(b.get("tools").is_none());
+        assert!(b.get("tool_choice").is_none());
+        c.response_schema = None;
+        let plain = build_anthropic_body(&c, "SYS", &compose_turns(&[], "hello"));
+        assert_eq!(plain["output_config"], json!({ "effort": "medium" }));
+    }
+
+    #[test]
+    fn only_the_three_efforts_are_reasoning_words() {
+        assert_eq!(reasoning_effort(" Medium "), Some("medium".to_string()));
+        assert_eq!(reasoning_effort("low"), Some("low".to_string()));
+        assert_eq!(reasoning_effort("high"), Some("high".to_string()));
+        for wrong in ["", "max", "xhigh", "on", "adaptive"] {
+            assert_eq!(reasoning_effort(wrong), None, "{wrong}");
+        }
     }
 
     #[test]
