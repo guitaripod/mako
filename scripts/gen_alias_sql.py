@@ -2,7 +2,8 @@
 """Write the SQL that seeds one app's rows of the mako table chat_aliases.
 
 An alias row holds the instructions and the shape of the reply on the service, so the app sends only the facts and
-a model call can do one job (roadmap decision D39). The rows are data, inserted by the operator and never by a
+a model call can do one job (roadmap decision D39). An alias that looks at pictures says how many it takes in
+max_images (0 when left out). The rows are data, inserted by the operator and never by a
 migration. Each app keeps a folder with aliases.json (the tenant's app_id, the model, and each alias with its limits
 and reply schema) and prompts/<alias>.txt (its instructions). The SQL is idempotent: running it again updates the rows.
 
@@ -21,8 +22,9 @@ from pathlib import Path
 EM_DASH = "—"
 COLUMNS = [
     "app_id", "alias", "model", "system_prompt", "response_schema", "max_tokens", "temperature", "flat_credits",
-    "weekly_free", "premium_bypass", "daily_limit", "reasoning", "version",
+    "weekly_free", "premium_bypass", "daily_limit", "reasoning", "max_images", "version",
 ]
+MOST_IMAGES = 4
 
 
 def sql_string(value):
@@ -56,6 +58,8 @@ def problems(catalog, folder):
         for limit in ("max_tokens", "weekly_free", "daily_limit", "flat_credits", "version"):
             if not isinstance(entry.get(limit), int) or entry[limit] < 0:
                 found.append(f"{name}: {limit} must be a whole number")
+        if not isinstance(entry.get("max_images", 0), int) or not 0 <= entry.get("max_images", 0) <= MOST_IMAGES:
+            found.append(f"{name}: max_images must be a whole number from 0 to {MOST_IMAGES} when it is set")
     for path in sorted((folder / "prompts").glob("*.txt")):
         if path.stem not in seen:
             found.append(f"{path} belongs to no alias in aliases.json")
@@ -69,7 +73,8 @@ def row(catalog, entry, folder):
         sql_string(catalog["app_id"]), sql_string(entry["alias"]), sql_string(catalog["model"]), sql_string(prompt),
         sql_string(schema), str(entry["max_tokens"]), "NULL", str(entry["flat_credits"]), str(entry["weekly_free"]),
         "1" if entry["premium_bypass"] else "0", str(entry["daily_limit"]),
-        sql_string(entry["reasoning"]) if entry.get("reasoning") else "NULL", str(entry["version"]),
+        sql_string(entry["reasoning"]) if entry.get("reasoning") else "NULL", str(entry.get("max_images", 0)),
+        str(entry["version"]),
     ]
     updates = ", ".join(f"{column} = excluded.{column}" for column in COLUMNS[2:])
     return (

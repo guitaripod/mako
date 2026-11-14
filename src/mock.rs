@@ -127,6 +127,7 @@ mod tests {
             premium_bypass: false,
             daily_limit: 0,
             reasoning: None,
+            max_images: 0,
             version: 1,
         }
     }

@@ -36,7 +36,9 @@ A tenant can have a share of its own: `apps.anthropic_daily_micro_usd` (milliont
 that tenant alone once its own calls have cost that much, counted under the provider name `anthropic:<app_id>`, so one
 app's allowance can never use up what the others share. Crucible's is 0.75 dollars. And an alias row can cap one
 person: `chat_aliases.daily_limit` answered calls per UTC day (0 for none), counted in `daily_usage` whoever pays, with
-`429 daily_limit_reached` and a `Retry-After` that counts down to midnight UTC. Read the figures:
+`429 daily_limit_reached` and a `Retry-After` that counts down to midnight UTC. An alias row that sets
+`chat_aliases.max_images` (migration 045; 0 for none) lets a call carry that many pictures in `images` for the model to
+look at; they are never stored. Read the figures:
 
 ```sh
 npx wrangler d1 execute openai-image-proxy --remote \

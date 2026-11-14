@@ -3,7 +3,8 @@ use serde_json::{json, Value};
 use worker::{D1Database, Env, Fetch, Headers, Method, Request, RequestInit, Response};
 use crate::auth::AuthedUser;
 use crate::chat_alias::{
-    build_anthropic_body, build_gemini_body, build_openai_body, compose_system_prompt, compose_turns,
+    attach_images_anthropic, attach_images_gemini, attach_images_openai, build_anthropic_body, build_gemini_body,
+    build_openai_body, check_images, compose_system_prompt, compose_turns,
     free_remaining, key_replay_is_free, ledger_reference, needs_premium_check, parse_alias_request,
     parse_anthropic_reply, parse_gemini_reply, parse_openai_reply, plan_after_lost_weekly_race, plan_charge,
     week_key, week_start, AliasConfig, AliasRequest, ChargeKind, ChargePlan, Reply, ReplyError, Settlement, Turn,
@@ -22,6 +23,7 @@ pub async fn handle(env: &Env, db: &D1Database, auth: &AuthedUser, body: &Value)
     let cfg = load_alias(db, &auth.app_id, &request.alias)
         .await?
         .ok_or_else(|| AppError::BadRequest("Unknown alias".to_string()))?;
+    check_images(&cfg, &request).map_err(AppError::BadRequest)?;
 
     check_and_acquire_lock(&auth.app_id, &auth.user_id, db)
         .await
@@ -55,7 +57,7 @@ async fn run(
 
     let system = compose_system_prompt(&cfg.system_prompt, request.language.as_deref());
     let turns = compose_turns(&request.messages, &request.input);
-    let reply = call_provider(env, db, &auth.app_id, cfg, &system, &turns).await?;
+    let reply = call_provider(env, db, &auth.app_id, cfg, &system, &turns, &request.images).await?;
     count_toward_daily_limit(db, auth, cfg, &today).await;
 
     let mut consumed_weekly = false;
@@ -156,7 +158,7 @@ async fn load_alias(db: &D1Database, app_id: &str, alias: &str) -> Result<Option
     let row = db
         .prepare(
             "SELECT alias, model, system_prompt, response_schema, max_tokens, temperature, flat_credits,
-                    weekly_free, premium_bypass, daily_limit, reasoning, version
+                    weekly_free, premium_bypass, daily_limit, reasoning, max_images, version
              FROM chat_aliases WHERE app_id = ?1 AND alias = ?2",
         )
         .bind(&[app_id.into(), alias.into()])?
@@ -346,6 +348,7 @@ async fn call_provider(
     cfg: &AliasConfig,
     system: &str,
     turns: &[Turn],
+    images: &[String],
 ) -> Result<Reply, AppError> {
     if crate::mock::enabled(env) {
         return crate::mock::alias_reply(cfg, turns).map_err(reply_error);
@@ -366,16 +369,22 @@ async fn call_provider(
     let (route, body, label): (Route, Value, &str) = match provider {
         Provider::Gemini => {
             headers.set("x-goog-api-key", &api_key)?;
-            (routing.route(&provider, &format!("{}:generateContent", cfg.model)), build_gemini_body(cfg, system, turns), "Gemini")
+            let mut body = build_gemini_body(cfg, system, turns);
+            attach_images_gemini(&mut body, images);
+            (routing.route(&provider, &format!("{}:generateContent", cfg.model)), body, "Gemini")
         }
         Provider::OpenAI => {
             headers.set("Authorization", &format!("Bearer {}", api_key))?;
-            (routing.route(&provider, OPENAI_CHAT_TAIL), build_openai_body(cfg, system, turns), "OpenAI")
+            let mut body = build_openai_body(cfg, system, turns);
+            attach_images_openai(&mut body, images);
+            (routing.route(&provider, OPENAI_CHAT_TAIL), body, "OpenAI")
         }
         Provider::Anthropic => {
             headers.set("x-api-key", &api_key)?;
             headers.set("anthropic-version", ANTHROPIC_VERSION)?;
-            (routing.route(&provider, ANTHROPIC_MESSAGES_TAIL), build_anthropic_body(cfg, system, turns), "Anthropic")
+            let mut body = build_anthropic_body(cfg, system, turns);
+            attach_images_anthropic(&mut body, images);
+            (routing.route(&provider, ANTHROPIC_MESSAGES_TAIL), body, "Anthropic")
         }
     };
     route.apply(&headers)?;

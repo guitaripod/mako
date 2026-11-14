@@ -808,6 +808,10 @@ paths:
         token limit answers 422 with code `truncated` and is not charged. The response
         adds `free_remaining` (the weekly bucket left, or null), `alias` and `version`.
         An unknown alias is 400. Requests without `alias` behave exactly as before.
+        An alias whose row sets `max_images` also takes `images`: up to that many pictures
+        (four at most), each a `data:` URL or bare base64 of a JPEG, PNG, WebP or GIF of at
+        most 700,000 characters, which join the caller's turn for the model to look at and
+        are not stored. Pictures on an alias that takes none, or too many, are 400.
       tags: [Capabilities]
       parameters:
         - $ref: '#/components/parameters/AppId'

@@ -11,6 +11,12 @@ const MAX_INPUT_CHARS: usize = 60_000;
 const MAX_PRIOR_TURNS: usize = 24;
 const MAX_TURN_CHARS: usize = 20_000;
 const MAX_LANGUAGE_LEN: usize = 64;
+/// The most pictures one alias call may carry, whatever its row allows.
+const MAX_IMAGES: usize = 4;
+/// The longest picture accepted, in base64 characters: about half a megabyte of JPEG, far more than a picture
+/// downsized for reading needs.
+const MAX_IMAGE_CHARS: usize = 700_000;
+const IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 
 /// One row of `chat_aliases`: everything the server decides about a named
 /// prompt, so the client sends only the alias and its input.
@@ -27,6 +33,8 @@ pub struct AliasConfig {
     pub premium_bypass: bool,
     pub daily_limit: u32,
     pub reasoning: Option<String>,
+    /// How many pictures a call of this alias may carry beside its input. 0, the default, is none.
+    pub max_images: u32,
     pub version: i64,
 }
 
@@ -55,6 +63,7 @@ impl AliasConfig {
             premium_bypass: row.get("premium_bypass").and_then(|v| v.as_i64()).unwrap_or(0) != 0,
             daily_limit: row.get("daily_limit").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
             reasoning: row.get("reasoning").and_then(|v| v.as_str()).and_then(reasoning_effort),
+            max_images: row.get("max_images").and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, MAX_IMAGES as i64) as u32,
             version: row.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
         })
     }
@@ -80,6 +89,8 @@ pub struct AliasRequest {
     pub language: Option<String>,
     pub idempotency_key: String,
     pub retry_of: Option<String>,
+    /// Pictures for the model to look at beside the input, each a `data:` URL or bare base64.
+    pub images: Vec<String>,
 }
 
 /// True when the body is an alias request: it carries a non-null `alias`.
@@ -126,7 +137,56 @@ pub fn parse_alias_request(body: &Value) -> Result<AliasRequest, String> {
         language,
         idempotency_key,
         retry_of,
+        images: parse_images(body.get("images"))?,
     })
+}
+
+fn parse_images(value: Option<&Value>) -> Result<Vec<String>, String> {
+    let items = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err("images must be an array".to_string()),
+    };
+    if items.len() > MAX_IMAGES {
+        return Err("images has too many pictures".to_string());
+    }
+    items
+        .iter()
+        .map(|item| {
+            let image = item.as_str().filter(|s| !s.is_empty()).ok_or_else(|| "an image must be a non-empty string".to_string())?;
+            if image.len() > MAX_IMAGE_CHARS {
+                return Err("an image is too large".to_string());
+            }
+            let (media_type, data) = image_parts(image);
+            if !IMAGE_TYPES.contains(&media_type) || data.is_empty() {
+                return Err("an image must be JPEG, PNG, WebP or GIF in base64".to_string());
+            }
+            Ok(image.to_string())
+        })
+        .collect()
+}
+
+/// The media type and the base64 of a picture sent as `data:<type>;base64,<data>`, or as bare base64, which is
+/// read as JPEG. A `data:` URL in any other form has no data.
+pub fn image_parts(image: &str) -> (&str, &str) {
+    match image.strip_prefix("data:") {
+        None => ("image/jpeg", image),
+        Some(rest) => match rest.split_once(";base64,") {
+            Some((media_type, data)) => (media_type, data),
+            None => ("", ""),
+        },
+    }
+}
+
+/// Refuses pictures on an alias whose row takes none, and more than its row takes.
+pub fn check_images(cfg: &AliasConfig, request: &AliasRequest) -> Result<(), String> {
+    if request.images.len() as u32 <= cfg.max_images {
+        Ok(())
+    } else if cfg.max_images == 0 {
+        Err("This alias takes no images".to_string())
+    } else {
+        Err("Too many images for this alias".to_string())
+    }
 }
 
 fn string_field(body: &Value, name: &str) -> Result<String, String> {
@@ -492,6 +552,44 @@ pub fn build_anthropic_body(cfg: &AliasConfig, system: &str, turns: &[Turn]) -> 
     body
 }
 
+/// Puts the pictures before the text of the last turn of an Anthropic body, which is the caller's input.
+pub fn attach_images_anthropic(body: &mut Value, images: &[String]) {
+    let Some(content) = body["messages"].as_array_mut().and_then(|m| m.last_mut()).and_then(|m| m["content"].as_array_mut()) else {
+        return;
+    };
+    for (index, image) in images.iter().enumerate() {
+        let (media_type, data) = image_parts(image);
+        content.insert(index, json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data } }));
+    }
+}
+
+/// Makes the last turn of an OpenAI body its text followed by the pictures.
+pub fn attach_images_openai(body: &mut Value, images: &[String]) {
+    let Some(last) = body["messages"].as_array_mut().and_then(|m| m.last_mut()) else {
+        return;
+    };
+    if images.is_empty() {
+        return;
+    }
+    let mut parts = vec![json!({ "type": "text", "text": last["content"].as_str().unwrap_or_default() })];
+    for image in images {
+        let (media_type, data) = image_parts(image);
+        parts.push(json!({ "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", media_type, data) } }));
+    }
+    last["content"] = Value::Array(parts);
+}
+
+/// Puts the pictures before the text of the last turn of a Gemini body.
+pub fn attach_images_gemini(body: &mut Value, images: &[String]) {
+    let Some(parts) = body["contents"].as_array_mut().and_then(|c| c.last_mut()).and_then(|c| c["parts"].as_array_mut()) else {
+        return;
+    };
+    for (index, image) in images.iter().enumerate() {
+        let (media_type, data) = image_parts(image);
+        parts.insert(index, json!({ "inlineData": { "mimeType": media_type, "data": data } }));
+    }
+}
+
 /// A provider's answer reduced to what the handler needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -642,6 +740,7 @@ mod tests {
             premium_bypass: true,
             daily_limit: 0,
             reasoning: None,
+            max_images: 0,
             version: 7,
         }
     }
@@ -686,6 +785,78 @@ mod tests {
         assert!(parse_alias_request(&body(json!({ "alias": "bad alias!" }))).is_err());
         assert!(parse_alias_request(&body(json!({ "retry_of": 4 }))).is_err());
         assert!(parse_alias_request(&body(json!({ "input": "x".repeat(MAX_INPUT_CHARS + 1) }))).is_err());
+    }
+
+    #[test]
+    fn pictures_parse_as_data_urls_or_bare_base64_and_nothing_else() {
+        let none = parse_alias_request(&body(json!({}))).unwrap();
+        assert!(none.images.is_empty());
+        let two = parse_alias_request(&body(json!({ "images": ["data:image/png;base64,AAAA", "BBBB"] }))).unwrap();
+        assert_eq!(two.images.len(), 2);
+        assert_eq!(image_parts(&two.images[0]), ("image/png", "AAAA"));
+        assert_eq!(image_parts(&two.images[1]), ("image/jpeg", "BBBB"));
+        assert!(parse_alias_request(&body(json!({ "images": "AAAA" }))).is_err());
+        assert!(parse_alias_request(&body(json!({ "images": [5] }))).is_err());
+        assert!(parse_alias_request(&body(json!({ "images": [""] }))).is_err());
+        assert!(parse_alias_request(&body(json!({ "images": ["data:text/html;base64,AAAA"] }))).is_err());
+        assert!(parse_alias_request(&body(json!({ "images": ["data:image/png,AAAA"] }))).is_err());
+        assert!(parse_alias_request(&body(json!({ "images": ["A", "B", "C", "D", "E"] }))).is_err());
+        assert!(parse_alias_request(&body(json!({ "images": ["A".repeat(MAX_IMAGE_CHARS + 1)] }))).is_err());
+    }
+
+    #[test]
+    fn an_alias_takes_only_as_many_pictures_as_its_row_allows() {
+        let with_one = parse_alias_request(&body(json!({ "images": ["AAAA"] }))).unwrap();
+        let without = parse_alias_request(&body(json!({}))).unwrap();
+        assert_eq!(check_images(&cfg(), &without), Ok(()));
+        assert_eq!(check_images(&cfg(), &with_one), Err("This alias takes no images".to_string()));
+        let one = AliasConfig { max_images: 1, ..cfg() };
+        assert_eq!(check_images(&one, &with_one), Ok(()));
+        let two = parse_alias_request(&body(json!({ "images": ["AAAA", "BBBB"] }))).unwrap();
+        assert_eq!(check_images(&one, &two), Err("Too many images for this alias".to_string()));
+        assert_eq!(AliasConfig::from_row(&json!({ "alias": "a", "model": "m", "system_prompt": "s" })).unwrap().max_images, 0);
+        assert_eq!(AliasConfig::from_row(&json!({ "alias": "a", "model": "m", "system_prompt": "s", "max_images": 9 })).unwrap().max_images, 4);
+    }
+
+    #[test]
+    fn pictures_join_the_callers_turn_for_every_provider() {
+        let turns = compose_turns(&[Turn { role: Role::User, content: "earlier".to_string() }, Turn { role: Role::Assistant, content: "answer".to_string() }], "look at this");
+        let images = vec!["data:image/png;base64,AAAA".to_string(), "BBBB".to_string()];
+
+        let mut anthropic = build_anthropic_body(&AliasConfig { model: "claude-haiku-5-5".to_string(), ..cfg() }, "sys", &turns);
+        attach_images_anthropic(&mut anthropic, &images);
+        let last = anthropic["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["content"][0], json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" } }));
+        assert_eq!(last["content"][1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(last["content"][2], json!({ "type": "text", "text": "look at this" }));
+        assert_eq!(anthropic["messages"][0]["content"].as_array().unwrap().len(), 1);
+
+        let mut openai = build_openai_body(&AliasConfig { model: "gpt-5-mini".to_string(), ..cfg() }, "sys", &turns);
+        attach_images_openai(&mut openai, &images);
+        let last = openai["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["content"][0], json!({ "type": "text", "text": "look at this" }));
+        assert_eq!(last["content"][1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(last["content"][2]["image_url"]["url"], "data:image/jpeg;base64,BBBB");
+        assert_eq!(openai["messages"][1]["content"], "earlier");
+
+        let mut gemini = build_gemini_body(&cfg(), "sys", &turns);
+        attach_images_gemini(&mut gemini, &images);
+        let last = gemini["contents"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["parts"][0], json!({ "inlineData": { "mimeType": "image/png", "data": "AAAA" } }));
+        assert_eq!(last["parts"][2], json!({ "text": "look at this" }));
+    }
+
+    #[test]
+    fn a_body_without_pictures_is_left_as_it_was() {
+        let turns = compose_turns(&[], "just text");
+        let built = build_openai_body(&AliasConfig { model: "gpt-5-mini".to_string(), ..cfg() }, "sys", &turns);
+        let mut same = built.clone();
+        attach_images_openai(&mut same, &[]);
+        assert_eq!(same, built);
+        let built = build_anthropic_body(&AliasConfig { model: "claude-haiku-5-5".to_string(), ..cfg() }, "sys", &turns);
+        let mut same = built.clone();
+        attach_images_anthropic(&mut same, &[]);
+        assert_eq!(same, built);
     }
 
     #[test]
