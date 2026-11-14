@@ -86,4 +86,10 @@ mod tests {
         assert_eq!(d1.int("SELECT anthropic_daily_micro_usd FROM apps WHERE app_id = 'crucible'", &[]), 750_000);
         assert_eq!(d1.int("SELECT new_user_free_credits FROM apps WHERE app_id = 'crucible'", &[]), 0);
     }
+
+    #[test]
+    fn the_pixie_tenant_has_its_own_ceiling_for_its_free_photo_ideas() {
+        let d1 = LocalD1::migrated();
+        assert_eq!(d1.int("SELECT anthropic_daily_micro_usd FROM apps WHERE app_id = 'pixie'", &[]), 500_000);
+    }
 }
