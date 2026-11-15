@@ -110,6 +110,12 @@ pub async fn forget_expired(db: &impl D1Exec, now: DateTime<Utc>) -> Result<u64,
 /// Opens a new account's balance: the welcome bonus and an open runway for an identity that never spent its free start
 /// in the tenant, a zero balance and an ended runway for one that did.
 pub async fn open_new_account(db: &D1Database, app_id: &str, user_id: &str) -> worker::Result<()> {
+    open_new_account_on_device(db, app_id, user_id, false).await.map(|_| ())
+}
+
+/// `open_new_account` for a device whose DeviceCheck bit may already say it had the free start
+/// (`crate::device_bits`). Returns whether the account got the free start.
+pub async fn open_new_account_on_device(db: &D1Database, app_id: &str, user_id: &str, spent_on_device: bool) -> worker::Result<bool> {
     let rows = db
         .rows("SELECT provider, provider_id FROM users WHERE id = ?1 AND app_id = ?2", &[user_id.into(), app_id.into()])
         .await?;
@@ -118,13 +124,15 @@ pub async fn open_new_account(db: &D1Database, app_id: &str, user_id: &str) -> w
         Some((provider, provider_id)) => is_returning(db, app_id, provider, provider_id).await?,
         None => false,
     };
-    if !returning {
-        return crate::credits::initialize_user_credits(app_id, user_id, db).await;
+    if !returning && !spent_on_device {
+        crate::credits::initialize_user_credits(app_id, user_id, db).await?;
+        return Ok(true);
     }
     crate::credits::open_user_credits(app_id, user_id, db).await?;
     end_runway(db, app_id, user_id).await?;
-    worker::console_log!("New user {} in {} is a returning identity: no free start", user_id, app_id);
-    Ok(())
+    let why = if returning { "a returning identity" } else { "a device whose DeviceCheck bit is set" };
+    worker::console_log!("New user {} in {} is {}: no free start", user_id, app_id, why);
+    Ok(false)
 }
 
 #[cfg(test)]

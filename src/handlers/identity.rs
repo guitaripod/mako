@@ -108,7 +108,7 @@ async fn anonymous_register_inner(
 
     if body.unverified == Some(true) {
         let device_id = verify_unverified(&ctx, body.device_id.as_deref())?;
-        let (user_id, api_key) = create_or_reuse_anonymous(&db, &app_id, &device_id).await?;
+        let (user_id, api_key, _) = create_or_reuse_anonymous(&db, &app_id, &device_id, false).await?;
         return Response::from_json(&IdentityResponse { api_key, user_id }).map_err(AppError::from);
     }
 
@@ -126,6 +126,11 @@ async fn register_with_devicecheck(
     Err(AppError::InternalError("DeviceCheck is not supported on Windows servers".to_string()))
 }
 
+/// Registers a genuine Apple device: Apple validates the DeviceCheck token, so emulators and scripts cannot register.
+/// The account is idempotent per app and Keychain device id (the unique index on app, provider and provider id makes
+/// the first insert win). When the tenant claims a DeviceCheck bit, the free start is also once per physical device:
+/// a set bit opens the new account without it, and a free start granted sets the bit
+/// (`crate::device_bits`). Apple not answering the bits never fails a registration.
 #[cfg(not(target_os = "windows"))]
 async fn register_with_devicecheck(
     ctx: &RouteContext<()>,
@@ -136,16 +141,38 @@ async fn register_with_devicecheck(
 ) -> std::result::Result<Response, AppError> {
     let cfg = DeviceCheckConfig::load(ctx)?;
     let jwt = cfg.sign_jwt()?;
+    let host = cfg.validate_device(&jwt, device_token).await?;
 
-    // Gate: prove this request comes from a genuine Apple device (blocks
-    // emulator/script farming). Apple performs the verification server-side.
-    cfg.validate_device(&jwt, device_token).await?;
+    let claim = free_start_bit(db, app_id).await;
+    let bits = match claim {
+        Some(_) => cfg.read_bits(host, &jwt, device_token).await,
+        None => None,
+    };
+    let spent_on_device = match (claim, &bits) {
+        (Some(bit), Some(state)) => crate::device_bits::free_start_spent(state, bit, Utc::now()),
+        _ => false,
+    };
 
-    // Per-app, per-device idempotent grant. The unique index
-    // (app_id, provider, provider_id) makes first-insert-wins atomic, so a real
-    // device gets the free trial exactly once per app regardless of concurrency.
-    let (user_id, api_key) = create_or_reuse_anonymous(db, app_id, client_device_id).await?;
+    let (user_id, api_key, granted) = create_or_reuse_anonymous(db, app_id, client_device_id, spent_on_device).await?;
+    if granted {
+        if let (Some(bit), Some(state)) = (claim, &bits) {
+            cfg.write_bits(host, &jwt, device_token, crate::device_bits::with_free_start(state, bit)).await;
+        }
+    }
     Response::from_json(&IdentityResponse { api_key, user_id }).map_err(AppError::from)
+}
+
+/// The DeviceCheck bit the tenant claims for its free start, if any. A read that fails claims none.
+#[cfg(not(target_os = "windows"))]
+async fn free_start_bit(db: &D1Database, app_id: &str) -> Option<u8> {
+    use crate::wallet::d1::D1Exec;
+    match db.rows("SELECT devicecheck_free_start_bit FROM apps WHERE app_id = ?1", &[app_id.into()]).await {
+        Ok(rows) => crate::device_bits::claimed_bit(rows.first().and_then(|row| crate::wallet::d1::int(row, "devicecheck_free_start_bit"))),
+        Err(e) => {
+            console_log!("DeviceCheck bit claim of {} could not be read: {:?}", app_id, e);
+            None
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -252,7 +279,7 @@ impl DeviceCheckConfig {
     /// grant). If Apple is never reached on any host (transport error or 429
     /// throttle), the device is NOT at fault => 500 so the client retries, rather
     /// than a permanent 400 deny of a legitimate paying device.
-    async fn validate_device(&self, jwt: &str, device_token: &str) -> std::result::Result<(), AppError> {
+    async fn validate_device(&self, jwt: &str, device_token: &str) -> std::result::Result<&'static str, AppError> {
         let mut saw_http_response = false;
         let mut saw_unavailable = false;
         let mut last_status = 0u16;
@@ -270,7 +297,7 @@ impl DeviceCheckConfig {
 
             let status = resp.status_code();
             if (200..300).contains(&status) {
-                return Ok(());
+                return Ok(base);
             }
             if status == 429 {
                 console_log!("DeviceCheck throttled (429) on {}", base);
@@ -284,7 +311,43 @@ impl DeviceCheckConfig {
             console_log!("DeviceCheck non-2xx on {}: {}", base, crate::redact::provider_error_summary(status, &detail));
         }
 
-        validation_outcome(saw_http_response, saw_unavailable, last_status)
+        validation_outcome(saw_http_response, saw_unavailable, last_status).map(|_| self.bases[0])
+    }
+
+    /// The device's two bits from the host that validated its token. Anything but a 2xx answer reads as unknown, so
+    /// the registration goes on as if no bit were claimed.
+    async fn read_bits(&self, host: &str, jwt: &str, device_token: &str) -> Option<crate::device_bits::BitState> {
+        let body = self.request_body(device_token);
+        let mut resp = match self.post(host, jwt, "/v1/query_two_bits", &body).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                console_log!("DeviceCheck bits could not be read on {}: {:?}", host, e);
+                return None;
+            }
+        };
+        let status = resp.status_code();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            console_log!("DeviceCheck bits read non-2xx on {}: {}", host, crate::redact::provider_error_summary(status, &text));
+            return None;
+        }
+        Some(crate::device_bits::parse_query(&text))
+    }
+
+    /// Writes the device's two bits. A failure is logged: the free start was already granted.
+    async fn write_bits(&self, host: &str, jwt: &str, device_token: &str, bits: (bool, bool)) {
+        let mut body = self.request_body(device_token);
+        body["bit0"] = json!(bits.0);
+        body["bit1"] = json!(bits.1);
+        match self.post(host, jwt, "/v1/update_two_bits", &body).await {
+            Ok(mut resp) if !(200..300).contains(&resp.status_code()) => {
+                let status = resp.status_code();
+                let text = resp.text().await.unwrap_or_default();
+                console_log!("DeviceCheck bits write non-2xx on {}: {}", host, crate::redact::provider_error_summary(status, &text));
+            }
+            Ok(_) => {}
+            Err(e) => console_log!("DeviceCheck bits could not be written on {}: {:?}", host, e),
+        }
     }
 }
 
@@ -360,11 +423,14 @@ async fn fetch_apple_app_identity(db: &D1Database, app_id: &str) -> std::result:
 /// (app_id, provider, provider_id) via ON CONFLICT DO NOTHING: the free trial is
 /// granted only on the row that is actually inserted, so concurrent or repeated
 /// calls for the same device never double-grant.
+/// The anonymous user of a device id in the tenant, created when missing, with a new API key, and whether this call
+/// gave it the free start. `spent_on_device` opens a new user without the free start.
 async fn create_or_reuse_anonymous(
     db: &D1Database,
     app_id: &str,
     device_key: &str,
-) -> std::result::Result<(String, String), AppError> {
+    spent_on_device: bool,
+) -> std::result::Result<(String, String, bool), AppError> {
     let new_user_id = Uuid::new_v4().to_string();
     let creds = NewCredentials::generate();
     let now = Utc::now().to_rfc3339();
@@ -392,9 +458,9 @@ async fn create_or_reuse_anonymous(
     let inserted = result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0;
 
     if inserted {
-        crate::returning::open_new_account(db, app_id, &new_user_id).await?;
+        let granted = crate::returning::open_new_account_on_device(db, app_id, &new_user_id, spent_on_device).await?;
         console_log!("Created anonymous user: {}", new_user_id);
-        return Ok((new_user_id, creds.api_key));
+        return Ok((new_user_id, creds.api_key, granted));
     }
 
     let existing = db
@@ -411,7 +477,7 @@ async fn create_or_reuse_anonymous(
     crate::returning::end_runway_if_returning(db, app_id, ANON_PROVIDER, device_key, &user_id).await?;
     let api_key = issue_api_key(db, app_id, &user_id).await?;
     console_log!("Reusing anonymous user: {}", user_id);
-    Ok((user_id, api_key))
+    Ok((user_id, api_key, false))
 }
 
 pub async fn link(req: Request, ctx: RouteContext<()>) -> Result<Response> {

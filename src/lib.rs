@@ -31,6 +31,7 @@ mod spend;
 mod daily;
 mod midgar_token;
 mod returning;
+mod device_bits;
 pub mod wallet;
 
 use handlers::{images, gallery, r2, usage, oauth, oauth_apple, oauth_apple_callback, oauth_native, device_auth, identity};
