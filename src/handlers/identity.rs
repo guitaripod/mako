@@ -2,7 +2,7 @@ use worker::{Request, Response, RouteContext, Result, console_log, D1Database, F
 use crate::error::AppError;
 use crate::auth::{resolve_app_id, authenticate, authenticate_account, issue_api_key, validate_api_key};
 use crate::api_keys::NewCredentials;
-use crate::credits::{initialize_user_credits, get_user_balance};
+use crate::credits::{initialize_user_credits, open_user_credits, get_user_balance};
 use crate::ledgers::{Account, Ledgers};
 use crate::wallet::ops::Grant;
 use crate::wallet::Kind;
@@ -392,8 +392,7 @@ async fn create_or_reuse_anonymous(
     let inserted = result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0;
 
     if inserted {
-        initialize_user_credits(app_id, &new_user_id, db).await?;
-        console_log!("Created anonymous user: {}", new_user_id);
+        open_new_anonymous(db, app_id, device_key, &new_user_id).await?;
         return Ok((new_user_id, creds.api_key));
     }
 
@@ -411,6 +410,25 @@ async fn create_or_reuse_anonymous(
     let api_key = issue_api_key(db, app_id, &user_id).await?;
     console_log!("Reusing anonymous user: {}", user_id);
     Ok((user_id, api_key))
+}
+
+/// Opens a new anonymous user's balance. A device that deleted an account in the tenant before starts without the
+/// welcome bonus and with its runway already ended, so deleting and signing up again never buys another free start.
+async fn open_new_anonymous(
+    db: &D1Database,
+    app_id: &str,
+    device_key: &str,
+    user_id: &str,
+) -> std::result::Result<(), AppError> {
+    if crate::returning::is_returning(db, app_id, ANON_PROVIDER, device_key).await? {
+        open_user_credits(app_id, user_id, db).await?;
+        crate::returning::end_runway(db, app_id, user_id).await?;
+        console_log!("Created anonymous user {} for a returning device in {}: no free start", user_id, app_id);
+        return Ok(());
+    }
+    initialize_user_credits(app_id, user_id, db).await?;
+    console_log!("Created anonymous user: {}", user_id);
+    Ok(())
 }
 
 pub async fn link(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -587,6 +605,7 @@ pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Resp
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
+    remember_device(&db, &auth.app_id, &auth.user_id).await;
     if let Err(e) = Ledgers::new(&ctx.env, &db).erase_partition(&auth.account).await {
         return AppError::from(e).to_response();
     }
@@ -605,6 +624,15 @@ pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Resp
         .run()
         .await?;
     Response::from_json(&json!({ "deleted": true }))
+}
+
+/// Remembers the device of an account about to be deleted (`crate::returning`). A failure is logged and never stands in
+/// the way of the deletion the person asked for.
+async fn remember_device(db: &D1Database, app_id: &str, user_id: &str) {
+    let now = Utc::now().to_rfc3339();
+    if let Err(e) = crate::returning::remember(db, app_id, user_id, &now).await {
+        console_log!("Could not remember the device of deleted user {} in {}: {:?}", user_id, app_id, e);
+    }
 }
 
 /// Removes every image owned by `uid`: deletes each R2 object (best-effort, a

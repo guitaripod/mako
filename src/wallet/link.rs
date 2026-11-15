@@ -131,7 +131,8 @@ impl<D: D1Exec, W: WalletTransport> Linker<'_, D, W> {
 
     /// Resolves a request that carries only a Midgar token. The user is the oldest one linked to that Midgar ID in
     /// the tenant; a Midgar ID with none gets a `provider = 'midgar'` user and a `linked` row. The welcome bonus is
-    /// granted once per Midgar ID and tenant, and only to an attested device.
+    /// granted once per Midgar ID and tenant, and only to an attested device; a Midgar ID that deleted an account in the
+    /// tenant before gets neither the bonus nor a runway (`crate::returning`).
     pub async fn native_account(&self, app_id: &str, caller: &MidgarCaller) -> Result<Account, AppError> {
         if !links::tenant_exists(self.db, app_id).await? {
             return Err(AppError::Unauthorized("Invalid API key".to_string()));
@@ -141,7 +142,9 @@ impl<D: D1Exec, W: WalletTransport> Linker<'_, D, W> {
         }
         let now = Utc::now().to_rfc3339();
         let user_id = links::midgar_user(self.db, app_id, &caller.midgar_id, &now).await?;
-        if caller.tier == Tier::AppAttest {
+        if crate::returning::is_returning(self.db, app_id, "midgar", &caller.midgar_id).await? {
+            crate::returning::end_runway(self.db, app_id, &user_id).await?;
+        } else if caller.tier == Tier::AppAttest {
             self.welcome(app_id, &caller.midgar_id).await?;
         }
         links::insert_linked(self.db, app_id, &user_id, &caller.midgar_id, &now).await?;

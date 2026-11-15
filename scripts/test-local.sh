@@ -363,6 +363,23 @@ for key in "$NEW_KEY" "$SECOND_KEY" "$THIRD_KEY"; do
   call GET /v1/credits/balance "$key"
   check "no key of the deleted account authenticates" 401 "$STATUS"
 done
+check "account deletion remembers the device and nothing that names it" "1 0" "$(sql_value "SELECT deletions || ' ' || COUNT(*) FILTER (WHERE device_hash LIKE '%local-device%') FROM returning_devices WHERE app_id = 'dreameater'")"
+STATUS=$(register_local_device)
+RETURNING_KEY="$(json_get api_key)"
+RETURNING_ID="$(json_get user_id)"
+check "a device that deleted its account can sign up again" 200 "$STATUS"
+check "the returning device gets a new account" 1 "$(sql_value "SELECT COUNT(*) FROM users WHERE id = '$RETURNING_ID' AND id != '$NEW_ID'")"
+check "the returning device's account starts without the welcome bonus" "0 0" "$(sql_value "SELECT c.balance || ' ' || (SELECT COUNT(*) FROM credit_transactions t WHERE t.user_id = c.user_id) FROM user_credits c WHERE c.user_id = '$RETURNING_ID'")"
+check "the returning device's runway has already ended" "1970-01-01T00:00:00+00:00" "$(sql_value "SELECT started_at FROM runways WHERE user_id = '$RETURNING_ID'")"
+STATUS=$(curl -s -o "$BODY" -w '%{http_code}' -X POST "$BASE/v1/identity/anonymous" -H "X-App-ID: dreameater" -H "Content-Type: application/json" --data '{"unverified":true,"device_id":"local-device-fresh"}')
+FRESH_KEY="$(json_get api_key)"
+FRESH_ID="$(json_get user_id)"
+check "a device that never deleted an account still gets the welcome bonus and no runway yet" "$(sql_value "SELECT new_user_free_credits FROM apps WHERE app_id = 'dreameater'") 0" "$(sql_value "SELECT c.balance || ' ' || (SELECT COUNT(*) FROM runways r WHERE r.user_id = c.user_id) FROM user_credits c WHERE c.user_id = '$FRESH_ID'")"
+call DELETE /v1/identity "$RETURNING_KEY"
+check "the returning device can delete its account again" 200 "$STATUS"
+check "a second deletion counts on the same remembered device" 2 "$(sql_value "SELECT MAX(deletions) FROM returning_devices WHERE app_id = 'dreameater'")"
+call DELETE /v1/identity "$FRESH_KEY"
+check "the fresh device can delete its account" 200 "$STATUS"
 
 echo "== tenant spellings and the Midgar token"
 call_with_token() {
