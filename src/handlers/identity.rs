@@ -2,7 +2,7 @@ use worker::{Request, Response, RouteContext, Result, console_log, D1Database, F
 use crate::error::AppError;
 use crate::auth::{resolve_app_id, authenticate, authenticate_account, issue_api_key, validate_api_key};
 use crate::api_keys::NewCredentials;
-use crate::credits::{initialize_user_credits, open_user_credits, get_user_balance};
+use crate::credits::get_user_balance;
 use crate::ledgers::{Account, Ledgers};
 use crate::wallet::ops::Grant;
 use crate::wallet::Kind;
@@ -392,7 +392,8 @@ async fn create_or_reuse_anonymous(
     let inserted = result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0;
 
     if inserted {
-        open_new_anonymous(db, app_id, device_key, &new_user_id).await?;
+        crate::returning::open_new_account(db, app_id, &new_user_id).await?;
+        console_log!("Created anonymous user: {}", new_user_id);
         return Ok((new_user_id, creds.api_key));
     }
 
@@ -407,28 +408,10 @@ async fn create_or_reuse_anonymous(
     if user_id.is_empty() {
         return Err(AppError::InternalError("Anonymous user lookup failed".to_string()));
     }
+    crate::returning::end_runway_if_returning(db, app_id, ANON_PROVIDER, device_key, &user_id).await?;
     let api_key = issue_api_key(db, app_id, &user_id).await?;
     console_log!("Reusing anonymous user: {}", user_id);
     Ok((user_id, api_key))
-}
-
-/// Opens a new anonymous user's balance. A device that deleted an account in the tenant before starts without the
-/// welcome bonus and with its runway already ended, so deleting and signing up again never buys another free start.
-async fn open_new_anonymous(
-    db: &D1Database,
-    app_id: &str,
-    device_key: &str,
-    user_id: &str,
-) -> std::result::Result<(), AppError> {
-    if crate::returning::is_returning(db, app_id, ANON_PROVIDER, device_key).await? {
-        open_user_credits(app_id, user_id, db).await?;
-        crate::returning::end_runway(db, app_id, user_id).await?;
-        console_log!("Created anonymous user {} for a returning device in {}: no free start", user_id, app_id);
-        return Ok(());
-    }
-    initialize_user_credits(app_id, user_id, db).await?;
-    console_log!("Created anonymous user: {}", user_id);
-    Ok(())
 }
 
 pub async fn link(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -531,6 +514,7 @@ async fn relink_anonymous_to_apple(
     claims: &crate::handlers::oauth_native::AppleIdTokenClaims,
 ) -> std::result::Result<(), AppError> {
     let now = Utc::now().to_rfc3339();
+    let device_key = anonymous_device_key(db, app_id, user_id).await;
     let email = claims
         .email
         .clone()
@@ -558,7 +542,38 @@ async fn relink_anonymous_to_apple(
         ));
     }
 
+    if let Some(device_key) = device_key {
+        remember_carried_device(db, app_id, &device_key).await;
+    }
     Ok(())
+}
+
+/// The Keychain device id an anonymous user registered with, read before linking moves the row to another provider.
+async fn anonymous_device_key(db: &D1Database, app_id: &str, user_id: &str) -> Option<String> {
+    use crate::wallet::d1::D1Exec;
+    let rows = db
+        .rows(
+            "SELECT provider_id FROM users WHERE app_id = ?1 AND id = ?2 AND provider = ?3",
+            &[app_id.into(), user_id.into(), ANON_PROVIDER.into()],
+        )
+        .await
+        .ok()?;
+    rows.first().and_then(|row| crate::wallet::d1::text(row, "provider_id")).filter(|id| !id.is_empty()).map(str::to_string)
+}
+
+/// Remembers a device whose anonymous account, free start included, moved to a Sign in with Apple account, so signing
+/// out and registering the device anonymously again does not open a second free start. A failure is logged and never
+/// fails the link.
+async fn remember_carried_device(db: &D1Database, app_id: &str, device_key: &str) {
+    let now = Utc::now().to_rfc3339();
+    let result = match crate::returning::grants_free_start(db, app_id).await {
+        Ok(true) => crate::returning::remember_identity(db, app_id, ANON_PROVIDER, device_key, &now).await,
+        Ok(false) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        console_log!("Could not remember the device carried into an Apple account in {}: {:?}", app_id, e);
+    }
 }
 
 /// Every table with a `user_id` column that account deletion empties with
@@ -626,17 +641,28 @@ pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Resp
     Response::from_json(&json!({ "deleted": true }))
 }
 
-/// Remembers the device of an account about to be deleted, by its account row and by the Midgar ID of its wallet
+/// Remembers the identity of an account about to be deleted, by its account row and by the Midgar ID of its wallet
 /// (`crate::returning`). A failure is logged and never stands in the way of the deletion the person asked for.
 async fn remember_device(db: &D1Database, auth: &crate::auth::AuthedUser) {
     let now = Utc::now().to_rfc3339();
-    if let Err(e) = crate::returning::remember(db, &auth.app_id, &auth.user_id, &now).await {
-        console_log!("Could not remember the device of deleted user {} in {}: {:?}", auth.user_id, auth.app_id, e);
-    }
-    if let Account::Wallet { midgar_id, app_id, .. } = &auth.account {
-        if let Err(e) = crate::returning::remember_midgar(db, app_id, midgar_id, &now).await {
-            console_log!("Could not remember the Midgar ID of deleted user {} in {}: {:?}", auth.user_id, app_id, e);
+    let remembered = match crate::returning::remember(db, &auth.app_id, &auth.user_id, &now).await {
+        Ok(identity) => identity,
+        Err(e) => {
+            console_log!("Could not remember the identity of deleted user {} in {}: {:?}", auth.user_id, auth.app_id, e);
+            None
         }
+    };
+    let Account::Wallet { midgar_id, app_id, .. } = &auth.account else { return };
+    if remembered.as_ref().is_some_and(|(provider, id)| provider == "midgar" && id == midgar_id) {
+        return;
+    }
+    let result = match crate::returning::grants_free_start(db, app_id).await {
+        Ok(true) => crate::returning::remember_identity(db, app_id, "midgar", midgar_id, &now).await,
+        Ok(false) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        console_log!("Could not remember the Midgar ID of deleted user {} in {}: {:?}", auth.user_id, app_id, e);
     }
 }
 

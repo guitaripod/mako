@@ -2,7 +2,6 @@ use worker::{Request, Response, RouteContext, Result, console_log, Fetch, Method
 use crate::error::AppError;
 use crate::auth::{issue_api_key, resolve_app_id};
 use crate::api_keys::NewCredentials;
-use crate::credits::initialize_user_credits;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use chrono::Utc;
@@ -136,7 +135,7 @@ pub async fn google_token_auth(mut req: Request, ctx: RouteContext<()>) -> Resul
             .await?;
 
         // Initialize credits for new user
-        initialize_user_credits(&app_id, &new_user_id, &db).await?;
+        crate::returning::open_new_account(&db, &app_id, &new_user_id).await?;
 
         (new_user_id, creds.api_key, false)
     };
@@ -359,7 +358,7 @@ pub async fn apple_token_auth(mut req: Request, ctx: RouteContext<()>) -> Result
             .run()
             .await?;
 
-        initialize_user_credits(&app_id, &new_user_id, &db).await?;
+        crate::returning::open_new_account(&db, &app_id, &new_user_id).await?;
 
         (new_user_id, creds.api_key, false)
     };

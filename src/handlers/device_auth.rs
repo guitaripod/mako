@@ -2,7 +2,6 @@ use worker::{Request, Response, RouteContext, Result};
 use crate::error::AppError;
 use crate::auth::{issue_api_key, resolve_app_id};
 use crate::api_keys::NewCredentials;
-use crate::credits::initialize_user_credits;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -408,7 +407,7 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                     .await?;
 
                 // Initialize credits for new user
-                initialize_user_credits(&app_id, &new_user_id, &db).await?;
+                crate::returning::open_new_account(&db, &app_id, &new_user_id).await?;
 
                 (new_user_id, creds.api_key)
             }
@@ -516,7 +515,7 @@ pub async fn poll_device_token(mut req: Request, ctx: RouteContext<()>) -> Resul
                     .await?;
 
                 // Initialize credits for new user
-                initialize_user_credits(&app_id, &new_user_id, &db).await?;
+                crate::returning::open_new_account(&db, &app_id, &new_user_id).await?;
 
                 (new_user_id, creds.api_key)
             }

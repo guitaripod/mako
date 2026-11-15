@@ -55,6 +55,11 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         ledgers::Ledgers::new(&env, &db).run_wallet_cron().await;
         handlers::playstore::run_cron(&env, &db).await;
         retention::run_scheduled(&env, &db).await;
+        match returning::forget_expired(&db, chrono::Utc::now()).await {
+            Ok(n) if n > 0 => console_log!("forgot {} returning identities older than a year", n),
+            Ok(_) => {}
+            Err(e) => console_error!("forgetting expired returning identities failed: {:?}", e),
+        }
     }
 }
 

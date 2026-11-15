@@ -1,22 +1,28 @@
-//! Devices that deleted an account in a tenant (migration 046). A tenant's free start, the welcome bonus and the edit
-//! runway, is meant once per device, and the account row that proved a device had it is erased with the account. So
-//! the device is remembered as a one-way hash that names nothing else, and a new account from it starts without the
-//! free start.
+//! Identities whose free start in a tenant is spent (migrations 046 and 047). A tenant's free start, the welcome bonus
+//! and the edit runway, is meant once per identity: the device's anonymous Keychain id, its Midgar ID, or the Apple,
+//! Google or GitHub account it signs in with. Deleting an account erases the row that proved the free start was had,
+//! and linking an anonymous account to Apple moves that row off its device id, so either event remembers the identity
+//! as a one-way hash that names nothing else. A new account from a remembered identity starts without the free start.
+//! A hash is forgotten twelve months after the identity was last remembered, as the privacy policies say.
 
+use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
+use worker::D1Database;
 
 use crate::error::AppError;
-use crate::wallet::d1::{text, D1Exec};
+use crate::wallet::d1::{int, text, D1Exec};
 
-/// Providers whose `provider_id` is a device: the anonymous Keychain id or a device-bound Midgar ID. Accounts signed in
-/// another way belong to a person's sign-in, not a device, and are not remembered.
-const DEVICE_PROVIDERS: &[&str] = &["anonymous", "midgar"];
-
-/// A runway start long past, so the runway of a returning device's new account has already ended.
+/// A runway start long past, so the runway of a returning identity's new account has already ended.
 pub const ENDED_RUNWAY_START: &str = "1970-01-01T00:00:00+00:00";
 
-/// The one-way name of a device in a tenant.
-pub fn device_hash(app_id: &str, provider: &str, provider_id: &str) -> String {
+/// How long a remembered identity is kept after it was last remembered.
+pub const KEPT_FOR_DAYS: i64 = 365;
+
+/// The welcome credits a tenant without an `apps` row grants, as `credits::initialize_user_credits` does.
+const DEFAULT_WELCOME_CREDITS: i64 = 6;
+
+/// The one-way name of an identity in a tenant.
+pub fn identity_hash(app_id: &str, provider: &str, provider_id: &str) -> String {
     let mut hasher = Sha256::new();
     for part in [app_id, provider, provider_id] {
         hasher.update(part.as_bytes());
@@ -25,52 +31,57 @@ pub fn device_hash(app_id: &str, provider: &str, provider_id: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Remembers the device behind `user_id` before its account is deleted. Nothing is remembered for an account that is
-/// not a device's or that does not exist.
-pub async fn remember(db: &impl D1Exec, app_id: &str, user_id: &str, now: &str) -> Result<bool, AppError> {
+/// Whether the tenant gives new accounts anything for free, the only case in which an identity is worth remembering.
+pub async fn grants_free_start(db: &impl D1Exec, app_id: &str) -> Result<bool, AppError> {
+    let rows = db
+        .rows("SELECT new_user_free_credits, runway_days, runway_daily_edits FROM apps WHERE app_id = ?1", &[app_id.into()])
+        .await?;
+    let Some(row) = rows.first() else { return Ok(DEFAULT_WELCOME_CREDITS > 0) };
+    let welcome = int(row, "new_user_free_credits").unwrap_or(DEFAULT_WELCOME_CREDITS);
+    let runway = int(row, "runway_days").unwrap_or(0) > 0 && int(row, "runway_daily_edits").unwrap_or(0) > 0;
+    Ok(welcome > 0 || runway)
+}
+
+/// Remembers the identity of `user_id` before its account is deleted and returns it as provider and provider id.
+/// Nothing is remembered for a user that does not exist, has no provider id, or lives in a tenant without a free start.
+pub async fn remember(db: &impl D1Exec, app_id: &str, user_id: &str, now: &str) -> Result<Option<(String, String)>, AppError> {
     let rows = db
         .rows("SELECT provider, provider_id FROM users WHERE id = ?1 AND app_id = ?2", &[user_id.into(), app_id.into()])
         .await?;
-    let Some(row) = rows.first() else { return Ok(false) };
-    let (Some(provider), Some(provider_id)) = (text(row, "provider"), text(row, "provider_id")) else { return Ok(false) };
-    if !DEVICE_PROVIDERS.contains(&provider) || provider_id.is_empty() {
-        return Ok(false);
+    let Some(row) = rows.first() else { return Ok(None) };
+    let (Some(provider), Some(provider_id)) = (text(row, "provider"), text(row, "provider_id")) else { return Ok(None) };
+    if provider.is_empty() || provider_id.is_empty() || !grants_free_start(db, app_id).await? {
+        return Ok(None);
     }
-    record(db, app_id, provider, provider_id, now).await?;
-    Ok(true)
+    remember_identity(db, app_id, provider, provider_id, now).await?;
+    Ok(Some((provider.to_string(), provider_id.to_string())))
 }
 
-/// Remembers the Midgar ID whose wallet an account about to be deleted was linked to. The account row of a linked
-/// anonymous user names only its Keychain id, while the device keeps its Midgar ID after the deletion and could come
-/// back through it.
-pub async fn remember_midgar(db: &impl D1Exec, app_id: &str, midgar_id: &str, now: &str) -> Result<(), AppError> {
-    if midgar_id.is_empty() {
+/// Remembers one identity in a tenant whose free start it has spent. Repeating it counts the event and moves its time.
+pub async fn remember_identity(db: &impl D1Exec, app_id: &str, provider: &str, provider_id: &str, now: &str) -> Result<(), AppError> {
+    if provider_id.is_empty() {
         return Ok(());
     }
-    record(db, app_id, "midgar", midgar_id, now).await
-}
-
-async fn record(db: &impl D1Exec, app_id: &str, provider: &str, provider_id: &str, now: &str) -> Result<(), AppError> {
-    let hash = device_hash(app_id, provider, provider_id);
     db.exec(
         "INSERT INTO returning_devices (app_id, device_hash, first_deleted_at, last_deleted_at, deletions) VALUES (?1, ?2, ?3, ?3, 1)
          ON CONFLICT(app_id, device_hash) DO UPDATE SET last_deleted_at = ?3, deletions = deletions + 1",
-        &[app_id.into(), hash.into(), now.into()],
+        &[app_id.into(), identity_hash(app_id, provider, provider_id).into(), now.into()],
     )
     .await?;
     Ok(())
 }
 
-/// Whether the device once deleted an account in the tenant.
+/// Whether the identity spent its free start in the tenant before.
 pub async fn is_returning(db: &impl D1Exec, app_id: &str, provider: &str, provider_id: &str) -> Result<bool, AppError> {
-    let hash = device_hash(app_id, provider, provider_id);
+    let hash = identity_hash(app_id, provider, provider_id);
     let rows = db
         .rows("SELECT 1 AS found FROM returning_devices WHERE app_id = ?1 AND device_hash = ?2", &[app_id.into(), hash.into()])
         .await?;
     Ok(!rows.is_empty())
 }
 
-/// Ends the runway of a returning device's new account before its first edit can start it.
+/// Ends the runway of a returning identity's account before its first edit can start it. Safe to repeat: a runway
+/// already started is left as it is.
 pub async fn end_runway(db: &impl D1Exec, app_id: &str, user_id: &str) -> Result<(), AppError> {
     db.exec(
         "INSERT OR IGNORE INTO runways (app_id, user_id, started_at) VALUES (?1, ?2, ?3)",
@@ -80,29 +91,79 @@ pub async fn end_runway(db: &impl D1Exec, app_id: &str, user_id: &str) -> Result
     Ok(())
 }
 
+/// Ends the runway of an account that registration found already made, when its identity is a returning one. A
+/// registration that failed after inserting the user is retried into this path, which would otherwise leave the
+/// account an open runway.
+pub async fn end_runway_if_returning(db: &impl D1Exec, app_id: &str, provider: &str, provider_id: &str, user_id: &str) -> Result<(), AppError> {
+    if is_returning(db, app_id, provider, provider_id).await? {
+        end_runway(db, app_id, user_id).await?;
+    }
+    Ok(())
+}
+
+/// Forgets every identity last remembered before `now` minus `KEPT_FOR_DAYS`, and returns how many.
+pub async fn forget_expired(db: &impl D1Exec, now: DateTime<Utc>) -> Result<u64, AppError> {
+    let cutoff = (now - Duration::days(KEPT_FOR_DAYS)).to_rfc3339();
+    db.exec("DELETE FROM returning_devices WHERE last_deleted_at < ?1", &[cutoff.into()]).await
+}
+
+/// Opens a new account's balance: the welcome bonus and an open runway for an identity that never spent its free start
+/// in the tenant, a zero balance and an ended runway for one that did.
+pub async fn open_new_account(db: &D1Database, app_id: &str, user_id: &str) -> worker::Result<()> {
+    let rows = db
+        .rows("SELECT provider, provider_id FROM users WHERE id = ?1 AND app_id = ?2", &[user_id.into(), app_id.into()])
+        .await?;
+    let identity = rows.first().and_then(|row| Some((text(row, "provider")?.to_string(), text(row, "provider_id")?.to_string())));
+    let returning = match &identity {
+        Some((provider, provider_id)) => is_returning(db, app_id, provider, provider_id).await?,
+        None => false,
+    };
+    if !returning {
+        return crate::credits::initialize_user_credits(app_id, user_id, db).await;
+    }
+    crate::credits::open_user_credits(app_id, user_id, db).await?;
+    end_runway(db, app_id, user_id).await?;
+    worker::console_log!("New user {} in {} is a returning identity: no free start", user_id, app_id);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::edits::{runway_phase, RunwayPhase};
     use crate::wallet::testing::LocalD1;
-    use chrono::{DateTime, Utc};
+    use chrono::TimeZone;
     use futures::executor::block_on;
 
     const NOW: &str = "2026-11-15T06:01:00+00:00";
 
-    fn device_user(d1: &LocalD1, app_id: &str, user_id: &str, provider: &str, provider_id: &str) {
+    fn user(d1: &LocalD1, app_id: &str, user_id: &str, provider: &str, provider_id: &str) {
         d1.run(
             "INSERT INTO users (id, provider, provider_id, name, created_at, updated_at, app_id) VALUES (?1, ?2, ?3, 'T', ?4, ?4, ?5)",
             &[user_id.into(), provider.into(), provider_id.into(), NOW.into(), app_id.into()],
         );
     }
 
+    fn tenant(d1: &LocalD1, app_id: &str, welcome: i64, runway_days: i64) {
+        d1.run("DELETE FROM apps WHERE app_id = ?1", &[app_id.into()]);
+        d1.run(
+            "INSERT INTO apps (app_id, name, new_user_free_credits, runway_days, runway_daily_edits) VALUES (?1, ?1, ?2, ?3, 5)",
+            &[app_id.into(), welcome.into(), runway_days.into()],
+        );
+    }
+
+    fn rows(d1: &LocalD1) -> i64 {
+        d1.int("SELECT COUNT(*) FROM returning_devices", &[])
+    }
+
     #[test]
-    fn a_deleted_anonymous_device_returns_and_only_in_its_tenant() {
+    fn a_deleted_identity_returns_and_only_in_its_tenant_and_provider() {
         let d1 = LocalD1::migrated();
-        device_user(&d1, "pixie", "u1", "anonymous", "keychain-1");
+        tenant(&d1, "pixie", 65, 7);
+        user(&d1, "pixie", "u1", "anonymous", "keychain-1");
         assert!(!block_on(is_returning(&d1, "pixie", "anonymous", "keychain-1")).unwrap());
-        assert!(block_on(remember(&d1, "pixie", "u1", NOW)).unwrap());
+        let remembered = block_on(remember(&d1, "pixie", "u1", NOW)).unwrap();
+        assert_eq!(remembered, Some(("anonymous".to_string(), "keychain-1".to_string())));
         assert!(block_on(is_returning(&d1, "pixie", "anonymous", "keychain-1")).unwrap());
         assert!(!block_on(is_returning(&d1, "doublekick", "anonymous", "keychain-1")).unwrap());
         assert!(!block_on(is_returning(&d1, "pixie", "anonymous", "keychain-2")).unwrap());
@@ -110,68 +171,102 @@ mod tests {
     }
 
     #[test]
-    fn a_midgar_id_returns_too() {
+    fn every_sign_in_kind_is_remembered() {
         let d1 = LocalD1::migrated();
-        device_user(&d1, "pixie", "u1", "midgar", "mid-1");
-        assert!(block_on(remember(&d1, "pixie", "u1", NOW)).unwrap());
-        assert!(block_on(is_returning(&d1, "pixie", "midgar", "mid-1")).unwrap());
+        tenant(&d1, "pixie", 65, 7);
+        for (n, provider) in ["anonymous", "midgar", "apple", "google", "github"].iter().enumerate() {
+            let id = format!("u{n}");
+            user(&d1, "pixie", &id, provider, &format!("{provider}-id"));
+            assert!(block_on(remember(&d1, "pixie", &id, NOW)).unwrap().is_some(), "{provider}");
+            assert!(block_on(is_returning(&d1, "pixie", provider, &format!("{provider}-id"))).unwrap(), "{provider}");
+        }
+        assert_eq!(rows(&d1), 5);
     }
 
     #[test]
-    fn the_midgar_id_of_a_linked_anonymous_account_returns_too() {
+    fn a_tenant_without_a_free_start_remembers_nothing() {
         let d1 = LocalD1::migrated();
-        device_user(&d1, "pixie", "u1", "anonymous", "keychain-1");
-        block_on(remember(&d1, "pixie", "u1", NOW)).unwrap();
-        block_on(remember_midgar(&d1, "pixie", "mid-1", NOW)).unwrap();
-        block_on(remember_midgar(&d1, "pixie", "", NOW)).unwrap();
-        assert!(block_on(is_returning(&d1, "pixie", "anonymous", "keychain-1")).unwrap());
-        assert!(block_on(is_returning(&d1, "pixie", "midgar", "mid-1")).unwrap());
-        assert_eq!(d1.int("SELECT COUNT(*) FROM returning_devices", &[]), 2);
+        tenant(&d1, "crucible", 0, 0);
+        user(&d1, "crucible", "u1", "midgar", "mid-1");
+        assert_eq!(block_on(remember(&d1, "crucible", "u1", NOW)).unwrap(), None);
+        tenant(&d1, "runwayonly", 0, 7);
+        user(&d1, "runwayonly", "u2", "anonymous", "k");
+        assert!(block_on(remember(&d1, "runwayonly", "u2", NOW)).unwrap().is_some());
+        user(&d1, "noappsrow", "u3", "anonymous", "k");
+        assert!(block_on(remember(&d1, "noappsrow", "u3", NOW)).unwrap().is_some());
+        assert_eq!(rows(&d1), 2);
     }
 
     #[test]
-    fn a_signed_in_person_or_a_missing_user_is_not_remembered() {
+    fn a_missing_user_or_an_empty_id_is_not_remembered() {
         let d1 = LocalD1::migrated();
-        device_user(&d1, "pixie", "u1", "apple", "apple-sub");
-        assert!(!block_on(remember(&d1, "pixie", "u1", NOW)).unwrap());
-        assert!(!block_on(remember(&d1, "pixie", "nobody", NOW)).unwrap());
-        assert!(!block_on(remember(&d1, "doublekick", "u1", NOW)).unwrap());
-        assert_eq!(d1.int("SELECT COUNT(*) FROM returning_devices", &[]), 0);
+        tenant(&d1, "pixie", 65, 7);
+        user(&d1, "pixie", "u1", "anonymous", "");
+        assert_eq!(block_on(remember(&d1, "pixie", "u1", NOW)).unwrap(), None);
+        assert_eq!(block_on(remember(&d1, "pixie", "nobody", NOW)).unwrap(), None);
+        block_on(remember_identity(&d1, "pixie", "midgar", "", NOW)).unwrap();
+        assert_eq!(rows(&d1), 0);
     }
 
     #[test]
-    fn deletions_count_up_and_keep_the_first_time() {
+    fn repeats_count_up_and_keep_the_first_time() {
         let d1 = LocalD1::migrated();
-        device_user(&d1, "pixie", "u1", "anonymous", "keychain-1");
+        tenant(&d1, "pixie", 65, 7);
+        user(&d1, "pixie", "u1", "anonymous", "keychain-1");
         block_on(remember(&d1, "pixie", "u1", "2026-11-15T05:45:00+00:00")).unwrap();
         block_on(remember(&d1, "pixie", "u1", "2026-11-15T06:01:00+00:00")).unwrap();
         assert_eq!(d1.int("SELECT deletions FROM returning_devices", &[]), 2);
-        let first: String = d1.0.query_row("SELECT first_deleted_at FROM returning_devices", [], |r| r.get(0)).unwrap();
-        let last: String = d1.0.query_row("SELECT last_deleted_at FROM returning_devices", [], |r| r.get(0)).unwrap();
-        assert_eq!((first.as_str(), last.as_str()), ("2026-11-15T05:45:00+00:00", "2026-11-15T06:01:00+00:00"));
+        let times: (String, String) =
+            d1.0.query_row("SELECT first_deleted_at, last_deleted_at FROM returning_devices", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(times, ("2026-11-15T05:45:00+00:00".to_string(), "2026-11-15T06:01:00+00:00".to_string()));
     }
 
     #[test]
     fn the_hash_names_no_id_and_separates_its_parts() {
-        let hash = device_hash("pixie", "anonymous", "keychain-1");
+        let hash = identity_hash("pixie", "anonymous", "keychain-1");
         assert_eq!(hash.len(), 64);
         assert!(!hash.contains("keychain"));
-        assert_ne!(device_hash("pixie", "anonymous", "x"), device_hash("pixiea", "nonymous", "x"));
+        assert_ne!(identity_hash("pixie", "anonymous", "x"), identity_hash("pixiea", "nonymous", "x"));
     }
 
     #[test]
     fn an_ended_runway_is_over_and_a_started_one_is_kept() {
         let d1 = LocalD1::migrated();
-        device_user(&d1, "pixie", "u1", "anonymous", "keychain-1");
+        user(&d1, "pixie", "u1", "anonymous", "keychain-1");
         block_on(end_runway(&d1, "pixie", "u1")).unwrap();
         let start: String = d1.0.query_row("SELECT started_at FROM runways WHERE user_id = 'u1'", [], |r| r.get(0)).unwrap();
         let start = DateTime::parse_from_rfc3339(&start).unwrap().with_timezone(&Utc);
         let now = DateTime::parse_from_rfc3339(NOW).unwrap().with_timezone(&Utc);
         assert!(matches!(runway_phase(Some(start), now, 7), RunwayPhase::Ended));
 
-        device_user(&d1, "pixie", "u2", "anonymous", "keychain-2");
+        user(&d1, "pixie", "u2", "anonymous", "keychain-2");
         d1.run("INSERT INTO runways (app_id, user_id, started_at) VALUES ('pixie', 'u2', ?1)", &[NOW.into()]);
         block_on(end_runway(&d1, "pixie", "u2")).unwrap();
         assert_eq!(d1.int("SELECT COUNT(*) FROM runways WHERE user_id = 'u2' AND started_at = ?1", &[NOW.into()]), 1);
+    }
+
+    #[test]
+    fn a_retried_registration_of_a_returning_identity_still_ends_the_runway() {
+        let d1 = LocalD1::migrated();
+        user(&d1, "pixie", "u1", "anonymous", "keychain-1");
+        block_on(end_runway_if_returning(&d1, "pixie", "anonymous", "keychain-1", "u1")).unwrap();
+        assert_eq!(d1.int("SELECT COUNT(*) FROM runways WHERE user_id = 'u1'", &[]), 0);
+        block_on(remember_identity(&d1, "pixie", "anonymous", "keychain-1", NOW)).unwrap();
+        block_on(end_runway_if_returning(&d1, "pixie", "anonymous", "keychain-1", "u1")).unwrap();
+        assert_eq!(d1.int("SELECT COUNT(*) FROM runways WHERE user_id = 'u1' AND started_at = ?1", &[ENDED_RUNWAY_START.into()]), 1);
+    }
+
+    #[test]
+    fn an_identity_is_forgotten_a_year_after_it_was_last_remembered() {
+        let d1 = LocalD1::migrated();
+        block_on(remember_identity(&d1, "pixie", "anonymous", "old", "2025-11-01T00:00:00+00:00")).unwrap();
+        block_on(remember_identity(&d1, "pixie", "anonymous", "renewed", "2025-11-01T00:00:00+00:00")).unwrap();
+        block_on(remember_identity(&d1, "pixie", "anonymous", "renewed", "2026-11-01T00:00:00+00:00")).unwrap();
+        block_on(remember_identity(&d1, "pixie", "anonymous", "recent", NOW)).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 0, 0, 0).unwrap();
+        assert_eq!(block_on(forget_expired(&d1, now)).unwrap(), 1);
+        assert!(!block_on(is_returning(&d1, "pixie", "anonymous", "old")).unwrap());
+        assert!(block_on(is_returning(&d1, "pixie", "anonymous", "renewed")).unwrap());
+        assert!(block_on(is_returning(&d1, "pixie", "anonymous", "recent")).unwrap());
     }
 }
