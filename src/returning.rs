@@ -36,6 +36,21 @@ pub async fn remember(db: &impl D1Exec, app_id: &str, user_id: &str, now: &str) 
     if !DEVICE_PROVIDERS.contains(&provider) || provider_id.is_empty() {
         return Ok(false);
     }
+    record(db, app_id, provider, provider_id, now).await?;
+    Ok(true)
+}
+
+/// Remembers the Midgar ID whose wallet an account about to be deleted was linked to. The account row of a linked
+/// anonymous user names only its Keychain id, while the device keeps its Midgar ID after the deletion and could come
+/// back through it.
+pub async fn remember_midgar(db: &impl D1Exec, app_id: &str, midgar_id: &str, now: &str) -> Result<(), AppError> {
+    if midgar_id.is_empty() {
+        return Ok(());
+    }
+    record(db, app_id, "midgar", midgar_id, now).await
+}
+
+async fn record(db: &impl D1Exec, app_id: &str, provider: &str, provider_id: &str, now: &str) -> Result<(), AppError> {
     let hash = device_hash(app_id, provider, provider_id);
     db.exec(
         "INSERT INTO returning_devices (app_id, device_hash, first_deleted_at, last_deleted_at, deletions) VALUES (?1, ?2, ?3, ?3, 1)
@@ -43,7 +58,7 @@ pub async fn remember(db: &impl D1Exec, app_id: &str, user_id: &str, now: &str) 
         &[app_id.into(), hash.into(), now.into()],
     )
     .await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Whether the device once deleted an account in the tenant.
@@ -100,6 +115,18 @@ mod tests {
         device_user(&d1, "pixie", "u1", "midgar", "mid-1");
         assert!(block_on(remember(&d1, "pixie", "u1", NOW)).unwrap());
         assert!(block_on(is_returning(&d1, "pixie", "midgar", "mid-1")).unwrap());
+    }
+
+    #[test]
+    fn the_midgar_id_of_a_linked_anonymous_account_returns_too() {
+        let d1 = LocalD1::migrated();
+        device_user(&d1, "pixie", "u1", "anonymous", "keychain-1");
+        block_on(remember(&d1, "pixie", "u1", NOW)).unwrap();
+        block_on(remember_midgar(&d1, "pixie", "mid-1", NOW)).unwrap();
+        block_on(remember_midgar(&d1, "pixie", "", NOW)).unwrap();
+        assert!(block_on(is_returning(&d1, "pixie", "anonymous", "keychain-1")).unwrap());
+        assert!(block_on(is_returning(&d1, "pixie", "midgar", "mid-1")).unwrap());
+        assert_eq!(d1.int("SELECT COUNT(*) FROM returning_devices", &[]), 2);
     }
 
     #[test]

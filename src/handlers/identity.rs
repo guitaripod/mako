@@ -605,7 +605,7 @@ pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Resp
         Ok(a) => a,
         Err(e) => return e.to_response(),
     };
-    remember_device(&db, &auth.app_id, &auth.user_id).await;
+    remember_device(&db, &auth).await;
     if let Err(e) = Ledgers::new(&ctx.env, &db).erase_partition(&auth.account).await {
         return AppError::from(e).to_response();
     }
@@ -626,12 +626,17 @@ pub async fn delete_identity(req: Request, ctx: RouteContext<()>) -> Result<Resp
     Response::from_json(&json!({ "deleted": true }))
 }
 
-/// Remembers the device of an account about to be deleted (`crate::returning`). A failure is logged and never stands in
-/// the way of the deletion the person asked for.
-async fn remember_device(db: &D1Database, app_id: &str, user_id: &str) {
+/// Remembers the device of an account about to be deleted, by its account row and by the Midgar ID of its wallet
+/// (`crate::returning`). A failure is logged and never stands in the way of the deletion the person asked for.
+async fn remember_device(db: &D1Database, auth: &crate::auth::AuthedUser) {
     let now = Utc::now().to_rfc3339();
-    if let Err(e) = crate::returning::remember(db, app_id, user_id, &now).await {
-        console_log!("Could not remember the device of deleted user {} in {}: {:?}", user_id, app_id, e);
+    if let Err(e) = crate::returning::remember(db, &auth.app_id, &auth.user_id, &now).await {
+        console_log!("Could not remember the device of deleted user {} in {}: {:?}", auth.user_id, auth.app_id, e);
+    }
+    if let Account::Wallet { midgar_id, app_id, .. } = &auth.account {
+        if let Err(e) = crate::returning::remember_midgar(db, app_id, midgar_id, &now).await {
+            console_log!("Could not remember the Midgar ID of deleted user {} in {}: {:?}", auth.user_id, app_id, e);
+        }
     }
 }
 
