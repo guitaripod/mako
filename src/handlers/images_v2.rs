@@ -297,6 +297,7 @@ pub async fn handle_generation(mut req: Request, ctx: RouteContext<()>) -> Resul
         .run()
         .await?;
 
+    crate::spend::count_images(&db, &app_id, providers::provider_name(&served_model), &served_model, images_stored, usage).await;
     let _ = release_lock(&app_id, &user_id, &db).await;
 
     let response = ImageResponse {
@@ -587,6 +588,7 @@ pub async fn handle_edit(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         .run()
         .await?;
 
+    crate::spend::count_images(&db, &app_id, providers::provider_name(&served_model), &served_model, images_stored, usage).await;
     let _ = release_lock(&app_id, &user_id, &db).await;
 
     let response = ImageResponse {

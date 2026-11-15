@@ -1,6 +1,8 @@
 //! What a model provider has cost today, counted in millionths of a dollar from each call's token usage, and the
-//! ceiling that stops calls for the rest of the UTC day once that much is spent. Anthropic is the provider counted:
-//! its monthly credit carries features in every app (Midgar D39), and no per-user limit bounds the day's total.
+//! ceiling that stops calls for the rest of the UTC day once that much is spent. Anthropic is the provider with a
+//! ceiling: its monthly credit carries features in every app (Midgar D39), and no per-user limit bounds the day's
+//! total. Image requests to Gemini and OpenAI are counted too, without a ceiling, so a day's image spend stays
+//! readable after the accounts that asked are deleted with their usage records (2026-11-15).
 
 use chrono::{DateTime, Utc};
 use worker::{console_log, Env};
@@ -113,6 +115,45 @@ pub async fn refuse_anthropic_over_ceiling(env: &Env, db: &impl D1Exec, app_id: 
     }
 }
 
+/// What `images` images from a Gemini image model cost at the standard 1K price, in millionths of a dollar, as Google's
+/// AI Studio pricing page listed them on 2026-11-15. A model not listed costs nothing here, and its requests still count.
+pub fn gemini_image_micro_usd(model: &str, images: u32) -> u64 {
+    let each: u64 = match model {
+        "gemini-nano-banana-2.1" | "gemini-3.1-flash-lite-image" => 33_600,
+        "gemini-3.1-flash-image" => 67_000,
+        "gemini-3-pro-image" | "gemini-3-pro-image-preview" | "nano-banana-pro" => 134_000,
+        "gemini-2.5-flash-image" => 39_000,
+        _ => 0,
+    };
+    each * images as u64
+}
+
+/// What an answered image request cost: Gemini by its per-image price, OpenAI by its token usage.
+pub fn image_micro_usd(provider: &str, model: &str, images: u32, usage: Option<&crate::models::ImageUsage>) -> u64 {
+    match provider {
+        "gemini" => gemini_image_micro_usd(model, images),
+        "openai" => usage.map(|u| (crate::credits::calculate_openai_cost_usd(u) * MICRO_PER_USD).ceil() as u64).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Counts an answered image request that made at least one image under its provider and the tenant's share. A count
+/// that cannot be written is logged and the images still go back.
+pub async fn count_images(db: &impl D1Exec, app_id: &str, provider: &str, model: &str, images: u32, usage: Option<&crate::models::ImageUsage>) {
+    if images == 0 || provider.is_empty() {
+        return;
+    }
+    let cost = image_micro_usd(provider, model, images, usage);
+    let day = day_of(Utc::now());
+    let counted = match add(db, provider, &day, cost).await {
+        Ok(()) => add(db, &tenant_share(provider, app_id), &day, cost).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = counted {
+        console_log!("{} image spend of {} micro-USD was not counted: {:?}", provider, cost, error);
+    }
+}
+
 /// Counts an Anthropic call that was answered. A count that cannot be written is logged and the answer still goes
 /// back to the person who paid for it.
 pub async fn count_anthropic(db: &impl D1Exec, app_id: &str, prices: (f64, f64), prompt_tokens: u64, output_tokens: u64) {
@@ -153,6 +194,30 @@ mod tests {
         for wrong in ["", "two", "0", "-1", "NaN", "inf"] {
             assert_eq!(ceiling_micro_usd(Some(wrong)), 2_000_000, "{wrong}");
         }
+    }
+
+    #[test]
+    fn gemini_images_cost_their_listed_price_and_unknown_models_nothing() {
+        assert_eq!(gemini_image_micro_usd("gemini-nano-banana-2.1", 1), 33_600);
+        assert_eq!(gemini_image_micro_usd("gemini-3.1-flash-image", 2), 134_000);
+        assert_eq!(gemini_image_micro_usd("gemini-3-pro-image", 1), 134_000);
+        assert_eq!(gemini_image_micro_usd("standard", 1), 0);
+        assert_eq!(image_micro_usd("gemini", "gemini-nano-banana-2.1", 3, None), 100_800);
+        assert_eq!(image_micro_usd("openai", "gpt-image-2", 1, None), 0);
+        assert_eq!(image_micro_usd("mock", "x", 1, None), 0);
+    }
+
+    #[test]
+    fn image_requests_count_per_provider_and_tenant() {
+        let d1 = LocalD1::migrated();
+        block_on(count_images(&d1, "pixie", "gemini", "gemini-nano-banana-2.1", 2, None));
+        block_on(count_images(&d1, "pixie", "gemini", "gemini-nano-banana-2.1", 1, None));
+        block_on(count_images(&d1, "pixie", "gemini", "gemini-nano-banana-2.1", 0, None));
+        let today = day_of(Utc::now());
+        assert_eq!(block_on(spent(&d1, "gemini", &today)).unwrap(), 100_800);
+        assert_eq!(block_on(spent(&d1, "gemini:pixie", &today)).unwrap(), 100_800);
+        assert_eq!(d1.int("SELECT calls FROM provider_spend WHERE provider = 'gemini'", &[]), 2);
+        assert_eq!(block_on(spent(&d1, ANTHROPIC, &today)).unwrap(), 0);
     }
 
     #[test]

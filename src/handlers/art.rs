@@ -183,6 +183,7 @@ async fn run(
     }).await;
 
     record_usage(db, auth, provider.get_name(), stored_prompt, produced, &provider_response, start_time).await;
+    crate::spend::count_images(db, &auth.app_id, provider.get_name(), ART_MODEL, produced, provider_response.usage.as_ref()).await;
 
     let data: Vec<Value> = provider_response
         .images
