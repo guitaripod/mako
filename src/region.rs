@@ -2,10 +2,12 @@ use worker::{Request, Response, Result};
 
 use crate::error::AppError;
 
-/// Countries where no model call is made for anyone. China mainland: Anthropic, Google and OpenAI do not serve it, and
-/// China's generative AI rules need CAC filings Midgar cannot hold, so Apple's China mainland declarations can only
-/// answer No when model features are geoblocked there. Kept in step with `services/lib/src/region.ts`.
-const MODEL_UNSERVED_COUNTRIES: [&str; 1] = ["CN"];
+/// Countries where no model call is made for anyone: every country or region that Anthropic, Google's Gemini API or
+/// OpenAI does not serve, read from their supported-region pages on 2026-11-17 (Afghanistan and Myanmar are missing
+/// from Anthropic's and Google's lists, Yemen from Anthropic's, Venezuela from Anthropic's and OpenAI's, the rest from
+/// all three). China mainland also needs CAC filings Midgar cannot hold, so Apple's China mainland declarations can
+/// only answer No when model features are geoblocked there. Kept in step with `services/lib/src/region.ts`.
+const MODEL_UNSERVED_COUNTRIES: [&str; 13] = ["AF", "BY", "CN", "CU", "HK", "IR", "KP", "MM", "MO", "RU", "SY", "VE", "YE"];
 
 /// The header the gateway sets on every internal hop to the country Cloudflare resolved for the caller.
 const COUNTRY_HEADER: &str = "X-Midgar-Country";
@@ -49,8 +51,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refuses_every_model_route_from_china_mainland_by_either_country() {
+    fn refuses_every_model_route_from_every_unserved_country_by_either_country() {
         for path in MODEL_ROUTES {
+            for code in MODEL_UNSERVED_COUNTRIES {
+                assert!(refuses(path, Some(code), None), "{path} {code}");
+            }
             assert!(refuses(path, Some("CN"), None), "{path}");
             assert!(refuses(path, None, Some("CN")), "{path}");
             assert!(refuses(path, Some("CN"), Some("US")), "{path}");
@@ -60,7 +65,7 @@ mod tests {
 
     #[test]
     fn serves_other_countries_and_unknown_callers() {
-        for (connection, forwarded) in [(Some("FI"), None), (None, Some("HK")), (Some("TW"), Some("TW")), (None, None), (None, Some("china")), (Some(""), None)] {
+        for (connection, forwarded) in [(Some("FI"), None), (None, Some("TW")), (Some("JP"), Some("JP")), (Some("UA"), None), (None, None), (None, Some("china")), (Some(""), None)] {
             assert!(!refuses("/v1/run/chat.completion", connection, forwarded), "{connection:?} {forwarded:?}");
         }
     }
