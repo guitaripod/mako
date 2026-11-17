@@ -38,6 +38,9 @@ pub enum AppError {
     /// 503 `not_configured`: this server cannot verify the purchase's store for this app (Google Play without its
     /// service account), so nothing is granted. A client keeps the purchase and asks again later.
     NotConfigured(String),
+    /// 451 `unavailable_in_region`: a model route called from a country where no model call is made (`region.rs`).
+    /// Nothing is held or charged.
+    UnavailableInRegion,
 }
 
 /// What an error answers with, before it becomes a response.
@@ -71,6 +74,7 @@ impl AppError {
             AppError::UnverifiablePurchase(msg) => (400, "invalid_request_error", msg.clone(), "unverifiable_purchase", None),
             AppError::Refunded(msg) => (400, "invalid_request_error", msg.clone(), "refunded", None),
             AppError::NotConfigured(msg) => (503, "service_unavailable", msg.clone(), "not_configured", None),
+            AppError::UnavailableInRegion => (451, "unavailable_in_region", "This is not available in your region. Nothing was charged.".to_string(), "unavailable_in_region", None),
         };
         ErrorParts { status, error_type, message, code, balance }
     }
@@ -165,6 +169,9 @@ impl From<worker::Error> for AppError {
         if error_str.starts_with("AppError::WalletUnavailable::") {
             return AppError::WalletUnavailable;
         }
+        if error_str.starts_with("AppError::UnavailableInRegion::") {
+            return AppError::UnavailableInRegion;
+        }
         if let Some(msg) = error_str.strip_prefix("AppError::CreditPending::") {
             return AppError::CreditPending(msg.to_string());
         }
@@ -209,6 +216,7 @@ impl From<AppError> for worker::Error {
             AppError::Truncated => "AppError::Truncated::".to_string(),
             AppError::ContentBlocked => "AppError::ContentBlocked::".to_string(),
             AppError::WalletUnavailable => "AppError::WalletUnavailable::".to_string(),
+            AppError::UnavailableInRegion => "AppError::UnavailableInRegion::".to_string(),
         };
         worker::Error::RustError(encoded)
     }

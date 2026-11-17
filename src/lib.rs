@@ -32,6 +32,7 @@ mod daily;
 mod midgar_token;
 mod returning;
 mod device_bits;
+mod region;
 pub mod wallet;
 
 use handlers::{images, gallery, r2, usage, oauth, oauth_apple, oauth_apple_callback, oauth_native, device_auth, identity};
@@ -82,6 +83,9 @@ async fn warm_app_aliases_for(req: &Request, env: &Env) {
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
+    if let Some(refusal) = region::refusal(&req) {
+        return refusal;
+    }
     warm_app_aliases_for(&req, &env).await;
 
     let router = Router::new();
